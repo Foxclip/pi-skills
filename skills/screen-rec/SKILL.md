@@ -1,15 +1,18 @@
 ---
 name: screen-rec
-description: Record the Windows screen to video (ffmpeg gdigrab, kill-proof .ts → clean .mp4) and capture stills of specific windows without disturbing the user's foreground (PrintWindow, with a foreground fallback for minimized/GPU-rendered windows). Use when the user asks to screen-record, record the desktop/screen, make a screen video, or screenshot/capture a specific window (even a background or minimized one).
+description: Record the Windows screen to video — full screen (ffmpeg gdigrab) or a single specific window (ffmpeg gfxcapture / Windows.Graphics.Capture) — kill-proof .ts → clean .mp4, and capture stills of specific windows without disturbing the user's foreground (PrintWindow, with a foreground fallback for minimized/GPU-rendered windows). Use when the user asks to screen-record, record the desktop/screen, make a screen video, record/capture a specific window as video, or screenshot/capture a specific window (even a background or minimized one).
 ---
 
 # screen-rec
 
-Two modes, both proven on this machine (Windows, primary monitor 1920x1080,
+Three modes, all proven on this machine (Windows, primary monitor 1920x1080,
 RTX 3090; ffmpeg 9.0.2 at `C:\Users\Suburban\.pi\agent\bin\ffmpeg.exe`):
 
 1. **Capture** — still PNG of one or all windows, no focus change.
 2. **Record** — full-screen video via `gdigrab`, kill-proof, remuxed to mp4.
+3. **Record window** — video of ONE specific window via `gfxcapture`
+   (Windows.Graphics.Capture), same kill-proof flow. Use this, not gdigrab
+   window capture, for any modern (GPU/composited) app.
 
 ## Capture (stills)
 
@@ -73,6 +76,41 @@ Rules / why:
   kill — OS write-back). `stop` waits up to 10s before declaring it missing.
 - Expected loss at stop: ~1-2s (encoder queue + OS buffer + the clipped
   tail packet the trim drops).
+
+## Record window (video)
+
+One script, same modes/state as rec.sh (separate `rec-window.state` +
+`win-*.ts` names, so it can't clash with a full-screen run):
+
+```sh
+cd <dir-for-files>
+bash skills/screen-rec/scripts/rec-window.sh record [sec]    --hwnd N [--cursor]
+bash skills/screen-rec/scripts/rec-window.sh start  [maxsec] --hwnd N [--cursor]
+bash skills/screen-rec/scripts/rec-window.sh stop [ts]      # self-heals from rec-window.state
+bash skills/screen-rec/scripts/rec-window.sh status
+```
+
+- Selector: `--hwnd N` (preferred — from `list-windows.ps1`, no non-ASCII
+  title pasting) or `--title REGEX` (PCRE, `(?i)` for case-insensitive;
+  ASCII-safe substring recommended). `--cursor` adds the mouse (default off).
+- Engine: `gfxcapture` filter (Windows.Graphics.Capture API, FFmpeg 8.0+;
+  present in the local 9.0.2 build). Captures at the WINDOW'S OWN SIZE
+  (e.g. 1920x1040), no screen crop; the window need not be foreground.
+  Under the hood: `-f lavfi -i "gfxcapture=hwnd=N:capture_cursor=0:max_framerate=25"
+  -vf "hwdownload,format=bgra,format=yuv420p" -r 25 -c:v libx264 ...`.
+- `format=bgra` between `hwdownload` and `format=yuv420p` is MANDATORY —
+  raw output is d3d11 hw frames and direct `hwdownload,format=yuv420p`
+  fails ("Invalid output format yuv420p for hwframe download").
+- **Event-driven capture:** WGC delivers frames only while the window's
+  content changes (up to max_framerate). pts are wall-clock, so motion
+  paces correctly, but a long static UI yields a SHORT video (ends at the
+  last content change). Keep the window active/animating during the take.
+- Same .ts rules as rec.sh (kill-proof, watchdog, self-heal stop, ~1-2s
+  loss at stop). Bad hwnd/title → clear error + exit 1, no state written.
+- Do NOT use `gdigrab title=`/`hwnd=` for window video: it BitBlts the
+  window's GDI DC = all-BLACK frames for GPU/composited apps (verified on
+  Docker Desktop + Sound Blaster Command). Full-screen gdigrab is fine
+  (composited desktop).
 
 ## Pitfalls (all hit in production)
 
