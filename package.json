@@ -1,0 +1,7 @@
+{
+  "name": "pi-skills",
+  "version": "0.1.0",
+  "description": "Foxclip's pi agent skills: vpn-control (AmneziaVPN on Windows) + yt-download (YouTube downloads via yt-dlp)",
+  "keywords": ["pi-package", "skills"],
+  "publishConfig": { "access": "public" }
+}
