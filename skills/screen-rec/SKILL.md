@@ -1,6 +1,6 @@
 ---
 name: screen-rec
-description: Record the Windows screen to video — full screen (ffmpeg gdigrab) or a single specific window (ffmpeg gfxcapture / Windows.Graphics.Capture) — kill-proof .ts → clean .mp4, and capture stills of specific windows without disturbing the user's foreground (PrintWindow, with a foreground fallback for minimized/GPU-rendered windows). Use when the user asks to screen-record, record the desktop/screen, make a screen video, record/capture a specific window as video, or screenshot/capture a specific window (even a background or minimized one).
+description: Record the Windows screen to video — full screen (ffmpeg gdigrab) or a single specific window (ffmpeg gfxcapture / Windows.Graphics.Capture) — kill-proof .ts → clean .mp4, and capture stills of specific windows without disturbing the user's foreground (PrintWindow; gfxcapture single-frame still for GPU/DComp windows; foreground fallback for minimized windows). Use when the user asks to screen-record, record the desktop/screen, make a screen video, record/capture a specific window as video, or screenshot/capture a specific window (even a background or minimized one).
 ---
 
 # screen-rec
@@ -33,8 +33,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File skills/screen-rec/scripts/ca
   # CopyFromScreen + put the previous foreground window back (-RestoreHwnd).
   powershell -NoProfile -ExecutionPolicy Bypass -File skills/screen-rec/scripts/cap-foreground.ps1 -Hwnd 69232 -Out caps/term.png -RestoreHwnd 790610
   ```
-- GPU/DComp-rendered windows (Windows Terminal) are also only reliably
-  captured via `cap-foreground.ps1` (CopyFromScreen), not PrintWindow.
+- GPU/DComp-rendered windows (Windows Terminal, Electron): PrintWindow goes
+  BLACK on these. Preferred still path for a VISIBLE window = gfxcapture
+  single-frame (no foreground change, FFmpeg 8.0+; bgra intermediate again
+  mandatory — same d3d11 hw frames as video):
+  ```sh
+  ffmpeg -f lavfi -i "gfxcapture=hwnd=N:capture_cursor=0" -vf "hwdownload,format=bgra" -frames:v 1 out.png
+  ```
+  Minimized window (or ffmpeg < 8.0) → `cap-foreground.ps1` path above.
+  WARNING: gfxcapture on a MINIMIZED window HANGS with zero frames (see
+  Record window) — check state first when unsure:
+  ```sh
+  powershell -NoProfile -ExecutionPolicy Bypass -File skills/screen-rec/scripts/win-rect.ps1 -Hwnd N
+  # prints: OK <hwnd> WxH | MINIMIZED <hwnd> WxH | NOTFOUND | BADHWND
+  ```
 - Non-ASCII titles come out mojibake'd in the console (code page) — identify
   windows by `Hwnd`/process name, never by pasting title text back.
 - After any capture, read the PNG with the `read` tool to verify/inspect.
@@ -105,6 +117,13 @@ bash skills/screen-rec/scripts/rec-window.sh status
   content changes (up to max_framerate). pts are wall-clock, so motion
   paces correctly, but a long static UI yields a SHORT video (ends at the
   last content change). Keep the window active/animating during the take.
+- **Minimized/hidden target = HANG, zero frames** — WGC only signals frame
+  events on content updates and DWM stops compositing a minimized surface, so
+  the filter initializes then waits forever (verified: Taskmgr + Windows
+  Terminal minimized, no frame in 60s; no stale frame, no black frame).
+  `rec-window.sh` now preflights the target via `win-rect.ps1` (the <=100x100
+  minimized tell, same heuristic as cap-windows.ps1) and refuses with a
+  clear error instead of starting a ffmpeg that would sit idle.
 - Same .ts rules as rec.sh (kill-proof, watchdog, self-heal stop, ~1-2s
   loss at stop). Bad hwnd/title → clear error + exit 1, no state written.
 - Do NOT use `gdigrab title=`/`hwnd=` for window video: it BitBlts the

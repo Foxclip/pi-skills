@@ -38,6 +38,7 @@
 set -u
 FF=ffmpeg
 STATE=rec-window.state
+SCRIPTDIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
 CIMP="Get-CimInstance Win32_Process -Filter \"Name='ffmpeg.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Csv -NoTypeInformation"
 
 gfx_pid() {
@@ -156,6 +157,22 @@ case "$SUB" in
       i=$((i+1))
     done
     [ -z "$SEL_MODE" ] || [ -z "$SEL_VAL" ] && { usage; exit 2; }
+    # Preflight: gfxcapture HANGS with zero frames on minimized/hidden windows
+    # (WGC never delivers a frame for an un-composited surface - verified on
+    # Taskmgr + Windows Terminal: no frame in 60s). Refuse early with a clear
+    # error instead of starting a ffmpeg that will sit idle forever.
+    if [ "$SEL_MODE" = hwnd ]; then
+      PRE="$(powershell -NoProfile -ExecutionPolicy Bypass -File "$SCRIPTDIR/win-rect.ps1" -Hwnd "$SEL_VAL" 2>/dev/null)"
+    else
+      PRE="$(powershell -NoProfile -ExecutionPolicy Bypass -File "$SCRIPTDIR/win-rect.ps1" -Title "$SEL_VAL" 2>/dev/null)"
+    fi
+    case "$PRE" in
+      MINIMIZED*)
+        echo "ERROR: target window is minimized/hidden ($PRE) - gfxcapture would hang with zero frames. Restore the window first (or use cap-foreground.ps1 for a one-shot still)." >&2
+        exit 1 ;;
+      NOTFOUND|BADHWND|'')
+        echo "WARNING: preflight could not resolve the target ($PRE) - continuing anyway" >&2 ;;
+    esac
     if [ "$SUB" = record ]; then
       SEC="${SEC:-10}"
       trap 'L="$(gfx_pid)"; [ -n "$L" ] && powershell -NoProfile -Command "Stop-Process -Id $L -Force -ErrorAction SilentlyContinue" 2>/dev/null' TERM INT HUP
