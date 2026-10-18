@@ -1,7 +1,7 @@
 {
   "name": "pi-skills",
-  "version": "0.2.0",
-  "description": "Foxclip's pi agent skills: pi-supervisor (child pi agent harness), vpn-control (AmneziaVPN on Windows), yt-download (YouTube downloads via yt-dlp)",
+  "version": "0.3.0",
+  "description": "Foxclip's pi agent skills: pi-supervisor (child pi agent harness), vpn-control (AmneziaVPN on Windows), yt-download (YouTube downloads via yt-dlp), screen-rec (screen recording + window screenshots)",
   "keywords": ["pi-package", "skills"],
   "engines": { "node": ">=22.19.0" },
   "publishConfig": { "access": "public" }
