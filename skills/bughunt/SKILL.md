@@ -1,5 +1,5 @@
 ---
-name: bug-hunting
+name: bughunt
 description: Structured methodology for hard, long-running bug hunts (rendering/pipeline bugs, subtle state bugs, file-format defects, concurrency issues) — executed as supervised child sessions via the pi-supervisor skill. Use when a bug outlived a quick fix and needs a disciplined multi-run hunt: differential reproduction, stage-by-stage ground-truth diffing, broken baseline + per-fix regression proofs, a verified-facts ledger, machine-checkable acceptance, and a distill-don't-resume run loop.
 ---
 
