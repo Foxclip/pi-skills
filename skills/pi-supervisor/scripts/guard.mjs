@@ -84,9 +84,23 @@
 //     "degenerate-settle").
 //   - --expect-file <path> (repeatable): on settle, missing artifacts are
 //     handled exactly like a degenerate settle ("missing-expected-file").
-//   - Progress log: pi-child-progress.log in the cwd is ALWAYS written (one
-//     line per completed tool call + [start]/[settled]/[result]); a parent
+//   - Context-overflow pivot (v0.6.0): resuming a transcript near the model's
+//     context window stalls on the FIRST prompt (zero tool calls, idle) — and
+//     forking that session copies the same transcript, so the fork stalls
+//     identically. The guard classifies that signature (resume mode + attempt
+//     1 + zero tool calls + session file >= --overflow-threshold-mb) and, on a
+//     matching stall, does NOT fork: it distills a fresh-session brief
+//     (pi-child-brief.md) + a relaunch manifest (pi-child-relaunch.json,
+//     exact command line) and exits 3 (exitReason "stuck-overflow"); with
+//     --pivot-relaunch it spawns the relay (fresh session, remaining wall
+//     clock) and exits with the relay's code. Preflight at launch warns when
+//     a --session resume is already above the threshold, and the resume-mode
+//     idle watchdog is lowered 300s -> 120s.
+//   - Progress log: pi-child-progress.log is ALWAYS written (one line per
+//     completed tool call + [start]/[settled]/[settle]/[result]); a parent
 //     session should poll it, not the session jsonl. Override: --progress-log.
+//     All pi-child-* artifacts (progress log, status file, result manifest,
+//     consult/brief/relaunch files) go to --out-dir (default: the cwd).
 //   - Tool exclusions: the child runs without ask_user_question and without
 //     the acp_delegate* family (its sub-agents would be unsupervised). Opt
 //     out: --keep-question-tool / --keep-delegate-tool.
@@ -109,10 +123,12 @@
 //   - Exit codes: 0 completed, 3 stuck, 4 consult (waiting on the parent
 //     session to resume), 1 error, 2 usage.
 
-import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const GUARD_PATH = fileURLToPath(import.meta.url);
 
 const USAGE = `Usage:
   node guard.mjs "autonomous task description" [options]
@@ -188,6 +204,22 @@ Options:
                         on extension-UI dialogs; you must answer them)
   --keep-delegate-tool  Do not exclude the acp_delegate* tools (by default
                         the child cannot spawn unsupervised sub-agents)
+  --out-dir <dir>       Directory for ALL pi-child-* artifacts (progress log,
+                        status file, result manifest, consult/brief/relaunch
+                        files; default: the cwd). Keeps the project tree
+                        clean — point it at a temp/supervisor dir and clean
+                        there after the run.
+  --overflow-threshold-mb <n>  Resumed-session size (MB) that makes a
+                        first-prompt stall count as a context OVERFLOW instead
+                        of a plain stall (default 3). The launch preflight
+                        warns at the same threshold.
+  --pivot-relaunch      On a context-overflow stall: instead of exiting 3,
+                        spawn a fresh supervisor run (new session, distilled
+                        brief, remaining wall clock) and exit with its code.
+                        The relay inherits provider/model, expect-files,
+                        out-dir, finalize and preamble.
+  --relayed-from <p>    Internal: mark this run as a relay of another run
+                        (the manifest carries the original manifest path).
 Resume from a consult file (instead of a task):
   --consult-file <p>    Consult file to resume from (usually
                         pi-child-consult.json; path is in the RESULT line)
@@ -230,6 +262,11 @@ let keepDelegateTool = false;
 let progressLogArg = "";
 const expectFiles = [];
 let preamble = "";
+let outDirArg = "";
+let overflowThresholdMb = 3;
+let pivotRelaunch = false;
+let relayedFromArg = "";
+let idleTimeoutSpecified = false;
 
 const VALID_FLAGS = [
   "--task", "--task-file", "--session-id", "--session", "--no-session", "--session-dir",
@@ -238,7 +275,8 @@ const VALID_FLAGS = [
   "--action", "--message", "--max-errors", "--heartbeat", "--max-text",
   "--idle-timeout", "--tool-timeout", "--timeout", "--finalize", "--stagnation",
   "--progress-log", "--expect-file", "--preamble", "--keep-question-tool",
-  "--keep-delegate-tool",
+  "--keep-delegate-tool", "--out-dir", "--overflow-threshold-mb",
+  "--pivot-relaunch", "--relayed-from",
   "-h", "--help",
 ];
 
@@ -268,13 +306,17 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--heartbeat") heartbeatN = Number(argv[++i]);
   else if (a === "--max-text") maxTextLen = Number(argv[++i]);
   else if (a === "--stagnation") stagnationN = Number(argv[++i]);
-  else if (a === "--idle-timeout") idleTimeoutMs = Number(argv[++i]) * 1000;
+  else if (a === "--idle-timeout") { idleTimeoutMs = Number(argv[++i]) * 1000; idleTimeoutSpecified = true; }
   else if (a === "--tool-timeout") toolTimeoutMs = Number(argv[++i]) * 1000;
   else if (a === "--timeout") hardTimeoutMs = Number(argv[++i]) * 60 * 1000;
   else if (a === "--finalize") finalizeMin = Number(argv[++i]);
   else if (a === "--progress-log") progressLogArg = argv[++i];
   else if (a === "--expect-file") expectFiles.push(argv[++i]);
   else if (a === "--preamble") preamble = argv[++i];
+  else if (a === "--out-dir") outDirArg = argv[++i];
+  else if (a === "--overflow-threshold-mb") overflowThresholdMb = Number(argv[++i]);
+  else if (a === "--pivot-relaunch") pivotRelaunch = true;
+  else if (a === "--relayed-from") relayedFromArg = argv[++i];
   else if (a === "--keep-question-tool") keepQuestionTool = true;
   else if (a === "--keep-delegate-tool") keepDelegateTool = true;
   else if (a === "-h" || a === "--help") {
@@ -383,6 +425,15 @@ if (sessionRef && noSession) {
   console.log(USAGE);
   process.exit(2);
 }
+if (sessionRef && !resumePayload && !idleTimeoutSpecified) {
+  // Resume mode: a transcript near the model's context window cannot be
+  // prefilled — the child stalls on the FIRST prompt with zero tool calls.
+  // Detect that signature fast (120 s) instead of 300 s; the overflow
+  // classifier turns it into a distilled brief + relaunch instead of
+  // forking the same (fatal) transcript.
+  idleTimeoutMs = 120 * 1000;
+}
+
 for (const [flag, value] of [
   ["--task", task],
   ["--session-id", sessionArg],
@@ -402,6 +453,7 @@ for (const [flag, value] of [
   ["--timeout", hardTimeoutMs],
   ["--finalize", finalizeMin],
   ["--stagnation", stagnationN],
+  ["--overflow-threshold-mb", overflowThresholdMb],
 ]) {
   if (value === undefined || Number.isNaN(value)) {
     console.error(`error: ${flag} requires a (numeric) value`);
@@ -560,7 +612,10 @@ function resetAttemptCounters() {
 // tool call, plus [start]/[settled]/[result] markers. The parent session
 // should poll THIS small file instead of parsing the (multi-MB) session
 // jsonl.
-const progressLogPath = progressLogArg || join(process.cwd(), "pi-child-progress.log");
+const outDir = outDirArg || process.cwd();
+try { mkdirSync(outDir, { recursive: true }); } catch { /* best effort */ }
+const progressLogPath = progressLogArg || join(outDir, "pi-child-progress.log");
+const manifestPath = join(outDir, "pi-child-result.json");
 writeFileSync(progressLogPath, "");
 const plog = (s) => { try { appendFileSync(progressLogPath, s); } catch { /* best effort */ } };
 plog(
@@ -574,7 +629,7 @@ plog(
 // state transition (start/steer/fork/consult/result/error). A monitoring
 // loop is one read + JSON.parse: no line matching, and the file always
 // reflects the current attempt (session id/file, tool count, elapsed).
-const statusFilePath = join(process.cwd(), "pi-child-status.json");
+const statusFilePath = join(outDir, "pi-child-status.json");
 function writeStatus(status, exitReason) {
   try {
     const payload = {
@@ -590,6 +645,7 @@ function writeStatus(status, exitReason) {
       elapsedMs: startTs > 0 ? Date.now() - startTs : 0,
       sessionId: stateSessionId || null,
       sessionFile: stateSessionFile || null,
+      sessionBytes: stateSessionFile && existsSync(stateSessionFile) ? statSync(stateSessionFile).size : undefined,
       expectedFiles: expectFiles.length > 0 ? Object.fromEntries(expectFiles.map((f) => [f, existsSync(f)])) : undefined,
     };
     writeFileSync(statusFilePath, JSON.stringify(payload, null, 2));
@@ -676,7 +732,7 @@ async function doConsult(trigger, extra) {
     recentToolCalls: recentCalls.slice(-15),
     lastAssistantText: lastText.slice(0, 4000),
   };
-  const p = join(process.cwd(), "pi-child-consult.json");
+  const p = join(outDir, "pi-child-consult.json");
   writeFileSync(p, JSON.stringify(payload, null, 2));
   consultOutFile = p;
   consultOut = payload;
@@ -949,8 +1005,157 @@ async function doDegenerateSteer(dReason, missing) {
   writeStatus("running");
 }
 
+// ---------------------------------------------------------------------------
+// v0.6.0 — context-overflow classifier + distill-and-relaunch pivot
+//
+// A resumed transcript near the model's context window cannot be prefilled:
+// the child emits zero events on the FIRST prompt (observed signature: 7 MB
+// session, ACP "EMERGENCY 99%", three identical 300 s stalls; forking such a
+// session copies the same transcript and stalls identically — futile). When
+// the stall matches the signature (resume mode, attempt 1, zero tool calls
+// this run, idle while thinking, session file >= threshold) the guard does
+// NOT fork: it distills a fresh-session brief (task + last assistant text +
+// required artifacts + remaining budget), writes pi-child-relaunch.json with
+// the exact relaunch command line, and — with --pivot-relaunch — spawns that
+// relay (fresh session, remaining wall clock) and exits with its code.
+// ---------------------------------------------------------------------------
+function isOverflowStall() {
+  if (!sessionRef || resumePayload) return false; // only plain --session resumes
+  if (attempt > 1 || totalToolCalls > 0) return false; // first prompt only
+  if (!stateSessionFile || !existsSync(stateSessionFile)) return false;
+  return statSync(stateSessionFile).size >= overflowThresholdMb * 1048576;
+}
+
+function buildOverflowBrief(idleMs) {
+  const sessBytes = stateSessionFile && existsSync(stateSessionFile) ? statSync(stateSessionFile).size : 0;
+  const last = (finalTextAcc || "").trim();
+  const remainMin = hardTimeoutMs > 0
+    ? Math.max(1, Math.ceil((hardTimeoutMs - (Date.now() - startTs)) / 60000))
+    : 0;
+  const L = [];
+  L.push("# Distilled brief — fresh-session continuation (auto-generated by pi-supervisor)");
+  L.push("");
+  L.push(`Generated: ${new Date().toISOString()}`);
+  L.push(
+    `Previous attempt: session ${stateSessionFile} (${(sessBytes / 1048576).toFixed(1)} MB) ` +
+    `stalled on the FIRST prompt with zero tool calls after ${Math.round(idleMs / 1000)}s — ` +
+    `the transcript is too large for the model's context window. This run starts from a CLEAN ` +
+    `session. Do NOT load that transcript into context; grep it on disk if you need details.`
+  );
+  L.push("");
+  L.push("## Original task (verbatim)");
+  L.push("");
+  L.push(task);
+  if (expectFiles.length > 0) {
+    L.push("");
+    L.push("## Required artifacts");
+    for (const f of expectFiles) L.push(`- ${f}`);
+  }
+  if (remainMin > 0) {
+    L.push("");
+    L.push("## Budget");
+    L.push(`- Remaining wall clock: ~${remainMin} minutes (hard).`);
+  }
+  if (last) {
+    L.push("");
+    L.push("## Last assistant text from the previous session (tail)");
+    L.push("");
+    L.push("```");
+    L.push(last.slice(-3000));
+    L.push("```");
+  }
+  L.push("");
+  L.push("## Standing rules (same contract as before)");
+  L.push("- Work from this brief; the transcript is not storage — update STATUS.md (or the task's notes file) at every milestone.");
+  L.push("- Keep single tool calls short (explicit timeouts; the environment kills long silence). Max 3 attempts per approach.");
+  L.push("- End with a written status; write the required artifact file(s) before stopping.");
+  L.push("");
+  return L.join("\n");
+}
+
+function relayArgs(briefPath) {
+  const a = ["--task-file", briefPath];
+  if (provider) a.push("--provider", provider);
+  if (model) a.push("--model", model);
+  if (hardTimeoutMs > 0) {
+    const remainMin = Math.max(5, Math.ceil((hardTimeoutMs - (Date.now() - startTs)) / 60000));
+    a.push("--timeout", String(remainMin));
+  } else {
+    a.push("--timeout", "0");
+  }
+  if (finalizeMin > 0) a.push("--finalize", String(finalizeMin));
+  for (const f of expectFiles) a.push("--expect-file", f);
+  if (outDirArg) a.push("--out-dir", outDirArg);
+  if (preamble) a.push("--preamble", preamble);
+  a.push("--relayed-from", manifestPath);
+  return a;
+}
+
+function writePivotManifest() {
+  try {
+    writeFileSync(manifestPath, JSON.stringify({
+      v: 1,
+      cwd: process.cwd(),
+      provider,
+      model,
+      startedAt: new Date(startTs).toISOString(),
+      finishedAt: new Date().toISOString(),
+      note: "run pivoted to a fresh-session relay; this manifest is overwritten by the relay's final manifest",
+      result: {
+        status: "stuck",
+        exitReason: "stuck-overflow",
+        sessionId: stateSessionId || null,
+        sessionFile: stateSessionFile || null,
+        briefFile: join(outDir, "pi-child-brief.md"),
+        relaunchFile: join(outDir, "pi-child-relaunch.json"),
+      },
+    }, null, 2));
+  } catch { /* best effort */ }
+}
+
+async function doOverflowPivot(idleMs) {
+  const briefPath = join(outDir, "pi-child-brief.md");
+  const relaunchPath = join(outDir, "pi-child-relaunch.json");
+  try { writeFileSync(briefPath, buildOverflowBrief(idleMs)); } catch (e) { logSup(`[guard] brief write failed: ${e.message}`); }
+  const args = relayArgs(briefPath);
+  try {
+    writeFileSync(relaunchPath, JSON.stringify({
+      v: 1,
+      at: new Date().toISOString(),
+      reason: "stuck-overflow: resumed transcript exceeded the model's context window",
+      brief: briefPath,
+      cmd: [process.execPath, GUARD_PATH, ...args].join(" "),
+      args,
+      originalSession: stateSessionFile || null,
+    }, null, 2));
+  } catch (e) { logSup(`[guard] relaunch write failed: ${e.message}`); }
+  logSup(
+    `[guard] OVERFLOW STALL — resumed session (${stateSessionFile}) is too large for the ` +
+    `model's context window (stalled on the first prompt, zero tool calls). Forking it would ` +
+    `stall identically. Distilled brief → ${briefPath}; relaunch command → ${relaunchPath}`
+  );
+  plog(`[overflow] ${new Date().toISOString()} session=${stateSessionFile} brief=${briefPath} relaunch=${relaunchPath}\n`);
+  if (!pivotRelaunch) return { pivoted: false, briefPath, relaunchPath };
+  // Relay mode: this run's manifest first (the relay records --relayed-from → it),
+  // then stop the original child and spawn the relay (fresh session, remaining
+  // wall clock). The relay prints the final RESULT line and overwrites the manifest.
+  writePivotManifest();
+  logSup("[guard] --pivot-relaunch: spawning the relay (fresh session, remaining wall clock)");
+  plog(`[relay] ${new Date().toISOString()} spawning relay (fresh session)\n`);
+  try { await client.stop(); } catch { /* already stopped */ }
+  const child = spawn(process.execPath, [GUARD_PATH, ...args], {
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  relayExitCode = await new Promise((res) => child.once("close", (c) => res(c ?? 1)));
+  relayHappened = true;
+  logSup(`[guard] relay exited ${relayExitCode} — forwarding as this process's exit code`);
+  return { pivoted: true, briefPath, relaunchPath };
+}
+
 let exitCode = 1;
 let outcome = "error";
+let relayHappened = false; // v0.6.0: an overflow relay ran to completion
+let relayExitCode = 1;
 try {
   if (provider && model) {
     logSup(`[info] child provider=${provider} model=${model}`);
@@ -976,6 +1181,33 @@ try {
         "(default abort=5, see acp.json `repetitionGuard`) usually aborts the " +
         "turn before your steer fires; external aborts are still recovered via fork"
     );
+  }
+  if (sessionRef && !resumePayload && !idleTimeoutSpecified) {
+    logSup(
+      "[guard] resume mode: idle watchdog lowered 300s → 120s " +
+        "(a first-prompt stall on a large transcript is context overflow, not slowness)"
+    );
+  }
+  // v0.6.0 preflight: size of the session being resumed. A transcript near the
+  // model's context window cannot be prefilled — the child stalls on the first
+  // prompt with zero tool calls (observed: 7 MB resume, ACP "EMERGENCY 99%",
+  // 3 identical stalls in 18 minutes). Warn now; the runtime classifier
+  // converts such a stall into a brief + relaunch instead of futile forks.
+  if (sessionRef && !resumePayload && sessionRef.endsWith(".jsonl") && existsSync(sessionRef)) {
+    const mb = statSync(sessionRef).size / 1048576;
+    if (mb >= overflowThresholdMb) {
+      const acp = sessionRef.replace(/\.jsonl$/, ".acp.json");
+      logSup(
+        `[warn] RESUME PREFLIGHT: session is ${mb.toFixed(1)} MB (>= ${overflowThresholdMb} MB ` +
+        `threshold). If the model's context window is comparable, the child will STALL ON THE ` +
+        `FIRST PROMPT (zero tool calls, idle). ` +
+        `${existsSync(acp) ? "An ACP compressed state exists — the effective prompt may be smaller than the raw file. " : ""}` +
+        `On such a stall the supervisor writes a distilled brief + relaunch manifest ` +
+        `(${join(outDir, "pi-child-relaunch.json")}) instead of forking the same transcript.`
+      );
+    } else {
+      logSup(`[info] resume preflight: session ${mb.toFixed(1)} MB (overflow threshold ${overflowThresholdMb} MB)`);
+    }
   }
   await client.start();
 
@@ -1105,6 +1337,11 @@ try {
       lastEventAt = now;
       if (ev.type === "agent_settled") {
         plog(`[settled] ${new Date().toISOString()} aborted=${ev.aborted ? "yes" : "no"}\n`);
+        // v0.6.0: the child's own words at settle — the one-line status surface
+        // for a 20-30-minute monitor (tool-call lines show WHAT ran, not what
+        // the child concluded).
+        const tailText = (finalTextAcc || "").trim().replace(/\s+/g, " ");
+        plog(`[settle] ${new Date().toISOString()} tools=${toolsSinceCheckpoint} text=${attemptTextChars}chars last="${tailText.slice(-200)}"\n`);
         if (finalized) {
           // Finalization window: accept whatever settle comes (no steer/fork —
           // the window is for writing the report, not for retries).
@@ -1338,6 +1575,24 @@ try {
       const what = inTool
         ? `no events for ${Math.round(idleLimit / 1000)}s during tool call \`${lastToolName}\``
         : `no events for ${Math.round(idleLimit / 1000)}s (model stalled or hung)`;
+      // v0.6.0: context-overflow signature — resume mode, first attempt, zero
+      // tool calls, idle while thinking, transcript >= threshold. A fork copies
+      // the same transcript and stalls identically, so pivot instead: distill a
+      // fresh-session brief (+ relay when --pivot-relaunch).
+      if (!inTool && isOverflowStall()) {
+        const pv = await doOverflowPivot(now - lastEventAt);
+        if (pv.pivoted) { outcome = "stuck-overflow"; settled = true; break; }
+        if (consultMode && forksUsed < maxForks) {
+          await doConsult("stall", {
+            detail: `${what} — context-overflow signature (large resumed transcript, first prompt, zero tool calls): forking this session would stall identically. Relaunch a FRESH session with the distilled brief: ${pv.relaunchPath}`,
+            inTool, lastTool: lastToolName, idleMs: now - lastEventAt,
+            brief: pv.briefPath, relaunch: pv.relaunchPath,
+          });
+          break;
+        }
+        outcome = "stuck-overflow";
+        break;
+      }
       if (consultMode && forksUsed < maxForks) {
         await doConsult("stall", { detail: what, inTool, lastTool: lastToolName, idleMs: now - lastEventAt });
         break;
@@ -1389,27 +1644,41 @@ try {
     result.allowedActions = consultOut.allowedActions;
   }
   // Run manifest: the same RESULT payload + run metadata, written to a stable
-  // file in the cwd so the parent (or a post-mortem) does not have to dig the
-  // RESULT line out of a multi-hundred-KB log.
-  const manifestPath = join(process.cwd(), "pi-child-result.json");
+  // file in the out dir so the parent (or a post-mortem) does not have to dig
+  // the RESULT line out of a multi-hundred-KB log.
   result.manifest = manifestPath;
   result.statusFile = statusFilePath;
-  try {
-    const manifest = {
-      v: 1,
-      cwd: process.cwd(),
-      provider,
-      model,
-      startedAt: new Date(startTs).toISOString(),
-      finishedAt: new Date().toISOString(),
-      result,
-    };
-    writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
-  } catch { /* best effort — the stdout RESULT line still carries everything */ }
-  plog(`[result] ${new Date().toISOString()} status=${result.status} exitReason=${outcome} attempts=${attempt} manifest=${manifestPath}\n`);
-  writeStatus(result.status, outcome);
-  process.stdout.write(`\n=== RESULT === ${JSON.stringify(result)}\n`);
-  exitCode = isCompleted ? 0 : isConsult ? 4 : 3;
+  if (relayedFromArg) result.relayedFrom = relayedFromArg;
+  if (outcome === "stuck-overflow") {
+    result.briefFile = join(outDir, "pi-child-brief.md");
+    result.relaunchFile = join(outDir, "pi-child-relaunch.json");
+    result.relaunched = relayHappened || undefined;
+  }
+  if (relayHappened) {
+    // The relay already wrote the final manifest (recording --relayed-from),
+    // the final status file, and printed the final RESULT line. This process
+    // must NOT overwrite them — only log its own bookkeeping line and forward
+    // the relay's exit code.
+    plog(`[result] ${new Date().toISOString()} status=${result.status} exitReason=${outcome} attempts=${attempt} relayed=yes relayExit=${relayExitCode}\n`);
+    logSup(`[guard] relay complete (exit ${relayExitCode}) — final manifest, status file and RESULT line belong to the relay`);
+    exitCode = relayExitCode;
+  } else {
+    try {
+      writeFileSync(manifestPath, JSON.stringify({
+        v: 1,
+        cwd: process.cwd(),
+        provider,
+        model,
+        startedAt: new Date(startTs).toISOString(),
+        finishedAt: new Date().toISOString(),
+        result,
+      }, null, 2));
+    } catch { /* best effort — the stdout RESULT line still carries everything */ }
+    plog(`[result] ${new Date().toISOString()} status=${result.status} exitReason=${outcome} attempts=${attempt} manifest=${manifestPath}\n`);
+    writeStatus(result.status, outcome);
+    process.stdout.write(`\n=== RESULT === ${JSON.stringify(result)}\n`);
+    exitCode = isCompleted ? 0 : isConsult ? 4 : 3;
+  }
 } catch (err) {
   logSup(`\n[error] ${err.message}`);
   writeStatus("error", err.message.slice(0, 300));

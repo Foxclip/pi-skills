@@ -130,7 +130,7 @@ class RpcClient {
     }
     return { sessionId: "fake-forked", sessionFile: "/tmp/fake-forked.jsonl", checkpointId: entryId, cancelled: false };
   }
-  async getState() { return { sessionId: "fake-session", sessionFile: "/tmp/fake-session.jsonl", entries: this.entries }; }
+  async getState() { return { sessionId: "fake-session", sessionFile: (spec.sessionFile ?? "/tmp/fake-session.jsonl"), entries: this.entries }; }
   async getEntries() {
     const last = this.entries[this.entries.length - 1];
     return { entries: this.entries, leafId: last ? last.id : null };
@@ -587,6 +587,99 @@ run({
       { type: "message", id: "asst-pre-2", parentId: "user-pre-1", message: { role: "assistant", content: [{ type: "text", text: "looping on the same call" }] } },
     ],
   },
+});
+
+// ---------------------------------------------------------------------------
+// v0.6.0: --out-dir, [settle] progress line, context-overflow pivot
+// ---------------------------------------------------------------------------
+run({
+  name: "--out-dir: artifacts land in the out dir; [settle] line carries last text",
+  args: [TASK, "--out-dir", "sup"],
+  phases: [
+    [...tool("bash", { cmd: "ls" }), ...done("Done, report saved.")],
+  ],
+  expect: ["\"status\":\"completed\""],
+  assertFiles: [
+    { path: "sup/pi-child-result.json", expect: ['"status": "completed"'] },
+    { path: "sup/pi-child-status.json", expect: ['"status": "completed"'] },
+    { path: "sup/pi-child-progress.log", expect: ["[start]", "[settled]", "[settle]", 'last="Done, report saved."', "[result]"] },
+  ],
+});
+
+run({
+  name: "overflow stall: large resumed session, first prompt, zero tools → stuck-overflow + brief + relaunch (no fork)",
+  args: [
+    TASK,
+    "--session", "big-session.jsonl",
+    "--overflow-threshold-mb", "0.5",
+    "--idle-timeout", "1",
+  ],
+  phases: [
+    [{ pauseMs: 4000 }], // silence on the first prompt — the overflow signature
+  ],
+  setup: (dir) => writeFileSync(join(dir, "big-session.jsonl"), "x".repeat(1_500_000)),
+  extra: { sessionFile: "big-session.jsonl" },
+  expect: [
+    "RESUME PREFLIGHT",
+    "OVERFLOW STALL",
+    "\"exitReason\":\"stuck-overflow\"",
+    "\"status\":\"stuck\"",
+    "pi-child-brief.md",
+    "pi-child-relaunch.json",
+  ],
+  expectNot: ["L2 fork", "L1 steer", "L1.5 rewind"],
+  expectExit: 3,
+  assertFiles: [
+    { path: "pi-child-brief.md", expect: ["Distilled brief", "CLEAN session", "Original task (verbatim)"] },
+    { path: "pi-child-relaunch.json", expect: ["stuck-overflow", "--task-file", "--relayed-from"] },
+    { path: "pi-child-result.json", expect: ['"exitReason": "stuck-overflow"', "briefFile", "relaunchFile"] },
+  ],
+});
+
+run({
+  name: "overflow stall: small resumed session → normal stall → fork (classifier must NOT fire)",
+  args: [
+    TASK,
+    "--session", "small-session.jsonl",
+    "--overflow-threshold-mb", "0.5",
+    "--idle-timeout", "1",
+  ],
+  phases: [
+    [{ pauseMs: 2500 }],
+    done("Recovered after fork.")],
+  setup: (dir) => writeFileSync(join(dir, "small-session.jsonl"), "x".repeat(10_000)),
+  extra: { sessionFile: "small-session.jsonl" },
+  expect: ["L2 fork #1", "\"status\":\"completed\""],
+  expectNot: ["OVERFLOW STALL", "stuck-overflow"],
+  expectExit: 0,
+});
+
+run({
+  name: "overflow pivot with --pivot-relaunch: relay is spawned and its exit code is forwarded",
+  args: [
+    TASK,
+    "--session", "big-session.jsonl",
+    "--overflow-threshold-mb", "0.5",
+    "--idle-timeout", "1",
+    "--pivot-relaunch",
+  ],
+  phases: [
+    // Shared spec: the FIRST run stalls at t≈1s (idle-timeout 1) DURING the
+    // 1.5s pause → overflow pivot → relay. The RELAY (fresh process, fresh
+    // fake client, same spec) consumes the same phase 0 from its start: the
+    // pause ends, it says its report and settles → completed (exit 0).
+    // With no --session the overflow classifier cannot fire in the relay.
+    [{ pauseMs: 1500 }, say("Relay finished the job; all items complete."), { settled: {} }],
+  ],
+  setup: (dir) => writeFileSync(join(dir, "big-session.jsonl"), "x".repeat(1_500_000)),
+  extra: { sessionFile: "big-session.jsonl" },
+  expect: ["OVERFLOW STALL", "spawning the relay", "\"exitReason\":\"completed\""],
+  expectNot: ["\"exitReason\":\"stuck-overflow\""],
+  expectExit: 0,
+  assertFiles: [
+    // Final manifest belongs to the RELAY (it overwrote the pivot manifest)
+    { path: "pi-child-result.json", expect: ['"status": "completed"', "relayedFrom"] },
+  ],
 });
 
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);

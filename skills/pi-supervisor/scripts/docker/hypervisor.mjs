@@ -140,8 +140,9 @@ const SUP_VALUE = new Set([
   "--consult-file", "--action", "--message", "--max-errors", "--heartbeat",
   "--max-text", "--idle-timeout", "--tool-timeout", "--timeout", "--finalize",
   "--stagnation", "--progress-log", "--expect-file", "--preamble",
+  "--out-dir", "--overflow-threshold-mb", "--relayed-from",
 ]);
-const SUP_BOOL = new Set(["--no-session", "--consult", "--keep-question-tool", "--keep-delegate-tool"]);
+const SUP_BOOL = new Set(["--no-session", "--consult", "--keep-question-tool", "--keep-delegate-tool", "--pivot-relaunch"]);
 const HY_VALUE = new Set([
   "--image", "--dockerfile-append", "--pre-run", "--pre-run-timeout", "--docker",
   "--workdir", "--model-base-url", "--api-key",
