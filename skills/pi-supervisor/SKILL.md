@@ -181,6 +181,8 @@ launch (fresh session + brief)  →  wait (20–30 min monitor cycles)
 
 **Budget expectations:** a fresh run converges far faster than a resumed one (field case: 58 min vs 600+ min). Give every run a real deadline (`--timeout`) — a run that hits it leaves a partial report (finalization window) and a brief, not a void.
 
+**A concrete methodology built on this loop:** for a hard, long-running *bug* hunt — differential reproduction, stage-by-stage ground-truth diffing, broken-baseline + per-fix regression proofs, the verified-facts ledger — see the **bughunt** skill, which layers a phase-by-phase playbook on top of exactly this distill-don't-resume loop.
+
 ## Multi-hour run playbook (host side)
 
 Field lessons from real long runs — including a 240-minute run on a ~0.5 tok/s local model that was killed mid-probe with no report and had to be reconstructed from logs afterwards.

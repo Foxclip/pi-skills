@@ -25,6 +25,13 @@ defines how to launch, supervise, and monitor the child.
 
 ## The core idea: the hunt is a loop of fresh runs + one growing brief
 
+> The *generic* loop — launching the child, the supervision ladder, the
+> distill-don't-resume rule, the monitoring cadence — is defined in the
+> **pi-supervisor** skill; its `Long multi-run jobs: distill, don't resume`
+> section is the single source of truth for that mechanism. This skill adds
+> only the bug-hunt phases on top. When the two describe the loop, follow
+> pi-supervisor.
+
 The model's context window is the scarce resource. A resumed transcript grows
 every run and dies once it approaches the window (the child emits **zero
 events on the first prompt**, and forking copies the same transcript, so every
