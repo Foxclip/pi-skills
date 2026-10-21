@@ -127,7 +127,7 @@ Notes: port 8765 was also used early on; 8766 is the standing one. `curl` may be
 - Two ISOs, one word apart (confused at first — big time cost): **CorePure64-17.1** (26 MB CLI-only core; its initrd is `corepure64.gz`) vs **TinyCorePure64-17.1** (GUI edition; `cde/optional/` holds 46 GUI tczs — X stack, aterm, flwm, wbar, Xfbdev…). Verified: `CorePure64-17.1.iso` = 26294272 B, md5 `9e1332dabf3c71435cf5fdf288df81cd`, from `tinycorelinux.net/17.x/x86_64/release/`.
 - Repo layout: `17.x/x86_64/{archive,release,tcz}/` — tczs are FLAT in `/tcz/` (the old `/tc/` path 404s). `.tcz` files are **squashfs** (loop-mountable: `mount -o loop x.tcz /tmp/x && ls /tmp/x` is the real content check).
 - Created 2026-10-20 as VM `TinyCore` (1 GB RAM / 2 vCPU / vram 16), later renamed `TinyCorePure64` and grown for the GUI: live config is **8 GB / 16 vCPU / vram 128** (trust `showvminfo` over history). NAT (guest sees host at `10.0.2.2`).
-- 4 GB `TinyCore.vdi` (ext4, `sda1`), currently boots from disk to a **flwm GUI desktop** (1024x768, Xorg `vesa` driver on VBoxVGA) with aterm + wbar. Root password `root` (auto-set each boot). Guest user `tc` has **passwordless full sudo** (`tc\tALL=NOPASSWD: ALL` + setuid sudo).
+- 4 GB `TinyCorePure64.vdi` (ext4, `sda1`), currently boots from disk to a **flwm GUI desktop** (1024x768, Xorg `vesa` driver on VBoxVGA) with aterm + wbar. Root password `root` (auto-set each boot). Guest user `tc` has **passwordless full sudo** (`tc\tALL=NOPASSWD: ALL` + setuid sudo).
 - Host artifacts: `E:\Trash\Empty\mouse_report.md` (input-fix report), `xsession_v3`/`xsession_v7` (host copies), `vm_gui_verify.png`, `vm_mouse_final.png`, `STATUS.md`.
 
 ### Install to disk (pure-CLI persistence, built-in tools only)
