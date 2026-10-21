@@ -96,17 +96,6 @@
 //     clock) and exits with the relay's code. Preflight at launch warns when
 //     a --session resume is already above the threshold, and the resume-mode
 //     idle watchdog is lowered 300s -> 120s.
-//   - Parent-model restore (v0.6.4): a supervised run on a single-slot local
-//     backend (llama.cpp router, e.g. parallel=1) ends with the CHILD's model
-//     resident in the server. If that is not the parent's model, the parent
-//     session's next turn pays a full cold model load. On EVERY exit path the
-//     guard therefore reloads the PARENT model (PI_PROVIDER/PI_MODEL env) via
-//     the llama.cpp router API (evicting the child's model first if the slot
-//     is occupied) before exiting. Out of scope: remote providers, and guards
-//     not launched from a pi session (no PI_* env). Opt out:
-//     --no-restore-parent-model; warmup bound: --restore-timeout (default 900s).
-//     Outcome lands in pi-child-parent-restore.json + manifest field
-//     result.parentRestore. A restore failure never changes the exit code.
 //   - Progress log: pi-child-progress.log is ALWAYS written (one line per
 //     completed tool call + [start]/[settled]/[settle]/[result]); a parent
 //     session should poll it, not the session jsonl. Override: --progress-log.
@@ -231,18 +220,6 @@ Options:
                         out-dir, finalize and preamble.
   --relayed-from <p>    Internal: mark this run as a relay of another run
                         (the manifest carries the original manifest path).
-  --no-restore-parent-model
-                        Skip the post-run parent-model restore (v0.6.4). After
-                        the child run, the guard reloads the PARENT session's
-                        model (PI_PROVIDER/PI_MODEL env) into the llama.cpp
-                        router (evicting the child's model first if the slot
-                        is occupied) so the parent's next turn does not pay a
-                        cold model load (single-slot local backends, e.g.
-                        llama.cpp with parallel=1, evict the resident model
-                        when the child loads a different one). Default: on,
-                        for local providers llama.cpp/ollama/lmstudio.
-  --restore-timeout <sec>  Timeout for the parent-model restore warmup
-                        (default 900).
 Resume from a consult file (instead of a task):
   --consult-file <p>    Consult file to resume from (usually
                         pi-child-consult.json; path is in the RESULT line)
@@ -261,11 +238,6 @@ let sessionDir = "";
 let sessionName = "";
 let provider = process.env.PI_PROVIDER || "";
 let model = process.env.PI_MODEL || "";
-// Parent session's provider/model: guard runs inside the parent pi session, so
-// PI_* identify the model the PARENT was using (before any --provider/--model
-// override above). Used for the post-run parent-model restore (v0.6.4).
-const parentProvider = process.env.PI_PROVIDER || "";
-const parentModel = process.env.PI_MODEL || "";
 let loopThreshold = 4;
 let maxSteers = 3;
 let maxForks = 2;
@@ -295,8 +267,6 @@ let overflowThresholdMb = 3;
 let pivotRelaunch = false;
 let relayedFromArg = "";
 let idleTimeoutSpecified = false;
-let restoreParentModelFlag = true;
-let restoreTimeoutSec = 900;
 
 const VALID_FLAGS = [
   "--task", "--task-file", "--session-id", "--session", "--no-session", "--session-dir",
@@ -306,8 +276,7 @@ const VALID_FLAGS = [
   "--idle-timeout", "--tool-timeout", "--timeout", "--finalize", "--stagnation",
   "--progress-log", "--expect-file", "--preamble", "--keep-question-tool",
   "--keep-delegate-tool", "--out-dir", "--overflow-threshold-mb",
-  "--pivot-relaunch", "--relayed-from", "--no-restore-parent-model",
-  "--restore-timeout",
+  "--pivot-relaunch", "--relayed-from",
   "-h", "--help",
 ];
 
@@ -348,8 +317,6 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--overflow-threshold-mb") overflowThresholdMb = Number(argv[++i]);
   else if (a === "--pivot-relaunch") pivotRelaunch = true;
   else if (a === "--relayed-from") relayedFromArg = argv[++i];
-  else if (a === "--no-restore-parent-model") restoreParentModelFlag = false;
-  else if (a === "--restore-timeout") restoreTimeoutSec = Number(argv[++i]);
   else if (a === "--keep-question-tool") keepQuestionTool = true;
   else if (a === "--keep-delegate-tool") keepDelegateTool = true;
   else if (a === "-h" || a === "--help") {
@@ -1189,99 +1156,6 @@ let exitCode = 1;
 let outcome = "error";
 let relayHappened = false; // v0.6.0: an overflow relay ran to completion
 let relayExitCode = 1;
-
-// ---------------------------------------------------------------------------
-// Parent-model restore (v0.6.4)
-// ---------------------------------------------------------------------------
-// A supervised child run on a single-slot local backend (llama.cpp router,
-// e.g. parallel=1) ends with the CHILD's model resident in the server. When
-// that is not the parent's model, the parent session's next turn pays a full
-// cold model load. The fix: right after the child run, load the PARENT model
-// back into the router here, so the parent resumes with a hot model. Mirrors
-// the pi /llama TUI "Unload all and load" behavior, unattended.
-const SINGLE_SLOT_LOCAL_PROVIDERS = new Set(["llama.cpp", "ollama", "lmstudio"]);
-function readLlamaAuth(provider) {
-  try {
-    const home = process.env.HOME || process.env.USERPROFILE || "";
-    const auth = JSON.parse(readFileSync(join(home, ".pi", "agent", "auth.json"), "utf8"));
-    const entry = (provider && auth[provider]) || auth["llama.cpp"];
-    return {
-      baseUrl: entry?.env?.LLAMA_BASE_URL || entry?.baseUrl || "",
-      apiKey: entry?.key || "",
-    };
-  } catch {
-    return { baseUrl: "", apiKey: "" };
-  }
-}
-async function restoreParentModel(context) {
-  const info = {
-    context,
-    attempted: false,
-    ok: undefined,
-    provider: parentProvider || undefined,
-    model: parentModel || undefined,
-  };
-  if (relayHappened) {
-    info.reason = "skipped: the relay run restores the parent model itself";
-    return info;
-  }
-  if (!restoreParentModelFlag) {
-    info.reason = "skipped: --no-restore-parent-model";
-    return info;
-  }
-  if (!parentProvider || !parentModel) {
-    info.reason = "skipped: no PI_PROVIDER/PI_MODEL env (guard not launched from a pi session)";
-    return info;
-  }
-  if (!SINGLE_SLOT_LOCAL_PROVIDERS.has(parentProvider.toLowerCase())) {
-    info.reason = `skipped: provider '${parentProvider}' is not a known single-slot local backend`;
-    return info;
-  }
-  info.attempted = true;
-  const t0 = Date.now();
-  try {
-    const { LlamaClient } = await import(
-      pathToFileURL(join(pkgDir, "dist", "extensions", "llama", "client.js")).href
-    );
-    const auth = readLlamaAuth(parentProvider);
-    const serverUrl = process.env.LLAMA_BASE_URL || auth.baseUrl || "http://127.0.0.1:8080";
-    const client = new LlamaClient(serverUrl, auth.apiKey);
-    let catalog = await client.list();
-    let entry = catalog.find((m) => m.id === parentModel);
-    if (entry && (entry.status.value === "loaded" || entry.status.value === "sleeping")) {
-      info.ok = true;
-      info.reason = `no restore needed: ${parentModel} is already ${entry.status.value}`;
-      logSup(`[guard] parent model ${parentModel} already ${entry.status.value} — no restore needed`);
-      return info;
-    }
-    logSup(
-      `[guard] restoring parent model ${parentModel} on ${serverUrl} after child run "${context}" ` +
-        `(child left ${model || provider || "?"} resident)`
-    );
-    const signal = AbortSignal.timeout(restoreTimeoutSec * 1000);
-    try {
-      await client.loadAndWait(parentModel, (p) => logSup(`[guard] restore: ${p.message}${p.ratio != null ? ` ${Math.round(p.ratio * 100)}%` : ""}`), signal);
-    } catch (err) {
-      // The child's model likely still holds the slot: unload it, retry the load
-      // (the TUI extension's "Unload all and load", done automatically).
-      logSup(`[guard] direct load failed (${err.message}) — evicting child model ${model || "?"} and retrying`);
-      if (model && model !== parentModel) {
-        try { await client.unloadAndWait(model, signal); } catch { /* child model may already be gone */ }
-      }
-      await client.loadAndWait(parentModel, (p) => logSup(`[guard] restore: ${p.message}${p.ratio != null ? ` ${Math.round(p.ratio * 100)}%` : ""}`), signal);
-    }
-    info.ok = true;
-    info.ms = Date.now() - t0;
-    info.server = serverUrl;
-    logSup(`[guard] parent model ${parentModel} restored in ${Math.round(info.ms / 1000)}s`);
-  } catch (err) {
-    info.ok = false;
-    info.ms = Date.now() - t0;
-    info.error = String(err?.message ?? err).slice(0, 300);
-    logSup(`[guard] PARENT MODEL RESTORE FAILED: ${info.error}`);
-  }
-  return info;
-}
 try {
   if (provider && model) {
     logSup(`[info] child provider=${provider} model=${model}`);
@@ -1811,23 +1685,5 @@ try {
   exitCode = 1;
 } finally {
   await client.stop().catch(() => {});
-  // Parent-model restore (v0.6.4): runs on EVERY exit path (completed, stuck,
-  // consult, error) so the parent session's next turn never pays a cold model
-  // load. Best effort — a restore failure never changes the run's exit code.
-  try {
-    const restoreInfo = await restoreParentModel(outcome);
-    try {
-      writeFileSync(join(outDir, "pi-child-parent-restore.json"), JSON.stringify(restoreInfo, null, 2));
-    } catch { /* best effort */ }
-    if (!relayHappened && existsSync(manifestPath)) {
-      try {
-        const m = JSON.parse(readFileSync(manifestPath, "utf8"));
-        m.result.parentRestore = restoreInfo;
-        writeFileSync(manifestPath, JSON.stringify(m, null, 2));
-      } catch { /* best effort */ }
-    }
-  } catch (e) {
-    logSup(`[guard] parent-model restore hook error: ${e?.message ?? e}`);
-  }
 }
 process.exit(exitCode);
