@@ -1,6 +1,6 @@
 ---
 name: pi-vmbox
-description: Run and drive VirtualBox VMs in E:\VMBox on this Windows host, headless — create/configure VMs (VirtualBox 7.1.4 option names), boot from ISO, type/scancode into a console, relay files over NAT, screenshot-verify, and edit the VDI from the host. Section 2 covers the TinyCore Pure64 17.1 VM specifically: disk install, Xorg/vesa/flwm GUI stack, the evdev input fix, and the persistent .xsession. Use for any VM work in E:\VMBox — creating VMs, installing OSes, GUI repair, or post-mortem diagnosis.
+description: Run and drive VirtualBox VMs in E:\VMBox on this Windows host, headless — create/configure VMs (VirtualBox 7.1.4 option names), boot from ISO, type/scancode into a console, relay files over NAT, screenshot-verify, and edit the VDI from the host. Section 2 covers the TinyCore Pure64 17.1 VM specifically — disk install, Xorg/vesa/flwm GUI stack, the evdev input fix, and the persistent .xsession. Use for any VM work in E:\VMBox — creating VMs, installing OSes, GUI repair, or post-mortem diagnosis.
 ---
 
 # pi-vmbox — Virtual machines in E:\VMBox (Windows, VirtualBox 7.1.4, headless)
