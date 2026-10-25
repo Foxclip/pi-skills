@@ -630,13 +630,33 @@ plog(
 // loop is one read + JSON.parse: no line matching, and the file always
 // reflects the current attempt (session id/file, tool count, elapsed).
 const statusFilePath = join(outDir, "pi-child-status.json");
+// v:2 status contract (v0.13.0) — liveness fields for scripts/monitor.mjs:
+//   guardPid  this guard's pid. A KILLED guard never updates the file, so
+//             "running" + dead guardPid is the dead-run signature. The monitor
+//             checks the process, never the file alone — file-only liveness was
+//             the 24-minute blind window in the VMWare campaign (2026-10-26).
+//   childPid  the spawned child's pid; RpcClient does not expose it, so null
+//             for now (kept in the schema for the future).
+//   at        heartbeated every 30s while running (even mid model-think), so
+//             file freshness is a usable signal for v:1-style readers too.
+// `starting` is written BEFORE the child spawns, so the file exists from
+// launch (scripts/launch.mjs verifies against it). PIDs are nulled in the
+// final write (process "exit" hook + signal handler) so a finished or killed
+// run can never claim a live guard.
+let lastStatus = "starting";
+let lastExitReason = undefined;
+const statusPids = { guardPid: process.pid, childPid: null };
 function writeStatus(status, exitReason) {
   try {
+    lastStatus = status;
+    lastExitReason = exitReason;
     const payload = {
-      v: 1,
+      v: 2,
       at: new Date().toISOString(),
-      status, // running | completed | stuck | consult | error
+      status, // starting | running | completed | stuck | consult | error
       exitReason: exitReason || undefined,
+      guardPid: statusPids.guardPid,
+      childPid: statusPids.childPid,
       attempt,
       rewinds: rewindsUsed,
       toolCalls: totalToolCalls,
@@ -651,6 +671,37 @@ function writeStatus(status, exitReason) {
     writeFileSync(statusFilePath, JSON.stringify(payload, null, 2));
   } catch { /* best effort */ }
 }
+writeStatus("starting");
+
+// v0.13.0 liveness plumbing (companion: scripts/monitor.mjs):
+//  - heartbeat: rewrites the status every 30s while running/starting, so `at`
+//    stays fresh even during long model thinking. A killed guard freezes the
+//    file — freshness is only meaningful because a live guard keeps it fresh.
+//  - process "exit" hook: nulls the PIDs in the final file on ANY exit path
+//    (normal, error, signal). Skipped for relay runs — the relay owns the file.
+//  - SIGTERM/SIGINT: best-effort "error/killed-<sig>" marking. Windows console
+//    tree-kills (TerminateProcess) skip both of these and deliver no signal —
+//    the monitor's PID check, not this, is the primary mechanism.
+let heartbeatTimer = null;
+function stopHeartbeat() {
+  try { if (heartbeatTimer) clearInterval(heartbeatTimer); } catch { /* ignore */ }
+  heartbeatTimer = null;
+}
+heartbeatTimer = setInterval(() => {
+  if (lastStatus === "running" || lastStatus === "starting") writeStatus(lastStatus);
+}, 30_000);
+try { heartbeatTimer.unref(); } catch { /* ignore */ }
+try {
+  process.on("exit", () => {
+    if (typeof relayHappened !== "undefined" && relayHappened) return; // relay owns the status file
+    stopHeartbeat();
+    statusPids.guardPid = null;
+    statusPids.childPid = null;
+    writeStatus(lastStatus, lastExitReason);
+  });
+  process.on("SIGTERM", () => { try { writeStatus("error", "killed-SIGTERM"); } catch { /* ignore */ } process.exit(1); });
+  process.on("SIGINT", () => { try { writeStatus("error", "killed-SIGINT"); } catch { /* ignore */ } process.exit(1); });
+} catch { /* ignore */ }
 
 function logSup(msg) {
   process.stderr.write(msg + "\n");
@@ -1142,6 +1193,7 @@ async function doOverflowPivot(idleMs) {
   writePivotManifest();
   logSup("[guard] --pivot-relaunch: spawning the relay (fresh session, remaining wall clock)");
   plog(`[relay] ${new Date().toISOString()} spawning relay (fresh session)\n`);
+  stopHeartbeat(); // the relay now owns the status file — this process must not write it
   try { await client.stop(); } catch { /* already stopped */ }
   const child = spawn(process.execPath, [GUARD_PATH, ...args], {
     stdio: ["ignore", "inherit", "inherit"],
