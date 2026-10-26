@@ -124,7 +124,8 @@
 //     session to resume), 1 error, 2 usage.
 
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -144,8 +145,8 @@ Options:
                         task on top of it (mutually exclusive with --session-id)
   --session-dir <dir>   Override where sessions are stored/looked up
   --name <name>         Session display name (default: the session ID)
-  --provider <p>        Provider for the child (default: $PI_PROVIDER)
-  --model <m>           Model for the child (default: $PI_MODEL)
+  --provider <p>        Provider for the child (default: parent session's provider)
+  --model <m>           Model for the child (default: parent session's model)
   --loop-threshold <n>  Consecutive identical tool calls that count as a loop
                         (default: 4 — fires one before the host repetition
                         guard's default abort-at-5, so the steer lands first)
@@ -241,8 +242,8 @@ let sessionRef = "";
 let noSession = false;
 let sessionDir = "";
 let sessionName = "";
-let provider = process.env.PI_PROVIDER || "";
-let model = process.env.PI_MODEL || "";
+let provider = "";
+let model = "";
 let loopThreshold = 4;
 let maxSteers = 3;
 let maxForks = 2;
@@ -469,11 +470,82 @@ for (const [flag, value] of [
   }
 }
 
+// Best-effort parent-session discovery: the most recently modified session
+// jsonl. Used only when PI_SESSION_FILE is absent (e.g. MCP-sandbox envs
+// where pi exports no session vars).
+function latestSessionFile() {
+  try {
+    const root = join(homedir(), ".pi", "agent", "sessions");
+    const files = [];
+    for (const d of readdirSync(root, { withFileTypes: true })) {
+      if (!d.isDirectory()) continue;
+      for (const f of readdirSync(join(root, d.name))) {
+        if (f.endsWith(".jsonl")) {
+          const p = join(root, d.name, f);
+          files.push({ p, m: statSync(p).mtimeMs });
+        }
+      }
+    }
+    files.sort((a, b) => b.m - a.m);
+    return files.length > 0 ? files[0].p : "";
+  } catch {
+    return "";
+  }
+}
+
+// The child matches the parent session's model by default. Per field:
+// explicit flag > PI_PROVIDER/PI_MODEL env (pi sets these on its own tools)
+// > the parent session file's last model-carrying message (PI_SESSION_FILE,
+// else the most recently modified session jsonl). sourceFile is set only
+// when both fields came from the session (used for the log line).
+function discoverParentModel(flagProvider, flagModel) {
+  const provider = flagProvider || process.env.PI_PROVIDER || "";
+  const model = flagModel || process.env.PI_MODEL || "";
+  if (provider && model) return { provider, model, sourceFile: "" };
+  const sf = process.env.PI_SESSION_FILE || latestSessionFile();
+  if (!sf) return { provider, model, sourceFile: "" };
+  try {
+    let last = null;
+    for (const line of readFileSync(sf, "utf8").split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const m = JSON.parse(line).message;
+        if (m && m.provider && m.model) last = m;
+      } catch { /* non-message line */ }
+    }
+    if (!last) return { provider, model, sourceFile: "" };
+    return {
+      provider: provider || last.provider,
+      model: model || last.model,
+      sourceFile: provider || model ? "" : sf,
+    };
+  } catch {
+    return { provider, model, sourceFile: "" };
+  }
+}
+
+const pm = discoverParentModel(provider, model);
+provider = pm.provider;
+model = pm.model;
+
 // Locate the installed @earendil-works/pi-coding-agent package (same as the
-// rpc-child.mjs harness: PI_PACKAGE_DIR > npm root -g > %APPDATA%\npm).
+// rpc-child.mjs harness: PI_PACKAGE_DIR > self-managed install
+// (~/.pi/agent/install/releases/<ver>, per the current-version file)
+// > npm root -g > %APPDATA%\npm).
 function resolvePackageDir() {
   const candidates = [];
   if (process.env.PI_PACKAGE_DIR) candidates.push(process.env.PI_PACKAGE_DIR);
+  try {
+    const installRoot = join(homedir(), ".pi", "agent", "install");
+    const version = readFileSync(join(installRoot, "current-version"), "utf8").trim();
+    if (version) {
+      candidates.push(
+        join(installRoot, "releases", version, "node_modules", "@earendil-works", "pi-coding-agent")
+      );
+    }
+  } catch {
+    // not a self-managed install — fall through
+  }
   try {
     const root = execFileSync("npm", ["root", "-g", "--silent"], {
       encoding: "utf8",
@@ -1268,9 +1340,9 @@ let relayHappened = false; // v0.6.0: an overflow relay ran to completion
 let relayExitCode = 1;
 try {
   if (provider && model) {
-    logSup(`[info] child provider=${provider} model=${model}`);
+    logSup(`[info] child provider=${provider} model=${model}${pm.sourceFile ? ` (inherited from ${pm.sourceFile})` : ""}`);
   } else {
-    logSup("[warn] no PI_PROVIDER/PI_MODEL in env; child will use configured defaults");
+    logSup("[warn] no parent provider/model found (flags, PI_PROVIDER/PI_MODEL, or session file); child will use configured defaults");
   }
   logSup(`[info] starting supervised child: ${cliPath} --mode rpc ${args.join(" ")}`);
   logSup(

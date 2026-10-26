@@ -65,13 +65,13 @@ node scripts/rpc-child.mjs --session <path-or-exact-id> --turn "..."
 
 ## Critical gotchas (learned the hard way — do not skip)
 
-1. **The child does NOT inherit the parent session's model.** A bare child uses the *configured default* model. For local providers (llama.cpp) that means loading a different GGUF — very slow, or failing. Fix: pass `--provider`/`--model`; the harness auto-inherits the parent session's `PI_PROVIDER`/`PI_MODEL` env vars, which is why it "just works" inside a pi session.
+1. **The child matches the parent session's model by default.** Precedence: explicit `--provider`/`--model` flags > `PI_PROVIDER`/`PI_MODEL` env vars (pi sets these on its own tools) > the parent session file (`PI_SESSION_FILE`, else the most recently modified session jsonl under `~/.pi/agent/sessions` — covers envs where pi exports no session vars, e.g. MCP sandboxes; the info log names the file when both fields came from there). If none of those exist the child falls back to the *configured default* model — for local providers (llama.cpp) that means loading a different GGUF: very slow, or failing.
 2. **`RpcClient.promptAndWait` defaults to a 60-second timeout.** Slow local models exceed this. Always pass an explicit per-turn timeout (harness default: 5 min; `--timeout <ms>`). If a turn may exceed even that, see **Long-running work** below.
 3. **Dialog tools hang the child.** `ask_user_question` (and similar extension-UI dialog tools) make the child emit an `extension_ui_request` on stdout and block until the client sends back a matching `extension_ui_response` on stdin. The harness excludes `ask_user_question` by default (`--keep-question-tool` retains it — then your client MUST answer dialogs per the RPC extension-UI protocol). The supervisor additionally excludes `acp_delegate` from the child's toolset by default (v0.4.0) — a child's sub-agents would run outside the supervision ladder (`--keep-delegate-tool` retains it).
 4. **The child has zero context from the parent conversation.** Every prompt must be self-contained: include file paths, constraints, and everything the child needs — the same rule as writing `acp_delegate` tasks.
 5. **`agent_end` ≠ done.** Retries, compaction, or queued work can follow `agent_end`; wait for `agent_settled` (the harness does this via `promptAndWait`).
 6. **The child's stdout is the protocol.** Diagnostics belong on stderr; never write non-protocol data to the child's stdin/stdout.
-7. **Windows/Node**: the child needs the pi CLI entry `dist/bundle/cli.js` of the installed package (the package `bin`), not `dist/cli.js` from a repo checkout. The harness resolves the global install automatically (`PI_PACKAGE_DIR` env overrides).
+7. **Windows/Node**: the child needs the pi CLI entry `dist/bundle/cli.js` of the installed package (the package `bin`), not `dist/cli.js` from a repo checkout. The harness resolves the install automatically: `PI_PACKAGE_DIR` env > self-managed install (`~/.pi/agent/install/releases/<ver>` per `current-version`) > npm global > `%APPDATA%\npm` (Windows).
 8. **Sessions are per-project.** The same `--session-id` resolves only in the same working directory (sessions live under `~/.pi/agent/sessions`, grouped by cwd). Resuming from a different cwd silently starts a fresh session. `--session`/`--session-id` must reference an exact ID or path — partial IDs may open the interactive picker, which blocks forever in RPC mode.
 
 ## Long-running work (when a turn exceeds the timeout)
@@ -242,7 +242,7 @@ const client = new RpcClient({
   cliPath: `${pkgDir}/dist/bundle/cli.js`,
   args: [
     "--no-session",
-    "--provider", process.env.PI_PROVIDER, // child would otherwise use configured defaults
+    "--provider", process.env.PI_PROVIDER, // custom client: pass the parent's model explicitly (the harness scripts inherit it themselves)
     "--model", process.env.PI_MODEL,
     "--exclude-tools", "ask_user_question", // dialog tools block on unanswered UI requests
   ],
