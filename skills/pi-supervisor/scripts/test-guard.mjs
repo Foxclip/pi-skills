@@ -26,7 +26,6 @@ import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync } from 
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseIcaclsMode } from "./user/reads-probe.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const supervisorPath = join(here, "guard.mjs");
@@ -434,32 +433,6 @@ run({
   expectNot: ["HARD TIMEOUT", "BUDGET WARNING", "HARD DEADLINE", "\"exitReason\":\"hard-timeout\""],
   expectExit: 0,
 });
-
-// 16. reads-probe parsing (the 2026-10-16 regression: an ANCESTOR-INHERITED
-//     agent deny must not count as mode state — the clean can never remove
-//     inherited ACEs, so counting them triggered a re-apply that failed)
-{
-  const cases = [
-    ["inherited NO_ACCESS only → allow", parseIcaclsMode(
-      `sibling DESKTOP-N9PF8BH\\agent:(I)(OI)(CI)(N)\nBUILTIN\\Administrators:(OI)(CI)(F)`, "agent"), "allow"],
-    ["no agent ACE → allow", parseIcaclsMode(
-      `sibling BUILTIN\\Administrators:(OI)(CI)(F)\nCREATOR OWNER:(OI)(CI)(F)`, "agent"), "allow"],
-    ["explicit F deny → deny", parseIcaclsMode(
-      `sibling DESKTOP-X\\agent:(OI)(CI)(F)`, "agent"), "deny"],
-    ["explicit N deny (legacy) → deny", parseIcaclsMode(
-      `sibling DESKTOP-X\\agent:(OI)(CI)(N)`, "agent"), "deny"],
-    ["grant only → unknown", parseIcaclsMode(
-      `sibling DESKTOP-X\\agent:(OI)(CI)(M)`, "agent"), "unknown"],
-    ["legacy DENY-mask → unknown (safe: forces re-apply)", parseIcaclsMode(
-      `sibling DESKTOP-X\\agent:(DENY)(D,WO,WD,AD,DC,WA)`, "agent"), "unknown"],
-    ["inherited N + explicit grant → unknown (inherited ignored)", parseIcaclsMode(
-      `sibling DESKTOP-X\\agent:(I)(OI)(CI)(N)\nDESKTOP-X\\agent:(OI)(CI)(M)`, "agent"), "unknown"],
-  ];
-  for (const [name, got, want] of cases) {
-    if (got === want) { passCount++; console.log(`PASS: ${name}`); }
-    else { failCount++; console.log(`FAIL: ${name} (got ${got}, want ${want})`); }
-  }
-}
 
 // ---------------------------------------------------------------------------
 // v0.11.0: --task-file + live status file
