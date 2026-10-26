@@ -220,6 +220,11 @@ Options:
                         out-dir, finalize and preamble.
   --relayed-from <p>    Internal: mark this run as a relay of another run
                         (the manifest carries the original manifest path).
+  --force               Allow starting in an --out-dir whose status file is
+                        owned by a LIVE guard process (its artifacts get
+                        overwritten/appended). Without it the guard refuses
+                        to start — protects a live run from a second launch
+                        or a diagnostic probe pointing at the same out-dir.
 Resume from a consult file (instead of a task):
   --consult-file <p>    Consult file to resume from (usually
                         pi-child-consult.json; path is in the RESULT line)
@@ -266,6 +271,7 @@ let outDirArg = "";
 let overflowThresholdMb = 3;
 let pivotRelaunch = false;
 let relayedFromArg = "";
+let force = false;
 let idleTimeoutSpecified = false;
 
 const VALID_FLAGS = [
@@ -276,7 +282,7 @@ const VALID_FLAGS = [
   "--idle-timeout", "--tool-timeout", "--timeout", "--finalize", "--stagnation",
   "--progress-log", "--expect-file", "--preamble", "--keep-question-tool",
   "--keep-delegate-tool", "--out-dir", "--overflow-threshold-mb",
-  "--pivot-relaunch", "--relayed-from",
+  "--pivot-relaunch", "--relayed-from", "--force",
   "-h", "--help",
 ];
 
@@ -317,6 +323,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--overflow-threshold-mb") overflowThresholdMb = Number(argv[++i]);
   else if (a === "--pivot-relaunch") pivotRelaunch = true;
   else if (a === "--relayed-from") relayedFromArg = argv[++i];
+  else if (a === "--force") force = true;
   else if (a === "--keep-question-tool") keepQuestionTool = true;
   else if (a === "--keep-delegate-tool") keepDelegateTool = true;
   else if (a === "-h" || a === "--help") {
@@ -613,13 +620,64 @@ function resetAttemptCounters() {
 // should poll THIS small file instead of parsing the (multi-MB) session
 // jsonl.
 const outDir = outDirArg || process.cwd();
+// Expected-file resolution (fixed 2026-10-26, found by a live child): a bare
+// relative name ("report.md") is expected in the OUT DIR — the child's
+// artifacts live there, while existsSync(bareName) resolved it against the
+// guard's cwd and flagged the file missing even though the child wrote it to
+// the out dir exactly as told. Absolute paths and names with separators are
+// used as-is; a bare name is satisfied by the out-dir copy OR a cwd copy.
+const isBareFileName = (f) => !f.includes("/") && !f.includes("\\") && !/^[A-Za-z]:/.test(f);
+const expectedExists = (f) => isBareFileName(f)
+  ? (existsSync(join(outDir, f)) || existsSync(f))
+  : existsSync(f);
 try { mkdirSync(outDir, { recursive: true }); } catch { /* best effort */ }
 const progressLogPath = progressLogArg || join(outDir, "pi-child-progress.log");
 const manifestPath = join(outDir, "pi-child-result.json");
-writeFileSync(progressLogPath, "");
+const statusFilePath = join(outDir, "pi-child-status.json");
+
+// v0.14.0: out-dir ownership. A second guard pointed at a live run's out-dir
+// (a diagnostic probe, or a parent that misread a slow launch as a failed
+// one) used to silently truncate the live run's progress log and clobber its
+// status file. If the status file names a LIVE guard process, refuse to
+// start unless --force. Stale owners are overwritable: the v:2 exit hook
+// nulls the pids on any exit, so a healthy finished run never looks live.
+function pidAliveCheck(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    if (process.platform === "win32") {
+      const out = execFileSync("tasklist", ["/FI", `PID eq ${pid}`], {
+        encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+      });
+      return out.split(/\r?\n/).some((l) => {
+        const f = l.trim().split(/\s+/);
+        return f.length > 1 && f[1] === String(pid);
+      });
+    }
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return !!(e && e.code === "EPERM"); // exists, owned by someone else
+  }
+}
+let liveOwner = null;
+if (!relayedFromArg) { // a relay deliberately reuses the parent's out-dir
+  try {
+    const j = JSON.parse(readFileSync(statusFilePath, "utf8"));
+    if (j && (j.status === "running" || j.status === "starting") && pidAliveCheck(j.guardPid)) liveOwner = j;
+  } catch { /* no file or unparsable → unowned */ }
+}
+if (liveOwner && !force) {
+  console.error(
+    `error: ${outDir} is owned by a live guard (pid ${liveOwner.guardPid}, session ${liveOwner.sessionId || "?"}). ` +
+    `Point at a different --out-dir, or pass --force to overwrite its artifacts.`
+  );
+  process.exit(2);
+}
+if (liveOwner) console.error(`[warn] --force: overwriting artifacts of live guard pid ${liveOwner.guardPid} (session ${liveOwner.sessionId || "?"}) — appending to its progress log`);
+if (!liveOwner) writeFileSync(progressLogPath, ""); // fresh dir or dead owner → clean log
 const plog = (s) => { try { appendFileSync(progressLogPath, s); } catch { /* best effort */ } };
 plog(
-  `[start] ${new Date().toISOString()} task=${task.length}chars ` +
+  `[start] ${new Date().toISOString()} pid=${process.pid} task=${task.length}chars ` +
     `hard=${hardTimeoutMs > 0 ? Math.round(hardTimeoutMs / 60000) + "min" : "none"} session=${sessionId || "?"} ` +
     `consult=${consult ? "on" : "off"}\n`
 );
@@ -629,7 +687,6 @@ plog(
 // state transition (start/steer/fork/consult/result/error). A monitoring
 // loop is one read + JSON.parse: no line matching, and the file always
 // reflects the current attempt (session id/file, tool count, elapsed).
-const statusFilePath = join(outDir, "pi-child-status.json");
 // v:2 status contract (v0.13.0) — liveness fields for scripts/monitor.mjs:
 //   guardPid  this guard's pid. A KILLED guard never updates the file, so
 //             "running" + dead guardPid is the dead-run signature. The monitor
@@ -666,7 +723,7 @@ function writeStatus(status, exitReason) {
       sessionId: stateSessionId || null,
       sessionFile: stateSessionFile || null,
       sessionBytes: stateSessionFile && existsSync(stateSessionFile) ? statSync(stateSessionFile).size : undefined,
-      expectedFiles: expectFiles.length > 0 ? Object.fromEntries(expectFiles.map((f) => [f, existsSync(f)])) : undefined,
+      expectedFiles: expectFiles.length > 0 ? Object.fromEntries(expectFiles.map((f) => [f, expectedExists(f)])) : undefined,
     };
     writeFileSync(statusFilePath, JSON.stringify(payload, null, 2));
   } catch { /* best effort */ }
@@ -1100,7 +1157,8 @@ function buildOverflowBrief(idleMs) {
   if (expectFiles.length > 0) {
     L.push("");
     L.push("## Required artifacts");
-    for (const f of expectFiles) L.push(`- ${f}`);
+    L.push(`(written to the run out dir: ${outDir})`);
+    for (const f of expectFiles) L.push(`- ${isBareFileName(f) ? join(outDir, f) : f}`);
   }
   if (remainMin > 0) {
     L.push("");
@@ -1220,6 +1278,9 @@ try {
       `idle=${Math.round(idleTimeoutMs / 1000)}s tool=${Math.round(toolTimeoutMs / 1000)}s ` +
       `hard=${hardTimeoutMs > 0 ? Math.round(hardTimeoutMs / 60000) + "min" : "none"}`
   );
+  if (hardTimeoutMs === 0) {
+    logSup("[warn] --timeout 0: no wall clock — --finalize is a no-op; sensors + the parent's monitor cycles are the only bounds");
+  }
   logSup(
     `[guard] task: ${task.length} chars — "${task.slice(0, 160).replace(/\s+/g, " ")}${task.length > 160 ? "…" : ""}"`
   );
@@ -1404,7 +1465,7 @@ try {
           }
           if (!ev.aborted) {
             const si = await inspectSettle();
-            const missing = expectFiles.filter((f) => !existsSync(f));
+            const missing = expectFiles.filter((f) => !expectedExists(f));
             const emptyStop = attemptTextChars === 0 && attemptToolCalls === 0;
             const strayTail = si.textChars === 0 && si.thinkingChars > 0 && attemptTextChars < 200;
             if (!emptyStop && !strayTail && missing.length === 0) {
@@ -1458,7 +1519,7 @@ try {
           const emptyStop = attemptTextChars === 0 && attemptToolCalls === 0;
           const strayTail = si.textChars === 0 && si.thinkingChars > 0 && attemptTextChars < 200;
           const degenerate = emptyStop || strayTail;
-          const missing = expectFiles.filter((f) => !existsSync(f));
+          const missing = expectFiles.filter((f) => !expectedExists(f));
           if (degenerate || missing.length > 0) {
             const dReason = emptyStop
               ? `with no text and no tool activity`
@@ -1663,6 +1724,10 @@ try {
     finalText = (await client.getLastAssistantText())?.text ?? "";
   } catch { /* best effort */ }
   if (!finalText) finalText = finalTextAcc.trim();
+  // v0.14.0: full final text on disk for host mode too (previously only the
+  // 4000-char manifest slice; the user-variant mode already wrote this file).
+  const finalTextFile = join(outDir, "pi-child-final.txt");
+  try { writeFileSync(finalTextFile, finalText); } catch { /* best effort */ }
 
   const isConsult = outcome.startsWith("consult-");
   const isCompleted = outcome === "completed" || outcome === "completed-finalized";
@@ -1679,6 +1744,7 @@ try {
     sessionFile: stateSessionFile || null,
     finalText: finalText.slice(0, 4000),
     finalTextTruncated: finalText.length > 4000,
+    finalTextFile: finalTextFile,
     settle: {
       attemptTextChars,
       attemptToolCalls,

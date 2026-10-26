@@ -430,7 +430,7 @@ run({
     // supervisor prompts only once, and steer/fork prompts consume later ones.
     [{ pauseMs: 2500 }, ...tool("bash", { cmd: "ls" }), ...done("Done, report saved.")],
   ],
-  expect: ["\"status\":\"completed\""],
+  expect: ["\"status\":\"completed\"", "[warn] --timeout 0: no wall clock"],
   expectNot: ["HARD TIMEOUT", "BUDGET WARNING", "HARD DEADLINE", "\"exitReason\":\"hard-timeout\""],
   expectExit: 0,
 });
@@ -681,6 +681,50 @@ run({
     { path: "pi-child-result.json", expect: ['"status": "completed"', "relayedFrom"] },
   ],
 });
+
+// v0.14.0: out-dir ownership (the 2026-10-26 toposort review, F2: a second
+// guard pointed at a live run's out-dir silently truncated its progress log
+// and clobbered its status file)
+{
+  const liveOwnerStatus = {
+    v: 2, at: new Date().toISOString(), status: "running",
+    guardPid: process.pid, sessionId: "owner-run",
+  };
+  run({
+    name: "out-dir owned by a live guard → refuse without --force (exit 2)",
+    args: [TASK],
+    phases: [],
+    expectExit: 2,
+    expect: ["is owned by a live guard", "different --out-dir", "--force"],
+    expectNot: ["[start]"],
+    setup: (dir) => writeFileSync(join(dir, "pi-child-status.json"), JSON.stringify(liveOwnerStatus)),
+  });
+  run({
+    name: "--force → starts in a live-guard dir and APPENDS to its progress log",
+    args: [TASK, "--force"],
+    phases: [done("forced ok")],
+    expect: ["--force: overwriting artifacts", "\"status\":\"completed\""],
+    expectExit: 0,
+    setup: (dir) => {
+      writeFileSync(join(dir, "pi-child-status.json"), JSON.stringify(liveOwnerStatus));
+      writeFileSync(join(dir, "pi-child-progress.log"), "sentinel-from-owner\n");
+    },
+    assertFiles: [
+      { path: "pi-child-progress.log", expect: ["sentinel-from-owner", "[start]", "pid="] },
+    ],
+  });
+  run({
+    name: "stale owner (dead pid) → overwrites without --force",
+    args: [TASK],
+    phases: [done("stale ok")],
+    expect: ["\"status\":\"completed\""],
+    expectNot: ["is owned by a live guard"],
+    expectExit: 0,
+    setup: (dir) => writeFileSync(join(dir, "pi-child-status.json"), JSON.stringify({
+      ...liveOwnerStatus, guardPid: 99999999, sessionId: "dead-owner",
+    })),
+  });
+}
 
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);
 process.exit(failCount === 0 ? 0 : 1);

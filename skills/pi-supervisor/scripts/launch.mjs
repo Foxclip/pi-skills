@@ -22,7 +22,9 @@
 //   Extra launch options:
 //     --guard <path>     guard script to start (default: guard.mjs next to this file)
 //                        (exists for tests — point it at a fake guard)
-//     --verify-sec <n>   how long to verify the launch (default 8)
+//     --verify-sec <n>   stage-1 verification window (default 8)
+//     --grace-sec <n>    stage-2 grace if the status file is slow but the guard
+//                        process is alive (default 60)
 //
 // Behavior:
 //   - spawns guard.mjs with detached + hidden window (Windows) + unref — the
@@ -31,11 +33,24 @@
 //     preserved from the nohup fallback)
 //   - creates --out-dir if missing
 //   - refuses backslash paths with a clear error (forward slashes only)
-//   - VERIFIES the launch (the checklist in SKILL.md, "Verify the launch"):
-//     guard process alive AND the status file appeared with a live status
+//   - VERIFIES the launch in two stages (the checklist in SKILL.md, "Verify
+//     the launch"): stage 1 (--verify-sec) waits for the status file — the
+//     guard writes "starting" before it spawns its child, so on a warm host
+//     this is a second or two. If the file is still missing but the guard
+//     PROCESS is alive, stage 2 (--grace-sec) extends the wait: node cold
+//     start / AV scanning of a detached hidden process measured ~14s on a
+//     Windows dev host (2026-10-26). An alive-but-silent process is NOT a
+//     failed launch — a bare launched:false would nudge the parent into a
+//     second launch into the same out-dir.
 //   - prints one JSON line and exits:
 //       success: {"launched":true,"guardPid":…,"status":{…},"statusPath":…}
-//       failure: {"launched":false,"reason":…}  (non-zero exit)
+//       unknown: {"launched":"unknown","guardPid":…,"reason":…}  (exit 0 —
+//                 process alive but silent after verify+grace; check it
+//                 yourself, do not relaunch)
+//       failure: {"launched":false,"reason":…,"launchOutTail":…,
+//                 "launchErrTail":…}  (non-zero exit — only for a DEAD
+//                 process or an arg-level refusal; the tails are inline so
+//                 no second read is needed)
 //
 // The caller's shell call should not need a long timeout: this returns in
 // ~verify-sec.
@@ -47,8 +62,21 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+let outDir = null; // hoisted so fail() can attach launch.out/err tails
+let child = null;  // hoisted so fail() can report the pid/exit code
+
 function fail(reason) {
-  console.log(JSON.stringify({ launched: false, reason }));
+  const obj = { launched: false, reason };
+  if (child) { obj.guardPid = child.pid; obj.exitCode = child.exitCode; }
+  if (outDir) {
+    for (const [key, p] of [["launchOutTail", join(outDir, "launch.out")], ["launchErrTail", join(outDir, "launch.err")]]) {
+      try {
+        const tail = readFileSync(p, "utf8").split(/\r?\n/).filter((l) => l.trim()).slice(-5).join(" | ");
+        if (tail) obj[key] = tail.slice(-2000);
+      } catch { /* file not there yet */ }
+    }
+  }
+  console.log(JSON.stringify(obj));
   process.exit(1);
 }
 
@@ -62,6 +90,7 @@ const VALUELESS = new Set([
 
 let guardPath = join(HERE, "guard.mjs");
 let verifySec = 8;
+let graceSec = 60;
 let task = null;
 let taskFromFlag = false; // --task/--task-file values stay in passthrough; only a positional task is prepended
 let pendingValueFor = null; // last seen flag awaiting its value
@@ -71,6 +100,7 @@ for (let i = 0; i < argv.length; i++) {
   const x = argv[i];
   if (x === "--guard") { guardPath = argv[++i]; pendingValueFor = null; continue; }
   if (x === "--verify-sec") { verifySec = Number(argv[++i]); pendingValueFor = null; continue; }
+  if (x === "--grace-sec") { graceSec = Number(argv[++i]); pendingValueFor = null; continue; }
   if (x === "--") { passthrough.push(x); pendingValueFor = null; continue; }
   if (x.startsWith("--")) {
     pendingValueFor = VALUELESS.has(x) ? null : x;
@@ -124,7 +154,6 @@ for (let i = 0; i < passthrough.length; i++) {
 }
 
 // --out-dir: create it (redirect targets and status file must have a home).
-let outDir = null;
 for (let i = 0; i < passthrough.length; i++) {
   if (passthrough[i] === "--out-dir") outDir = passthrough[i + 1];
 }
@@ -134,7 +163,6 @@ try { mkdirSync(outDir, { recursive: true }); } catch (e) { fail(`cannot create 
 // Launch: detached + unref → survives the caller's timeout. Hidden window on
 // Windows (detached implies CREATE_NEW_CONSOLE; windowsHide suppresses it).
 const guardArgs = taskFromFlag ? [guardPath, ...passthrough] : [guardPath, task, ...passthrough];
-let child;
 try {
   const outFd = openSync(join(outDir, "launch.out"), "a");
   const errFd = openSync(join(outDir, "launch.err"), "a");
@@ -148,30 +176,51 @@ try {
 }
 child.unref();
 
-// Verify: guard process alive AND the status file appeared with a live status.
-// (A killed guard leaves a stale "running" — the process check, not the file,
-// is what proves the launch worked. The guard writes status "starting" before
-// it spawns its child, so the file is expected within a second or two.)
+// Verify (two stages). Stage 1 (--verify-sec): wait for the status file.
+// Stage 2 (--grace-sec): file still missing but the guard PROCESS is alive →
+// slow host startup; keep waiting. Only a DEAD process is a failure (with the
+// launch.out/launch.err tails inlined); an alive-but-silent process is
+// "unknown" (exit 0) so the parent verifies instead of relaunching.
 const statusPath = join(outDir, "pi-child-status.json");
 const t0 = Date.now();
+const deadline = t0 + (verifySec + graceSec) * 1000;
 let seen = null;
-while (Date.now() - t0 < verifySec * 1000) {
+let seenAtMs = 0;
+while (Date.now() - t0 < deadline) {
   await sleep(500);
   if (child.exitCode !== null || child.signalCode !== null) {
-    fail(`guard process exited during launch (code ${child.exitCode}, signal ${child.signalCode || "none"}) — read ${join(outDir, "launch.out")} and ${join(outDir, "launch.err")}`);
+    fail(`guard process exited before the launch could be verified (code ${child.exitCode}, signal ${child.signalCode || "none"}) — see launchOutTail/launchErrTail`);
   }
   try {
     seen = JSON.parse(readFileSync(statusPath, "utf8"));
-    if (seen.status === "starting" || seen.status === "running") break;
     if (seen.status === "error" || seen.status === "stuck") {
-      fail(`status file already terminal at launch: status=${seen.status} exitReason=${seen.exitReason || "?"} — read ${join(outDir, "launch.out")}`);
+      fail(`status file already terminal at launch: status=${seen.status} exitReason=${seen.exitReason || "?"} — see launchOutTail/launchErrTail`);
     }
+    // starting|running|completed|consult — the guard is (was) alive and writing
+    seenAtMs = Date.now() - t0;
+    break;
   } catch {
     seen = null; // not written yet
   }
 }
 if (!seen) {
-  fail(`status file did not appear at ${statusPath} within ${verifySec}s — the launch likely failed; check the arguments and ${join(outDir, "launch.out")}`);
+  // Still no file after verify+grace and the process is ALIVE (a dead process
+  // would have failed above). Slow host, not a failed launch.
+  console.log(JSON.stringify({
+    launched: "unknown",
+    guardPid: child.pid,
+    reason: `status file still absent after ${verifySec}s + ${graceSec}s grace, but the guard process is ALIVE — startup is slow on this host (node cold start / AV scan). Do NOT relaunch into ${outDir}. Check the process, tail ${join(outDir, "launch.out")}, and/or run monitor.mjs --status ${statusPath}.`,
+    statusPath,
+    elapsedMs: Date.now() - t0,
+  }));
+  process.exit(0);
 }
-console.log(JSON.stringify({ launched: true, guardPid: child.pid, status: seen, statusPath }));
+console.log(JSON.stringify({
+  launched: true,
+  guardPid: child.pid,
+  status: seen,
+  statusPath,
+  verifiedMs: seenAtMs,
+  ...(seenAtMs > verifySec * 1000 ? { slowStart: true, note: "status file appeared after the stage-1 window — slow host startup" } : {}),
+}));
 process.exit(0);

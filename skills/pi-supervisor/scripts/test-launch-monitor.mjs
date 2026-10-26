@@ -6,7 +6,11 @@
 // Verifies:
 //   T1 launch   launch.mjs verifies (process alive + status appeared) and reports
 //   T2 settle   monitor returns reason=settle well before the --cycle-min cap
-//   T3 expected monitor returns reason=expected when all expectedFiles are true
+//   T3 manifest  monitor returns reason=settled-manifest when the result
+//                 manifest appears while the status still says running
+//   T3b expected regression — expectedFiles no longer trigger an early
+//                 return (the report file is usually scaffolded early); with a
+//                 dead guardPid the monitor must fall through to reason=liveness
 //   T4 liveness kill the guard's process tree; monitor returns reason=liveness
 //                (guard-pid-dead) fast — the stale "running" file must NOT hold it
 //   T5 stale     a v:1 file with an old `at` → reason=liveness (status-stale)
@@ -119,15 +123,37 @@ async function runMonitor(statusPath, extra = []) {
     `reason=${M.json?.reason} status=${M.json?.status} t=${M.secs}s`);
 }
 
-// T3: monitor returns on expected files
+// T3: monitor returns on the result manifest (status still running)
 {
   const d = path.join(root, "t3");
   mkdirSync(d);
-  const L = await runLaunch(d, ["--mode", "expected"]);
+  writeFileSync(path.join(d, "pi-child-status.json"), JSON.stringify({
+    v: 2, at: new Date(Date.now() - 5000).toISOString(), status: "running",
+    guardPid: process.pid, childPid: null, attempt: 1, sessionId: "fake-3", toolCalls: 1,
+  }));
+  writeFileSync(path.join(d, "pi-child-result.json"), JSON.stringify({
+    v: 1, finishedAt: new Date().toISOString(), result: { status: "completed" },
+  }));
   const M = await runMonitor(path.join(d, "pi-child-status.json"), ["--cycle-min", "1"]);
-  report("T3 monitor expected-early", L.json?.launched === true
-    && M.json?.reason === "expected", `reason=${M.json?.reason} t=${M.secs}s`);
-  if (L.json?.guardPid) killTree(L.json.guardPid);
+  report("T3 monitor settled-manifest", M.json?.reason === "settled-manifest",
+    `reason=${M.json?.reason} t=${M.secs}s`);
+}
+
+// T3b: regression — expected files present + DEAD guardPid → liveness, not
+// "expected" (the pre-v0.14.0 code returned reason=expected here, because a
+// living-report file made the early-return fire on every cycle)
+{
+  const d = path.join(root, "t3b");
+  mkdirSync(d);
+  writeFileSync(path.join(d, "done.txt"), "artifact");
+  writeFileSync(path.join(d, "pi-child-status.json"), JSON.stringify({
+    v: 2, at: new Date().toISOString(), status: "running",
+    guardPid: 99999999, childPid: null, attempt: 1, sessionId: "fake-3b", toolCalls: 1,
+    expectedFiles: { "done.txt": true },
+  }));
+  const M = await runMonitor(path.join(d, "pi-child-status.json"), ["--cycle-min", "1", "--liveness-min", "1"]);
+  report("T3b no expected early-return", M.json?.reason === "liveness" && M.json?.liveness === "guard-pid-dead",
+    `reason=${M.json?.reason} liveness=${M.json?.liveness} t=${M.secs}s`);
 }
 
 // T4: killed run → liveness (stale "running" file must not hold the monitor)

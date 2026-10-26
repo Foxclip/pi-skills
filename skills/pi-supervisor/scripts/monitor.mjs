@@ -17,8 +17,18 @@
 //                         the guard heartbeats `at` every 30s, so a healthy
 //                         run — even mid long model-think — never goes stale
 //                         past --liveness-min.)
-//       reason=expected   every expectedFile in the status is true
+//       reason=settled-manifest  the result manifest (pi-child-result.json in
+//                         the status dir) appeared while the status still
+//                         said running/starting — the manifest is the
+//                         definitive completion marker. (Stale manifests from
+//                         an earlier run in the same dir are ignored: the
+//                         manifest must be newer than the status's `at`.)
 //       reason=cap        nothing happened within --cycle-min (default 20)
+//   - There is NO early return on expectedFiles: the child is usually told
+//     to keep the report file updated as it goes, so the file exists from
+//     early on and "expected files present" never meant "done". The guard
+//     still enforces expected files at settle (missing file → intervention
+//     ladder); the monitor only waits.
 //   - One machine-readable JSON line on stdout — the caller needs exactly one
 //     follow-up decision, not a file read.
 //
@@ -33,6 +43,7 @@
 // guards key on the call text.
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
 function parseArgs() {
   const a = {
@@ -112,16 +123,27 @@ function tailLines(file, n) {
   }
 }
 
-function allExpectedMet(obj) {
-  const ef = obj.expectedFiles;
-  if (!ef || Object.keys(ef).length === 0) return false;
-  return Object.values(ef).every((v) => v === true);
+const resultPath = join(dirname(A.status), "pi-child-result.json");
+
+// v0.14.0: is there a result manifest that is newer than the current status
+// heartbeat? Returns the manifest's finishedAt, or null.
+function manifestSignal() {
+  try {
+    const m = JSON.parse(readFileSync(resultPath, "utf8"));
+    const fin = Date.parse(m.finishedAt);
+    if (!Number.isFinite(fin)) return null;
+    const at = Date.parse(readStatus().obj?.at);
+    if (Number.isFinite(at) && fin < at) return null; // stale — earlier run in the same dir
+    return m.finishedAt;
+  } catch {
+    return null;
+  }
 }
 
 function emit(reason, liveness, obj, progressTail) {
   const out = {
     monitor: "pi-supervisor",
-    reason, // settle | liveness | expected | cap
+    reason, // settle | settled-manifest | liveness | cap
     liveness: liveness || null, // guard-pid-dead | status-stale | no-status-file
     status: obj ? obj.status : null,
     exitReason: obj ? obj.exitReason || null : null,
@@ -130,6 +152,7 @@ function emit(reason, liveness, obj, progressTail) {
     sessionFile: obj ? obj.sessionFile || null : null,
     toolCalls: obj ? obj.toolCalls ?? null : null,
     expectedFiles: obj ? obj.expectedFiles || null : null,
+    manifestPath: resultPath,
     elapsedMonitorMs: Date.now() - t0,
     statusFile: A.status,
     tag: A.tag || undefined,
@@ -163,11 +186,14 @@ async function main() {
         emit("settle", null, obj, A.progress ? tailLines(A.progress, A.tail) : null);
         return;
       }
-      if ((st === "running" || st === "starting") && allExpectedMet(obj)) {
-        emit("expected", null, obj, A.progress ? tailLines(A.progress, A.tail) : null);
-        return;
-      }
       if (st === "running" || st === "starting") {
+        // v0.14.0: watch the result manifest as a completion signal (covers
+        // a lagging status write; a stale manifest from an earlier run in the
+        // same dir is excluded by the freshness check inside manifestSignal).
+        if (manifestSignal()) {
+          emit("settled-manifest", null, obj, A.progress ? tailLines(A.progress, A.tail) : null);
+          return;
+        }
         // Liveness: the file can only assert what the guard itself wrote. A
         // killed guard leaves a stale "running" — check the process.
         let dead = false;
