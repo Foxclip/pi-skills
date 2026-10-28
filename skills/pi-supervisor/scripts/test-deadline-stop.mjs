@@ -14,8 +14,9 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-const HERE = path.dirname(new URL(import.meta.url).pathname);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const KEEP = process.argv.includes("--keep");
 const root = path.join(os.tmpdir(), `pi-sup-ds-${Date.now()}`);
 mkdirSync(root, { recursive: true });
