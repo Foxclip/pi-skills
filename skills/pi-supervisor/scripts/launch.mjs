@@ -62,6 +62,56 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// --deadline helpers: parse a wall-clock deadline and size --timeout so the
+// guard's finalization window ends AT the deadline. The guard's total real
+// time is --timeout + --finalize (the finalize window opens at the hard wall
+// clock, see guard.mjs), so the finalize minutes must be reserved here.
+function fmtLocal(d) {
+  const p = (n) => String(n).padStart(2, "0");
+  let tz = "local";
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "local"; } catch { /* keep default */ }
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())} (${tz})`;
+}
+function parseDeadline(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return null;
+  if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/.test(s)) { // ISO — local, Z, or explicit offset
+    const d = new Date(s);
+    return Number.isFinite(d.getTime()) ? d : null;
+  }
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (m) { // local YYYY-MM-DD[ HH:MM[:SS]]
+    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+      m[4] !== undefined ? Number(m[4]) : 0,
+      m[5] !== undefined ? Number(m[5]) : 0,
+      m[6] !== undefined ? Number(m[6]) : 0);
+    return Number.isFinite(d.getTime()) ? d : null;
+  }
+  m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (m) { // HH:MM[:SS] today, local
+    const t = new Date();
+    const d = new Date(t.getFullYear(), t.getMonth(), t.getDate(),
+      Number(m[1]), Number(m[2]), m[3] !== undefined ? Number(m[3]) : 0);
+    return Number.isFinite(d.getTime()) ? d : null;
+  }
+  return null;
+}
+function passthroughValue(passthrough, flag, dflt) {
+  for (let i = 0; i < passthrough.length; i++) {
+    if (passthrough[i] === flag) {
+      const v = Number(passthrough[i + 1]);
+      return Number.isFinite(v) ? v : dflt;
+    }
+  }
+  return dflt;
+}
+function setPassthroughTimeout(passthrough, value) {
+  for (let i = 0; i < passthrough.length; i++) {
+    if (passthrough[i] === "--timeout") { passthrough.splice(i, 2); break; }
+  }
+  passthrough.push("--timeout", String(value));
+}
+
 let outDir = null; // hoisted so fail() can attach launch.out/err tails
 let child = null;  // hoisted so fail() can report the pid/exit code
 
@@ -91,6 +141,7 @@ const VALUELESS = new Set([
 let guardPath = join(HERE, "guard.mjs");
 let verifySec = 8;
 let graceSec = 60;
+let deadlineRaw = null; // --deadline <time>: size --timeout so finalize lands on this wall clock
 let task = null;
 let taskFromFlag = false; // --task/--task-file values stay in passthrough; only a positional task is prepended
 let pendingValueFor = null; // last seen flag awaiting its value
@@ -101,6 +152,7 @@ for (let i = 0; i < argv.length; i++) {
   if (x === "--guard") { guardPath = argv[++i]; pendingValueFor = null; continue; }
   if (x === "--verify-sec") { verifySec = Number(argv[++i]); pendingValueFor = null; continue; }
   if (x === "--grace-sec") { graceSec = Number(argv[++i]); pendingValueFor = null; continue; }
+  if (x === "--deadline") { deadlineRaw = argv[++i]; pendingValueFor = null; continue; }
   if (x === "--") { passthrough.push(x); pendingValueFor = null; continue; }
   if (x.startsWith("--")) {
     pendingValueFor = VALUELESS.has(x) ? null : x;
@@ -160,6 +212,36 @@ for (let i = 0; i < passthrough.length; i++) {
 outDir = outDir || process.cwd();
 try { mkdirSync(outDir, { recursive: true }); } catch (e) { fail(`cannot create out dir ${outDir}: ${e.message}`); }
 
+// --deadline: replace --timeout so the guard's finalization window ends at the
+// wall-clock deadline. total real time = --timeout + --finalize, so reserve it.
+let deadlineInfo = null;
+if (deadlineRaw !== null) {
+  const D = parseDeadline(deadlineRaw);
+  if (!D) {
+    fail(`cannot parse --deadline "${deadlineRaw}" — use ISO (2026-10-28T10:00Z) or a local wall clock ("2026-10-28 10:00", "10:00")`);
+  }
+  const finalizeMin = passthroughValue(passthrough, "--finalize", 10);
+  const now = Date.now();
+  const timeoutMin = Math.floor((D.getTime() - now) / 60000) - finalizeMin;
+  if (timeoutMin < 1) {
+    fail(`--deadline ${fmtLocal(D)} leaves no work time: only ${Math.max(0, Math.round((D.getTime() - now) / 60000))}min until it, and ${finalizeMin}min is reserved for finalization — pass a later --deadline or a smaller --finalize`);
+  }
+  setPassthroughTimeout(passthrough, timeoutMin);
+  const hardStop = new Date(now + timeoutMin * 60000);
+  const finalizeAt = new Date(now + (timeoutMin + finalizeMin) * 60000);
+  deadlineInfo = {
+    deadline: D.toISOString(),
+    deadlineLocal: fmtLocal(D),
+    timeoutMin,
+    finalizeMin,
+    hardStopAt: hardStop.toISOString(),
+    hardStopAtLocal: fmtLocal(hardStop),
+    finalizeAt: finalizeAt.toISOString(),
+    finalizeAtLocal: fmtLocal(finalizeAt),
+    note: `--timeout ${timeoutMin} computed so the ${finalizeMin}min finalization window ends at the deadline (projected: hard stop ${fmtLocal(hardStop)}, finalize ${fmtLocal(finalizeAt)})`,
+  };
+}
+
 // Launch: detached + unref → survives the caller's timeout. Hidden window on
 // Windows (detached implies CREATE_NEW_CONSOLE; windowsHide suppresses it).
 const guardArgs = taskFromFlag ? [guardPath, ...passthrough] : [guardPath, task, ...passthrough];
@@ -212,6 +294,7 @@ if (!seen) {
     reason: `status file still absent after ${verifySec}s + ${graceSec}s grace, but the guard process is ALIVE — startup is slow on this host (node cold start / AV scan). Do NOT relaunch into ${outDir}. Check the process, tail ${join(outDir, "launch.out")}, and/or run monitor.mjs --status ${statusPath}.`,
     statusPath,
     elapsedMs: Date.now() - t0,
+    ...(deadlineInfo ? { deadline: deadlineInfo } : {}),
   }));
   process.exit(0);
 }
@@ -221,6 +304,7 @@ console.log(JSON.stringify({
   status: seen,
   statusPath,
   verifiedMs: seenAtMs,
+  ...(deadlineInfo ? { deadline: deadlineInfo } : {}),
   ...(seenAtMs > verifySec * 1000 ? { slowStart: true, note: "status file appeared after the stage-1 window — slow host startup" } : {}),
 }));
 process.exit(0);
