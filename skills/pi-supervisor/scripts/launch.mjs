@@ -58,44 +58,10 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseDeadline, sizeDeadline, fmtLocal } from "./lib/deadline.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-// --deadline helpers: parse a wall-clock deadline and size --timeout so the
-// guard's finalization window ends AT the deadline. The guard's total real
-// time is --timeout + --finalize (the finalize window opens at the hard wall
-// clock, see guard.mjs), so the finalize minutes must be reserved here.
-function fmtLocal(d) {
-  const p = (n) => String(n).padStart(2, "0");
-  let tz = "local";
-  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "local"; } catch { /* keep default */ }
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())} (${tz})`;
-}
-function parseDeadline(raw) {
-  const s = String(raw ?? "").trim();
-  if (!s) return null;
-  if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}T/.test(s)) { // ISO — local, Z, or explicit offset
-    const d = new Date(s);
-    return Number.isFinite(d.getTime()) ? d : null;
-  }
-  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
-  if (m) { // local YYYY-MM-DD[ HH:MM[:SS]]
-    const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]),
-      m[4] !== undefined ? Number(m[4]) : 0,
-      m[5] !== undefined ? Number(m[5]) : 0,
-      m[6] !== undefined ? Number(m[6]) : 0);
-    return Number.isFinite(d.getTime()) ? d : null;
-  }
-  m = s.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
-  if (m) { // HH:MM[:SS] today, local
-    const t = new Date();
-    const d = new Date(t.getFullYear(), t.getMonth(), t.getDate(),
-      Number(m[1]), Number(m[2]), m[3] !== undefined ? Number(m[3]) : 0);
-    return Number.isFinite(d.getTime()) ? d : null;
-  }
-  return null;
-}
 function passthroughValue(passthrough, flag, dflt) {
   for (let i = 0; i < passthrough.length; i++) {
     if (passthrough[i] === flag) {
@@ -216,29 +182,26 @@ try { mkdirSync(outDir, { recursive: true }); } catch (e) { fail(`cannot create 
 // wall-clock deadline. total real time = --timeout + --finalize, so reserve it.
 let deadlineInfo = null;
 if (deadlineRaw !== null) {
-  const D = parseDeadline(deadlineRaw);
-  if (!D) {
+  const P = parseDeadline(deadlineRaw);
+  if (!P.ok) {
     fail(`cannot parse --deadline "${deadlineRaw}" — use ISO (2026-10-28T10:00Z) or a local wall clock ("2026-10-28 10:00", "10:00")`);
   }
   const finalizeMin = passthroughValue(passthrough, "--finalize", 10);
-  const now = Date.now();
-  const timeoutMin = Math.floor((D.getTime() - now) / 60000) - finalizeMin;
-  if (timeoutMin < 1) {
-    fail(`--deadline ${fmtLocal(D)} leaves no work time: only ${Math.max(0, Math.round((D.getTime() - now) / 60000))}min until it, and ${finalizeMin}min is reserved for finalization — pass a later --deadline or a smaller --finalize`);
+  const S = sizeDeadline({ ts: P.ts, finalizeMin, now: new Date() });
+  if (!S.ok) {
+    fail(`--deadline ${fmtLocal(P.ts)} ${S.why}`);
   }
-  setPassthroughTimeout(passthrough, timeoutMin);
-  const hardStop = new Date(now + timeoutMin * 60000);
-  const finalizeAt = new Date(now + (timeoutMin + finalizeMin) * 60000);
+  setPassthroughTimeout(passthrough, S.timeoutMin);
   deadlineInfo = {
-    deadline: D.toISOString(),
-    deadlineLocal: fmtLocal(D),
-    timeoutMin,
-    finalizeMin,
-    hardStopAt: hardStop.toISOString(),
-    hardStopAtLocal: fmtLocal(hardStop),
-    finalizeAt: finalizeAt.toISOString(),
-    finalizeAtLocal: fmtLocal(finalizeAt),
-    note: `--timeout ${timeoutMin} computed so the ${finalizeMin}min finalization window ends at the deadline (projected: hard stop ${fmtLocal(hardStop)}, finalize ${fmtLocal(finalizeAt)})`,
+    deadline: P.ts.toISOString(),
+    deadlineLocal: P.label,
+    timeoutMin: S.timeoutMin,
+    finalizeMin: S.finalizeMin,
+    hardStopAt: S.hardStopAt,
+    hardStopAtLocal: S.hardStopAtLocal,
+    finalizeAt: S.finalizeAt,
+    finalizeAtLocal: S.finalizeAtLocal,
+    note: `--timeout ${S.timeoutMin} computed so the ${S.finalizeMin}min finalization window ends at the deadline (projected: hard stop ${S.hardStopAtLocal}, finalize ${S.finalizeAtLocal})`,
   };
 }
 

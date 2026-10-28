@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use for long-lived, isolated second pi — parallel work, sub-conversations, orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles guard.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer→rewind→fork→stuck ladder, --expect-file artifacts, context-overflow distill-and-relaunch, always-on progress log + v:2 liveness status), launch.mjs (verified detached launcher, --deadline sizing), monitor.mjs (early-return wait loop with liveness detection) and stop.mjs (ordered group-kill stop + state snapshot).
+description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use for long-lived, isolated second pi — parallel work, sub-conversations, orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles guard.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer→rewind→fork→stuck ladder, --expect-file artifacts, context-overflow distill-and-relaunch, always-on progress log + v:2 liveness status), launch.mjs (verified detached launcher, --deadline sizing), monitor.mjs (early-return wait loop with liveness detection), stop.mjs (ordered group-kill stop + state snapshot) and campaign.mjs (durable multi-run campaigns — goal+deadline state file, verified-facts ledger, next-run loop).
 ---
 
 # Interacting with a child pi process
@@ -73,6 +73,8 @@ node scripts/rpc-child.mjs --session <path-or-exact-id> --turn "..."
 6. **The child's stdout is the protocol.** Diagnostics belong on stderr; never write non-protocol data to the child's stdin/stdout.
 7. **Windows/Node**: the child needs the pi CLI entry `dist/bundle/cli.js` of the installed package (the package `bin`), not `dist/cli.js` from a repo checkout. The harness resolves the install automatically: `PI_PACKAGE_DIR` env > self-managed install (`~/.pi/agent/install/releases/<ver>` per `current-version`) > npm global > `%APPDATA%\npm` (Windows).
 8. **Sessions are per-project.** The same `--session-id` resolves only in the same working directory (sessions live under `~/.pi/agent/sessions`, grouped by cwd). Resuming from a different cwd silently starts a fresh session. `--session`/`--session-id` must reference an exact ID or path — partial IDs may open the interactive picker, which blocks forever in RPC mode.
+9. **Campaign state is git-ignored, not git-tracked.** `campaign.mjs` keeps its state in `<project>/.pi-supervisor/<name>.json` — bookkeeping, not source. Add `.pi-supervisor/` to the project's `.gitignore` (`init` warns when it is missing). A reboot wipes the /tmp run out-dirs; the campaign file survives and marks those runs `gone` — the history lives on, the artifacts do not.
+10. **A campaign is one live run at a time.** `campaign next` pid-checks the latest run's guard before spawning (never the status file — it lies when the host died) and refuses while that pid is alive. Stop the run first (`campaign stop`).
 
 ## Long-running work (when a turn exceeds the timeout)
 
@@ -183,6 +185,39 @@ node <skill_dir>/scripts/stop.mjs --out-dir <run-dir> --force   # straight to SI
 ```
 
 Graceful is the right default: the guard's own SIGTERM handler marks the status file `error`/`killed-SIGTERM` before it exits, so a graceful stop leaves an accurate final status — only a SIGKILL'd group leaves the file stale-`running`. One JSON line on stdout: `{stopped, stoppedVia, guardPid, childPid, confirmedDead:{guard,child}, finalStatus, manifestPath}`. **Exit codes: 0 = stopped (or already stopped); 1 = could not confirm death, or nothing was found (a missing status file is exit 1 + "verify" — it may be a typo'd `--out-dir`, never mistaken for a stop); 2 = hard error (bad args, corrupt status file).** Use it whenever a human says "stop the child", a campaign deadline is forced, or you need to tear a run down before relaunching; then audit the final `pi-child-result.json` (if it settled) and the expect-files before the next run.
+
+## Multi-run campaigns (`campaign.mjs`, v0.16.0)
+
+A **campaign** is a durable, named, goal-anchored multi-run thing — a goal, a deadline, per-run history, a **verified-facts ledger**, final **acceptance criteria**, and a **next-brief slot**. It is the generalization of the hand-rolled BlockGame pattern (goal "finish the game by <deadline>", N supervised runs, a compounding verified-facts list): previously that loop lived in the parent LLM and had to be reconstructed after every context overflow or reboot; now the mechanics are scripted. The script owns the MECHANICS (locating artifacts, liveness, deadline math, bookkeeping); the LLM owns the JUDGMENT (what to do next — via the next slot, `--brief-file`, or `--goal`). State lives in `<project>/.pi-supervisor/<name>.json` (git-ignored — see gotchas). Runs are still ephemeral `--out-dir`s under /tmp; the campaign file only *references* them, so a reboot losing /tmp costs the artifacts, not the history. Every subcommand prints **one JSON line on stdout** + a summary on stderr (`--quiet` suppresses it). **Exit codes — 0 success · 1 operational refusal/failure · 2 usage error.**
+
+```bash
+# 1) create — the goal + deadline are what make it a campaign, not just a run
+node <skill_dir>/scripts/campaign.mjs init --name <n> --goal "<objective>" --deadline "<ISO or local wall clock>" [--run-timeout-min 40]
+
+# 2) fresh-monitor re-entry — read-only, NO writes; do this FIRST in any new session
+node <skill_dir>/scripts/campaign.mjs status
+
+# 3) assemble run N+1's brief (NO launch) → .pi-supervisor/brief-run<N+1>.md —
+#    campaign goal + this run's goal (next slot) + verified facts + last run's manifest final-text tail
+#    + STATUS.md tail + deadline math. Edit it (parent judgment), then launch:
+node <skill_dir>/scripts/campaign.mjs scaffold
+node <skill_dir>/scripts/campaign.mjs next --brief-file .pi-supervisor/brief-run<N+1>.md
+#    …or launch directly (the assembled brief is still written to brief-run<N+1>.md for inspection):
+node <skill_dir>/scripts/campaign.mjs next --goal "…" --accept "c1,c2"
+
+# 4) when the run settles:
+node <skill_dir>/scripts/campaign.mjs record "<verified finding>" --run N --verified-by manifest
+node <skill_dir>/scripts/campaign.mjs stop [--grace-sec N]      # delegates to stop.mjs for the latest run
+node <skill_dir>/scripts/campaign.mjs done [--confirm "<criterion>"]   # final acceptance gate
+```
+
+- **`status`** — the whole re-entry point: the latest run (pid-checked liveness, not just the status file), its manifest tail (final text ≤2000 chars), the verified-facts ledger, the next-brief slot, and minutes-to-deadline. No writes.
+- **`next`** — builds the brief (or reads `--brief-file`), sizes the deadline, **spawns via `launch.mjs`** (detached — the run survives the monitor dying), records the run in the state file. Per-run deadline = **min(campaign deadline, `--deadline` override, now + `runTimeoutMin`)** — the same math as `launch.mjs --deadline` (shared `lib/deadline.mjs`). **Refusals** (each overridable with `--force`): nothing to launch (no brief, no slot), the campaign deadline has already passed, or the latest run is still LIVE.
+- **`record`** — appends a fact to the verified-facts ledger, which the next brief injects as "do not re-derive" — the compounding asset between runs (see *distill, don't resume* below). `--verified-by parent|manifest|probe` says who checked it.
+- **`stop`** — thin wrapper over `stop.mjs` for the latest run; the run's final status is recorded in the campaign file.
+- **`done`** — the machine acceptance gate. `acceptance[]` entries are `{criterion, check}`: `check` is a shell command run in the project dir (POSIX `sh -c` / Windows `cmd /c`), `check: null` = a parent-judgment criterion confirmed with `--confirm "<criterion>"`. All pass → `status: "completed"` + a `done.md` report. Refuses while a run is LIVE. A campaign's goal without machine-checkable acceptance is a scope, not a definition of done.
+
+**The monitor loop** (what the supervising session does): `campaign status` → judge → *settled?* read manifest + STATUS.md, `record` verified facts, `scaffold` → edit → `next` · *live?* `monitor.mjs --expected-file …` → repeat. Each `next` re-computes the shrinking per-run budget from the same campaign deadline — the "one deadline across many back-to-back runs" case, with the bookkeeping kept out of the LLM.
 
 ## Long multi-run jobs: distill, don't resume (v0.6.0)
 
