@@ -328,6 +328,7 @@ Note: do not use a generic line reader that splits on Unicode line separators (U
 
 ## Notes
 
+- **v0.16.1:** fixed Windows script-dir resolution in `test-campaign.mjs` and `test-deadline-stop.mjs` (`fileURLToPath` instead of `new URL(import.meta.url).pathname`, which yields `/C:/…` that Node resolves against the current drive → `E:\C:\Users\…` → `Cannot find module`). The v0.15/v0.16 test suites now run and pass on Windows (9/9, 15/15) — before this fix they could never run there.
 - The harness runs the child with `--no-session` (throwaway) by default. Use `--session-id`/`--session` to persist and resume — see **Session persistence and resuming**.
 - The child is a full agent: it has `read`, `bash`, `edit`, `write` by default and can do real work. Its tool activity arrives as `tool_execution_start` events (harness prints them to stderr).
 - Credentials/config are inherited from the same config dir and environment, so a child in a pi session can use the same providers as the parent.
