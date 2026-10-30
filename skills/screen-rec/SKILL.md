@@ -1,12 +1,14 @@
 ---
 name: screen-rec
-description: Record the Windows screen to video — full screen (ffmpeg gdigrab) or a single specific window (ffmpeg gfxcapture / Windows.Graphics.Capture) — kill-proof .ts → clean .mp4, and capture stills of specific windows without disturbing the user's foreground (PrintWindow; gfxcapture single-frame still for GPU/DComp windows; foreground fallback for minimized windows). Use when the user asks to screen-record, record the desktop/screen, make a screen video, record/capture a specific window as video, or screenshot/capture a specific window (even a background or minimized one).
+description: Record the screen to video on Windows (ffmpeg gdigrab / gfxcapture) or X11 Linux (x11grab of the root window with in-user crop) — kill-proof .ts → clean .mp4 — and capture stills of specific windows without disturbing the user's foreground (PrintWindow; gfxcapture single-frame still for GPU/DComp windows; foreground fallback for minimized windows; root-crop PNG on X11). Use when the user asks to screen-record, record the desktop/screen, make a screen video, record/capture a specific window as video, or screenshot/capture a specific window (even a background or minimized one).
 ---
 
 # screen-rec
 
-Three modes, all proven on this machine (Windows, primary monitor 1920x1080,
-RTX 3090; ffmpeg 9.0.2 at `C:\Users\Suburban\.pi\agent\bin\ffmpeg.exe`):
+Two platforms, same design (kill-proof .ts → remux to .mp4). Windows section
+first (primary monitor 1920x1080, RTX 3090; ffmpeg 9.0.2 at
+`C:\Users\Suburban\.pi\agent\bin\ffmpeg.exe`); X11 Linux section at the
+bottom (Mint 22, DISPLAY :0). On each host, three modes:
 
 1. **Capture** — still PNG of one or all windows, no focus change.
 2. **Record** — full-screen video via `gdigrab`, kill-proof, remuxed to mp4.
@@ -147,3 +149,57 @@ bash skills/screen-rec/scripts/rec-window.sh status
 - Recovery of an already-killed mp4 (no moov): x264 NALs survive in `mdat`,
   but SPS/PPS live only in moov/avcC — not reliably recoverable. That's why
   the .ts rule exists.
+
+## Linux X11 (this host: Mint 22, DISPLAY :0)
+
+Scripts in `scripts/linux/` — bash + ffmpeg x11grab, same kill-proof .ts →
+remux-to-.mp4 design as the Windows side.
+
+| Script | Purpose |
+|---|---|
+| `list-windows.sh` | DEC + HEX id, PID, geometry, mapped state |
+| `cap-window.sh` | Window stills: `-w ID` / `-t ERE` / `-f [NAME]` / `-o DIR` (no args = all visible windows) |
+| `rec.sh` | Full-screen video: `record [SEC]` / `start [MAXSEC]` / `stop` / `status` |
+| `rec-window.sh` | Single-window video, same modes + `--window ID \| --title ERE` |
+
+```sh
+cd <dir-for-files>
+bash scripts/linux/list-windows.sh
+bash scripts/linux/rec.sh record 10                          # → rec-<ts>.mp4
+bash scripts/linux/rec-window.sh record 10 --window 0x02600040   # or --title "ERE"
+bash scripts/linux/cap-window.sh -w 0x02600040     # or -t "vim" ; -f name.png ; -o caps
+```
+
+### HARD SAFETY RULE — violating it hard-locks the whole machine (verified TWICE, both times required a reboot)
+**Never** do per-window XGetImage on this box: no `ffmpeg -f x11grab -window_id …`,
+no `import -window 0x…`, no per-window xwd — against anything, especially not
+GLX/OpenGL windows. x11grab per-window froze the machine once; ImageMagick
+`import -window` froze it a second time. All scripts here instead capture the
+**root window** and crop in-user with libav — proven safe under long tests
+(root XGetImage is fine; the hang is per-window capture on GLX surfaces).
+
+### Design notes (Linux-specific gotchas, all verified on this host)
+
+- `record` (one-shot) passes `-t SEC` → ffmpeg stops input itself and
+  finalizes cleanly → **zero tail loss**. `start`/`stop` SIGTERMs ffmpeg →
+  loses the x264 lookahead queue (~1–2s tail, documented).
+- `-fflags +flush_packets` is REQUIRED on the ffmpeg line: without it a static
+  screen buffers everything inside x264/avio and any kill loses ALL (0-byte .ts).
+- ffmpeg must be launched as a **bare background command, never `func &`** —
+  a wrapper subshell makes `$!` the wrapper, not ffmpeg: the kill orphans a
+  zombie recorder and the state pid goes stale.
+- Window geometry = `xwininfo` **Absolute** upper-left. xdotool
+  `getwindowgeometry` and wmctrl are frame-relative (verified off by exactly
+  the frame offset) — do not use them for cropping.
+- Target preflight: the window must exist and be mapped (`IsViewable`);
+  MINIMIZED → clean error (the Linux equivalent of the WGC minimized hang).
+  Keep the window visible for the duration of the take (WYSIWYG rule).
+- x11grab reads the root pixmap: the **X cursor is NOT in the recording**
+  (same as gdigrab). No audio.
+- The display can change size mid-session (observed 1920x1080 → 1920x974) —
+  geometry is read at script start; a resize during a take kills that ffmpeg;
+  just re-run.
+- Outputs: `rec-<ts>.{ts,mp4}`, `win-<idhex>-<ts>.{ts,mp4}` in cwd; state in
+  `rec.state` / `rec-window.state` (stop self-heals from them).
+- `--window` takes decimal or `0x`-hex; `--title` is an ERE; multiple hits →
+  error listing the candidates.
