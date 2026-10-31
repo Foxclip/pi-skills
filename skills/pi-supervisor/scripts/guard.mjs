@@ -81,7 +81,21 @@
 //     thinking-only or empty stop — or a <200-char stub with zero tool
 //     activity on the initial attempt) is NOT "completed": one corrective
 //     prompt (L1 budget) → fork (L2) → consult-park or exit 3 (exitReason
-//     "degenerate-settle").
+//     "degenerate-settle"). v0.17.0: an EMPTY final message (no text, no
+//     thinking) after a non-trivial attempt is its own first-class condition
+//     with the same ladder and exitReason "empty-final".
+//   - Workspace invariants (v0.17.0): --invariant <cmd> (repeatable) shell
+//     commands that must ALWAYS exit 0, checked every --invariant-interval
+//     seconds. The other sensors watch model behavior; invariants watch world
+//     state (red self-test, dirty git tree, conflict markers, stray
+//     processes). A failure is a sensor hit with the command's output as
+//     evidence: steer → fork per budget → exitReason "stuck-invariant"
+//     (consult mode: parks).
+//   - Parent nudge channel (v0.17.0): .txt files dropped into
+//     <out-dir>/.steer-inbox/ (monitor.mjs --steer does this) are delivered
+//     into the live child (prompt if idle, steer if mid-turn), logged to the
+//     progress log, and moved to .steer-inbox/processed/ (audit trail).
+//     Counted in the manifest as parentSteers — NOT against the ladder budget.
 //   - --expect-file <path> (repeatable): on settle, missing artifacts are
 //     handled exactly like a degenerate settle ("missing-expected-file").
 //   - Context-overflow pivot (v0.6.0): resuming a transcript near the model's
@@ -123,10 +137,10 @@
 //   - Exit codes: 0 completed, 3 stuck, 4 consult (waiting on the parent
 //     session to resume), 1 error, 2 usage.
 
-import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const GUARD_PATH = fileURLToPath(import.meta.url);
@@ -174,6 +188,15 @@ Options:
                         "timed out", HTTP 4xx/5xx, permission denied. Catches
                         calls that SUCCEED with useless output, which
                         --max-errors never sees (default 0=off)
+  --invariant <cmd>     Workspace invariant (repeatable): a shell command that
+                        must ALWAYS exit 0. Checked every --invariant-interval
+                        seconds; a failure is a sensor hit whose evidence is
+                        the command's own output (autonomous: steer → fork per
+                        budget → exitReason stuck-invariant; consult: parks).
+                        Use for "the child is breaking its own world" checks:
+                        selftest exits 0, git status clean, no conflict
+                        markers, no stray processes.
+  --invariant-interval <sec>  Re-check period for --invariant (default 60)
   --idle-timeout <sec>  No-events timeout while the model is thinking (default 300)
   --tool-timeout <sec>  No-events timeout while one tool call is running
                         (long builds are normal; default 1800)
@@ -198,9 +221,12 @@ Options:
                         exist the run is NOT "completed" — autonomous mode
                         settle-steers then forks per budget; consult mode
                         parks (trigger "missing-expected-file"). Repeatable.
-  --preamble <t>        Boilerplate prepended to the task before the child
+  --preamble <t|standard>  Boilerplate prepended to the task before the child
                         sees it (standing rules). Applies to every prompt,
-                        including fork re-prompts.
+                        including fork re-prompts. "standard" = the bundled
+                        templates/standard-contract.md (stop condition, commit
+                        cadence, read-your-screenshots, non-empty final
+                        message, safe git recovery, evidence conventions).
   --keep-question-tool  Do not exclude ask_user_question (child can then block
                         on extension-UI dialogs; you must answer them)
   --keep-delegate-tool  Do not exclude the acp_delegate* tools (by default
@@ -259,6 +285,8 @@ let maxErrors = 6;
 let heartbeatN = 0;
 let maxTextLen = 20000;
 let stagnationN = 0;
+const invariants = []; // v0.17.0: workspace invariant commands (--invariant)
+let invariantIntervalMs = 60 * 1000;
 let idleTimeoutMs = 300 * 1000;
 let toolTimeoutMs = 1800 * 1000;
 let hardTimeoutMs = 240 * 60 * 1000;
@@ -280,7 +308,7 @@ const VALID_FLAGS = [
   "--name", "--provider", "--model", "--loop-threshold", "--max-steers",
   "--max-forks", "--max-rewinds", "--steer-msg", "--rewind-note", "--fork-note", "--consult", "--consult-file",
   "--action", "--message", "--max-errors", "--heartbeat", "--max-text",
-  "--idle-timeout", "--tool-timeout", "--timeout", "--finalize", "--stagnation",
+  "--idle-timeout", "--tool-timeout", "--timeout", "--finalize", "--stagnation", "--invariant", "--invariant-interval",
   "--progress-log", "--expect-file", "--preamble", "--keep-question-tool",
   "--keep-delegate-tool", "--out-dir", "--overflow-threshold-mb",
   "--pivot-relaunch", "--relayed-from", "--force",
@@ -313,6 +341,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--heartbeat") heartbeatN = Number(argv[++i]);
   else if (a === "--max-text") maxTextLen = Number(argv[++i]);
   else if (a === "--stagnation") stagnationN = Number(argv[++i]);
+  else if (a === "--invariant") invariants.push(argv[++i]);
+  else if (a === "--invariant-interval") invariantIntervalMs = Number(argv[++i]) * 1000;
   else if (a === "--idle-timeout") { idleTimeoutMs = Number(argv[++i]) * 1000; idleTimeoutSpecified = true; }
   else if (a === "--tool-timeout") toolTimeoutMs = Number(argv[++i]) * 1000;
   else if (a === "--timeout") hardTimeoutMs = Number(argv[++i]) * 60 * 1000;
@@ -406,6 +436,17 @@ if (!prompts.every((p) => p !== undefined && p !== "") || prompts.length === 0) 
   console.log(USAGE);
   process.exit(2);
 }
+// v0.17.0: --preamble standard = the bundled standard task contract.
+if (preamble === "standard") {
+  const contractPath = join(dirname(GUARD_PATH), "..", "templates", "standard-contract.md");
+  try {
+    preamble = readFileSync(contractPath, "utf8").trim();
+  } catch (e) {
+    console.error(`error: --preamble standard: cannot read ${contractPath}: ${e.message}`);
+    process.exit(2);
+  }
+}
+
 task = prompts.join(" ");
 if (!resumePayload && preamble) task = preamble + "\n\n" + task;
 if (!resumePayload && task.length < 100) {
@@ -461,6 +502,7 @@ for (const [flag, value] of [
   ["--timeout", hardTimeoutMs],
   ["--finalize", finalizeMin],
   ["--stagnation", stagnationN],
+  ["--invariant-interval", invariantIntervalMs],
   ["--overflow-threshold-mb", overflowThresholdMb],
 ]) {
   if (value === undefined || Number.isNaN(value)) {
@@ -707,6 +749,16 @@ const progressLogPath = progressLogArg || join(outDir, "pi-child-progress.log");
 const manifestPath = join(outDir, "pi-child-result.json");
 const statusFilePath = join(outDir, "pi-child-status.json");
 
+// v0.17.0: parent nudge channel. The parent drops a .txt file into the steer
+// inbox (monitor.mjs --steer does this); the guard delivers it to the live
+// child and moves the file to processed/ (the audit trail).
+const steerInboxDir = join(outDir, ".steer-inbox");
+const steerInboxDoneDir = join(steerInboxDir, "processed");
+let parentSteersUsed = 0;
+let lastInboxCheckAt = 0;
+let lastInvariantAt = 0;
+try { mkdirSync(steerInboxDir, { recursive: true }); } catch { /* best effort */ }
+
 // v0.14.0: out-dir ownership. A second guard pointed at a live run's out-dir
 // (a diagnostic probe, or a parent that misread a slow launch as a failed
 // one) used to silently truncate the live run's progress log and clobber its
@@ -796,6 +848,7 @@ function writeStatus(status, exitReason) {
       sessionFile: stateSessionFile || null,
       sessionBytes: stateSessionFile && existsSync(stateSessionFile) ? statSync(stateSessionFile).size : undefined,
       expectedFiles: expectFiles.length > 0 ? Object.fromEntries(expectFiles.map((f) => [f, expectedExists(f)])) : undefined,
+      deadlineIso: deadlineIso || undefined, // v0.17.0: the monitor prints the countdown
     };
     writeFileSync(statusFilePath, JSON.stringify(payload, null, 2));
   } catch { /* best effort */ }
@@ -851,6 +904,87 @@ function isNoContent(res) {
 
 function fillTemplate(tpl, vars) {
   return tpl.replace(/\{(\w+)\}/g, (m, k) => (vars[k] !== undefined ? String(vars[k]) : m));
+}
+
+// v0.17.0: workspace invariants — repeatable shell commands that must ALWAYS
+// exit 0. The other sensors watch model BEHAVIOR (loops, stalls, degenerate
+// settles); invariants watch WORLD STATE — the blind spot where a child can
+// corrupt its own workspace (detached HEAD, red self-test, conflict markers,
+// stray processes) and still "complete". A failing invariant is a sensor hit
+// whose evidence is the command's own output.
+function checkInvariants() {
+  const failures = [];
+  for (const cmd of invariants) {
+    let r;
+    try {
+      r = spawnSync(cmd, { shell: true, encoding: "utf8", timeout: 30000, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (e) {
+      r = { status: null, signal: null, stdout: "", stderr: `invariant check error: ${e.message}` };
+    }
+    const out = `${r.stdout ?? ""}${r.stderr ?? ""}`.trim();
+    if (r.status === 0) {
+      plog(`[invariant] ${new Date().toISOString()} exit=0 cmd=${cmd.slice(0, 160)}\n`);
+    } else {
+      plog(`[invariant] ${new Date().toISOString()} exit=${r.status}${r.signal ? ` signal=${r.signal}` : ""} cmd=${cmd.slice(0, 160)}\n`);
+      failures.push({ cmd, exit: r.status, out: out.slice(-800) });
+    }
+  }
+  return failures;
+}
+
+// v0.17.0 (post-E2E fix): agent turn tracking for mid-turn-safe delivery.
+// pi's RPC rejects prompt() while the agent is processing ("Agent is already
+// processing. Specify streamingBehavior..." — an E2E run died on this when a
+// steer-inbox file was prompt()ed into a mid-generation child). steer() is the
+// queueing path mid-turn; prompt() is only safe between turns (right after an
+// agent_settled). turnActive is set at every prompt site, cleared at settle.
+let turnActive = false;
+async function promptChild(text) {
+  turnActive = true;
+  return client.prompt(text);
+}
+async function deliverToChild(text) {
+  return turnActive ? client.steer(text) : promptChild(text);
+}
+
+// v0.17.0: parent nudge channel — deliver any .txt files dropped into
+// <out-dir>/.steer-inbox/ into the live child: a steer when the child is
+// mid-turn, a prompt when it is idle (between turns). Each file is delivered
+// once, then moved to .steer-inbox/processed/ (audit trail). Parent steers do
+// NOT count against the guard's own steer budget — they are parent judgment,
+// not a ladder step — but they are counted in the manifest (parentSteers).
+async function processSteerInbox() {
+  if (Date.now() - lastInboxCheckAt < 2000) return;
+  lastInboxCheckAt = Date.now();
+  let files = [];
+  try {
+    files = readdirSync(steerInboxDir).filter((f) => f.endsWith(".txt")).sort();
+  } catch { return; }
+  for (const f of files) {
+    const p = join(steerInboxDir, f);
+    let body = "";
+    try { body = readFileSync(p, "utf8").trim(); } catch { continue; }
+    if (body) {
+      parentSteersUsed++;
+      let disp = null;
+      try {
+        disp = await deliverToChild(body);
+        logSup(`[guard] L1 parent-steer #${parentSteersUsed} (${f}, ${body.length} chars): "${body.slice(0, 120)}"`);
+        plog(`[steer-inbox] ${new Date().toISOString()} file=${f} chars=${body.length} disposition=${disp}\n`);
+        writeStatus("running");
+      } catch (e) {
+        // A failed nudge must never kill the run: log, archive, continue.
+        logSup(`[guard] WARN: parent-steer delivery failed: ${e.message}`);
+        plog(`[steer-inbox] ${new Date().toISOString()} file=${f} chars=${body.length} disposition=error: ${String(e.message).slice(0, 200)}\n`);
+      }
+    } else {
+      plog(`[steer-inbox] ${new Date().toISOString()} file=${f} empty — ignored\n`);
+    }
+    try {
+      mkdirSync(steerInboxDoneDir, { recursive: true });
+      renameSync(p, join(steerInboxDoneDir, f));
+    } catch { /* best effort — the file stays and is retried next scan */ }
+  }
 }
 
 function computeDeadline() {
@@ -1064,7 +1198,7 @@ async function doFork(reason) {
     : `A previous attempt at this task ${reason}. That approach is exhausted — do NOT repeat it. ` +
       `Break the work into smaller steps, verify assumptions as you go, and if you cannot proceed, ` +
       `finish with a clear explanation of exactly where it is blocked.`;
-  await client.prompt(task + "\n\n" + note);
+  await promptChild(task + "\n\n" + note);
   checkpointId = await findCheckpoint();
   lastSig = null;
   loopCount = 0;
@@ -1124,7 +1258,7 @@ async function doRewind(reason) {
       `above this note. Do NOT repeat the approach that just looped. Break the work into ` +
       `smaller steps, verify assumptions as you go, and if you cannot proceed, finish with a ` +
       `clear explanation of exactly where you are blocked.`;
-  await client.prompt(task + "\n\n" + note);
+  await promptChild(task + "\n\n" + note);
   checkpointId = await findCheckpoint();
   lastSig = null;
   loopCount = 0;
@@ -1166,7 +1300,7 @@ async function inspectSettle() {
 
 // A settle-time corrective prompt (cheaper than a fork): the child is idle
 // between turns, so a plain prompt starts a new turn in the same session.
-async function doDegenerateSteer(dReason, missing) {
+async function doDegenerateSteer(dReason, missing, emptyFinal = false) {
   steersUsed++;
   steersThisAttempt++;
   resetAttemptCounters();
@@ -1174,13 +1308,17 @@ async function doDegenerateSteer(dReason, missing) {
     missing.length > 0
       ? `[guard] You ended your turn without creating the required file(s): ${missing.join(", ")}. ` +
         `Create them, then finish with a clear written status update.`
-      : `[guard] You ended your turn ${dReason}. That is not a valid completion — continue ` +
-        `the task from where you left off and finish with a clear written status update.`;
+      : emptyFinal
+        ? `[guard] Your last message was EMPTY (no text, no thinking). That is not a valid ` +
+          `completion. Write a short STATUS line — what you just did, the current state, what ` +
+          `is next — then continue or finish.`
+        : `[guard] You ended your turn ${dReason}. That is not a valid completion — continue ` +
+          `the task from where you left off and finish with a clear written status update.`;
   logSup(
     `[guard] L1 settle-steer #${steersUsed}/${maxSteers}: ` +
-      `${missing.length > 0 ? "missing expected file(s)" : "degenerate settle"}`
+      `${missing.length > 0 ? "missing expected file(s)" : emptyFinal ? "empty final message" : "degenerate settle"}`
   );
-  const disp = await client.prompt(msg);
+  const disp = await promptChild(msg);
   logSup(`[guard] settle-steer disposition=${disp}`);
   writeStatus("running");
 }
@@ -1357,6 +1495,8 @@ try {
     `[guard] task: ${task.length} chars — "${task.slice(0, 160).replace(/\s+/g, " ")}${task.length > 160 ? "…" : ""}"`
   );
   if (expectFiles.length > 0) logSup(`[guard] expected files: ${expectFiles.join(", ")}`);
+  if (invariants.length > 0) logSup(`[guard] invariants (${invariants.length}, every ${Math.round(invariantIntervalMs / 1000)}s): ${invariants.join(" | ")}`);
+  logSup(`[guard] steer inbox: ${steerInboxDir} (drop a .txt there, or use monitor.mjs --steer)`);
   logSup(`[guard] progress log: ${progressLogPath}`);
   logSup(`[guard] status file: ${statusFilePath}`);
   writeStatus("running");
@@ -1450,7 +1590,7 @@ try {
         }
       } catch { /* best effort */ }
       logSup(`[guard] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
-      const d = await client.prompt(task + "\n\n" + resumeMessage);
+      const d = await promptChild(task + "\n\n" + resumeMessage);
       logSup(`[guard] fork re-prompt disposition=${d}`);
       checkpointId = await findCheckpoint();
     } else if (resumeAction === "rewind") {
@@ -1474,16 +1614,16 @@ try {
         }
       } catch { /* best effort */ }
       logSup(`[guard] session now id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
-      const d = await client.prompt(task + "\n\n" + resumeMessage);
+      const d = await promptChild(task + "\n\n" + resumeMessage);
       logSup(`[guard] rewind re-prompt disposition=${d}`);
       checkpointId = await findCheckpoint();
     } else if (resumeAction === "steer") {
       steersUsed++;
-      const d = await client.prompt(resumeMessage);
+      const d = await promptChild(resumeMessage);
       logSup(`[guard] steer disposition=${d}`);
     } else {
       // continue: hand the remaining budget to the built-in ladder
-      const d = await client.prompt(
+      const d = await promptChild(
         "[guard] Supervision was paused and has now resumed. Continue the original task from where you left off."
       );
       logSup(`[guard] continue disposition=${d}`);
@@ -1503,7 +1643,7 @@ try {
           : ` The process is force-killed at that point with no chance to report.`) +
         ` Plan to finish the task — and any required report files — before the deadline.`
       : ""; // --timeout 0 = unlimited: there is no wall clock to pace against
-    const disp0 = await client.prompt(task + deadlineNote);
+    const disp0 = await promptChild(task + deadlineNote);
     logSup(`[guard] prompt disposition=${disp0}`);
     if (hardTimeoutMs > 0) {
       logSup(`[guard] hard deadline: ${deadlineLocal} (${deadlineIso} UTC)` + (finalizeMin > 0 ? ` + ${finalizeMin}min finalization window` : ""));
@@ -1521,6 +1661,7 @@ try {
     if (ev) {
       lastEventAt = now;
       if (ev.type === "agent_settled") {
+        turnActive = false; // the turn is over — prompt() is safe again
         plog(`[settled] ${new Date().toISOString()} aborted=${ev.aborted ? "yes" : "no"}\n`);
         // v0.6.0: the child's own words at settle — the one-line status surface
         // for a 20-30-minute monitor (tool-call lines show WHAT ran, not what
@@ -1540,13 +1681,15 @@ try {
             const missing = expectFiles.filter((f) => !expectedExists(f));
             const emptyStop = attemptTextChars === 0 && attemptToolCalls === 0;
             const strayTail = si.textChars === 0 && si.thinkingChars > 0 && attemptTextChars < 200;
-            if (!emptyStop && !strayTail && missing.length === 0) {
+            const emptyFinal = si.textChars === 0 && si.thinkingChars === 0 &&
+              (attemptToolCalls > 0 || attemptTextChars > 0);
+            if (!emptyStop && !strayTail && !emptyFinal && missing.length === 0) {
               outcome = "completed-finalized";
               logSup("[guard] settled during the finalization window with a report — completed-finalized");
             } else {
               outcome = "hard-timeout";
               logSup(
-                `[guard] finalization settle degenerate/missing (missing=${missing.join(",") || "none"}) — hard-timeout`
+                `[guard] finalization settle degenerate/empty-final/missing (missing=${missing.join(",") || "none"}) — hard-timeout`
               );
             }
             settled = true;
@@ -1591,14 +1734,23 @@ try {
           const emptyStop = attemptTextChars === 0 && attemptToolCalls === 0;
           const strayTail = si.textChars === 0 && si.thinkingChars > 0 && attemptTextChars < 200;
           const degenerate = emptyStop || strayTail;
+          // v0.17.0: an EMPTY final message (no text, no thinking) after a
+          // non-trivial attempt is a first-class settle condition with its own
+          // exitReason — previously the same signal either passed as
+          // "completed" (healthy attempt counters) or tripped
+          // degenerate-settle by accident (thinking tail + short attempt).
+          const emptyFinal = !degenerate && si.textChars === 0 && si.thinkingChars === 0 &&
+            (attemptToolCalls > 0 || attemptTextChars > 0);
           const missing = expectFiles.filter((f) => !expectedExists(f));
-          if (degenerate || missing.length > 0) {
+          if (degenerate || emptyFinal || missing.length > 0) {
             const dReason = emptyStop
               ? `with no text and no tool activity`
-              : `with a thinking-only final message (${si.thinkingChars} chars of thinking) after only ${attemptTextChars} chars of attempt text`;
-            if (degenerate) logSup(`[guard] degenerate settle: ended ${dReason}`);
+              : emptyFinal
+                ? `with an EMPTY final message (no text, no thinking) after ${attemptToolCalls} tool call(s) and ${attemptTextChars} chars of text`
+                : `with a thinking-only final message (${si.thinkingChars} chars of thinking) after only ${attemptTextChars} chars of attempt text`;
+            if (degenerate || emptyFinal) logSup(`[guard] degenerate settle: ended ${dReason}`);
             if (missing.length > 0) logSup(`[guard] missing expected file(s): ${missing.join(", ")}`);
-            const trigger = missing.length > 0 ? "missing-expected-file" : "degenerate-settle";
+            const trigger = missing.length > 0 ? "missing-expected-file" : emptyFinal ? "empty-final" : "degenerate-settle";
             if (consultMode && (steersUsed < maxSteers || forksUsed < maxForks)) {
               await doConsult(trigger, {
                 detail: missing.length > 0
@@ -1610,7 +1762,7 @@ try {
               break;
             }
             if (steersUsed < maxSteers) {
-              await doDegenerateSteer(dReason, missing);
+              await doDegenerateSteer(dReason, missing, emptyFinal);
               continue;
             }
             if (forksUsed < maxForks) {
@@ -1633,6 +1785,10 @@ try {
       }
       handleEvent(ev);
     }
+    // v0.17.0: parent nudge channel — deliver any .txt the parent dropped
+    // into the steer inbox (also during the finalization window: a parent
+    // report instruction is exactly what that window is for).
+    await processSteerInbox();
     if (!finalized) {
       // 90%-of-budget warning (only with finalization: it tells the child to
       // start wrapping up for the finalization window). Not counted against
@@ -1648,7 +1804,7 @@ try {
         logSup(`[guard] BUDGET WARNING sent at 90% of the budget`);
         plog(`[budget] ${new Date().toISOString()} ~${remainMin}min remaining\n`);
         try {
-          const disp = toolDepth > 0 ? await client.steer(warnMsg) : await client.prompt(warnMsg);
+          const disp = await deliverToChild(warnMsg);
           logSup(`[guard] budget-warning disposition=${disp}`);
         } catch (e) {
           logSup(`[guard] budget-warning warn: ${e.message}`);
@@ -1662,11 +1818,14 @@ try {
           logSup(`[guard] HARD TIMEOUT at the wall clock — entering a ${finalizeMin}-minute finalization window (ladder suppressed)`);
           plog(`[finalize] ${new Date().toISOString()} window=${finalizeMin}min\n`);
           try {
-            const disp = await client.prompt(
+            // deliverToChild: at wall-clock time the child is mid-turn — a raw
+            // prompt() is rejected ("Agent is already processing") and the
+            // finalization would silently never reach the child.
+            const disp = await deliverToChild(
               `[guard] HARD DEADLINE REACHED — you have ${finalizeMin} minutes before the process ` +
               `is force-killed. STOP all new work immediately. Write the final report NOW with the ` +
               `partial results gathered so far (state explicitly what is done, what is unfinished ` +
-              `and why). This prompt runs after your current turn ends.`
+              `and why). This message runs after your current turn ends.`
             );
             logSup(`[guard] finalize prompt disposition=${disp}`);
           } catch (e) {
@@ -1717,7 +1876,21 @@ try {
     //                    steer once, then fork per budget.
     if (!pendingLoop && !sensorHold) {
       let sensor = null;
-      if (maxErrors > 0 && errorStreak >= maxErrors) {
+      // v0.17.0: workspace invariants — world-state sensors, checked on a
+      // timer (not on tool activity), so they catch a broken workspace even
+      // while the child looks healthy and busy.
+      if (invariants.length > 0 && now - lastInvariantAt >= invariantIntervalMs) {
+        lastInvariantAt = now;
+        const invFailures = checkInvariants();
+        if (invFailures.length > 0) {
+          sensor = {
+            kind: "invariant",
+            detail: `${invFailures.length} workspace invariant(s) failing: ${invFailures.map((f) => f.cmd).join(" | ")}`,
+            evidence: invFailures,
+          };
+        }
+      }
+      if (!sensor && maxErrors > 0 && errorStreak >= maxErrors) {
         sensor = { kind: "error-loop", detail: `${errorStreak} consecutive tool calls failed` };
       } else if (stagnationN > 0 && noContentStreak >= stagnationN) {
         sensor = { kind: "stagnation", detail: `${noContentStreak} consecutive tool calls returned no usable content (empty/killed/timeout/HTTP error/permission denied)` };
@@ -1729,20 +1902,24 @@ try {
       if (sensor) {
         if (consultMode) {
           if (sensor.kind === "heartbeat" || steersUsed < maxSteers || forksUsed < maxForks) {
-            await doConsult(sensor.kind, { detail: sensor.detail });
+            await doConsult(sensor.kind, { detail: sensor.detail, ...(sensor.evidence ? { evidence: sensor.evidence } : {}) });
             break;
           }
         } else if (steersUsed < maxSteers) {
           sensorHold = sensor.kind;
           steersUsed++;
           loopsSeen++;
-          const msg = sensor.kind === "error-loop"
+          const msg = sensor.kind === "invariant"
+            ? `[guard] WORKSPACE INARIANT VIOLATION: ${sensor.detail}.\n` +
+              sensor.evidence.map((f) => `$ ${f.cmd}\nexit ${f.exit}${f.out ? "\n" + f.out : ""}`).join("\n") +
+              `\nFix the workspace state (whatever these commands check — self-test, git state, stray files/processes), then continue the task.`
+            : sensor.kind === "error-loop"
             ? `[guard] ${sensor.detail}. Stop repeating the failing approach: change your method or verify an assumption, then continue. If it cannot work, say exactly where it is blocked.`
             : sensor.kind === "stagnation"
               ? `[guard] ${sensor.detail}. Stop probing a path that returns nothing: change your method, and if this target cannot work in this environment, record the finding and move on to the next item.`
               : `[guard] You have written ${textSinceTool} chars of text without taking a tool action. Stop narrating and take the next concrete action with a tool call.`;
           logSup(`[guard] L1 ${sensor.kind} steer #${steersUsed}/${maxSteers}: ${sensor.detail}`);
-          const disp = await client.steer(msg);
+          const disp = await deliverToChild(msg);
           logSup(`[guard] ${sensor.kind} steer disposition=${disp}`);
           continue;
         } else if (forksUsed < maxForks) {
@@ -1812,6 +1989,7 @@ try {
     taskChars: task.length,
     attempts: attempt,
     interventions: { steers: steersUsed, forks: forksUsed, rewinds: rewindsUsed, loopsSeen },
+    parentSteers: parentSteersUsed, // v0.17.0: nudge files the parent delivered (not part of the ladder budget)
     sessionId: stateSessionId || null,
     sessionFile: stateSessionFile || null,
     finalText: finalText.slice(0, 4000),

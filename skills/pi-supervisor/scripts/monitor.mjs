@@ -37,12 +37,26 @@
 //                    [--progress <dir>/pi-child-progress.log]
 //                    [--cycle-min 20] [--liveness-min 3] [--poll 30]
 //                    [--tail 8] [--tag <any-string>]
+//   node monitor.mjs --status <dir>/pi-child-status.json --steer "message"
 //
 // --tag is echoed into the output: pass a per-cycle value (cycle-1, cycle-2…)
 // so the invocation is not byte-identical across cycles — host-side repetition
-// guards key on the call text.
+// guards key on the call text. v0.17.0: when omitted, a tag is AUTO-generated
+// (timestamp + pid), so omitting it can no longer produce byte-identical
+// invocations.
+//
+// --steer (v0.17.0) — the parent nudge channel: write the message into the
+// run's steer inbox (<out-dir>/.steer-inbox/). The LIVE guard delivers it to
+// the child (prompt if idle, steer if mid-turn), logs it to the progress log,
+// and moves the file to processed/ (audit trail). Requires a live run
+// (status running/starting + live guardPid) — otherwise exit 1 and NO file is
+// written.
+//
+// v0.17.0: the output JSON also carries the deadline countdown when the
+// status file has a deadlineIso: {deadline: {iso, remainingMin}} — a 20-min
+// monitor cycle is self-contained without re-reading the status file.
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 function parseArgs() {
@@ -54,6 +68,7 @@ function parseArgs() {
     poll: 30,
     tail: 8,
     tag: null,
+    steer: null,
   };
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) {
@@ -65,9 +80,10 @@ function parseArgs() {
     else if (x === "--poll") a.poll = Math.max(5, Number(argv[++i]));
     else if (x === "--tail") a.tail = Number(argv[++i]);
     else if (x === "--tag") a.tag = argv[++i];
+    else if (x === "--steer") a.steer = argv[++i];
     else {
       console.error(`unknown arg: ${x}`);
-      console.error("usage: monitor.mjs --status <dir>/pi-child-status.json [--progress <log>] [--cycle-min 20] [--liveness-min 3] [--poll 30] [--tail 8] [--tag <s>]");
+      console.error("usage: monitor.mjs --status <dir>/pi-child-status.json [--progress <log>] [--cycle-min 20] [--liveness-min 3] [--poll 30] [--tail 8] [--tag <s>] [--steer <msg>]");
       process.exit(2);
     }
   }
@@ -79,6 +95,11 @@ function parseArgs() {
 }
 
 const A = parseArgs();
+
+// v0.17.0: auto-tag (see the --tag note in the header).
+if (A.tag === null) {
+  A.tag = `auto-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}`;
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -140,6 +161,41 @@ function manifestSignal() {
   }
 }
 
+// v0.17.0: --steer one-shot mode (the parent nudge channel). Writes the
+// message into the run's steer inbox; the live guard delivers it.
+function steerOneShot() {
+  const dir = dirname(A.status);
+  const { obj, err } = readStatus();
+  let live = false;
+  if (!err && obj && (obj.status === "running" || obj.status === "starting")) {
+    live = !(obj.v === 2 && Number.isInteger(obj.guardPid)) || pidAlive(obj.guardPid);
+  }
+  if (!live) {
+    console.log(JSON.stringify({
+      monitor: "pi-supervisor",
+      steer: false,
+      status: obj ? obj.status : "missing",
+      reason: `no live run to steer (status=${obj ? obj.status : "missing"}) — the guard is not running here; nothing was written`,
+    }));
+    process.exit(1);
+  }
+  const inbox = join(dir, ".steer-inbox");
+  mkdirSync(inbox, { recursive: true });
+  const name = `steer-${Date.now()}-${process.pid}.txt`;
+  const p = join(inbox, name);
+  writeFileSync(`${p}.tmp`, A.steer, "utf8");
+  renameSync(`${p}.tmp`, p); // atomic — the guard never sees a half-written file
+  console.log(JSON.stringify({
+    monitor: "pi-supervisor",
+    steer: true,
+    file: p,
+    status: obj.status,
+    note: "the guard delivers it to the live child (prompt if idle, steer if mid-turn) and moves it to .steer-inbox/processed/",
+  }));
+  process.exit(0);
+}
+if (A.steer !== null) steerOneShot();
+
 function emit(reason, liveness, obj, progressTail) {
   const out = {
     monitor: "pi-supervisor",
@@ -152,11 +208,18 @@ function emit(reason, liveness, obj, progressTail) {
     sessionFile: obj ? obj.sessionFile || null : null,
     toolCalls: obj ? obj.toolCalls ?? null : null,
     expectedFiles: obj ? obj.expectedFiles || null : null,
+    // v0.17.0: deadline countdown — self-contained cycles without re-reading
+    // the status file (set when the guard wrote a deadlineIso into the status).
+    deadline: null,
     manifestPath: resultPath,
     elapsedMonitorMs: Date.now() - t0,
     statusFile: A.status,
     tag: A.tag || undefined,
   };
+  if (obj && obj.deadlineIso) {
+    const dl = Date.parse(obj.deadlineIso);
+    if (Number.isFinite(dl)) out.deadline = { iso: obj.deadlineIso, remainingMin: Math.round((dl - Date.now()) / 60000) };
+  }
   if (progressTail) out.progressTail = progressTail;
   console.log(JSON.stringify(out));
 }

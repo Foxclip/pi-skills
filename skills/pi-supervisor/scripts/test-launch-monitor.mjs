@@ -17,7 +17,7 @@
 //
 // Run:  node test-launch-monitor.mjs [--keep]
 import { spawnSync, execSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync as existsSync0, readdirSync as readdirSync0 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -189,6 +189,108 @@ function killTree(pid) {
       else process.kill(pid, "SIGKILL");
     } catch { /* already gone */ }
   }
+}
+
+// ---------------------------------------------------------------------------
+// v0.17.0: launch aliases, epoch deadlines, monitor auto-tag + deadline
+// countdown + --steer (the parent nudge channel)
+// ---------------------------------------------------------------------------
+
+// V1: --state-dir / --tag aliases map with a stderr warning (pre-v0.17.0:
+// hard "unknown flag" failures after a silent 240-min fallback had confused a parent)
+{
+  const d = path.join(root, "v1");
+  mkdirSync(d);
+  const r = spawnSync(node, [
+    path.join(HERE, "launch.mjs"), "--guard", FAKE_GUARD, "fake task",
+    "--state-dir", d, "--tag", "v1name", "--mode", "idle", "--verify-sec", "6",
+  ], { encoding: "utf8", timeout: 30000 });
+  let j = null; try { j = JSON.parse(r.stdout.trim().split("\n").pop()); } catch {}
+  const stExists = existsSync0(path.join(d, "pi-child-status.json"));
+  report("V1 aliases --state-dir/--tag", r.status === 0 && j?.launched === true && stExists
+    && /alias for --out-dir/.test(r.stderr) && /alias for --name/.test(r.stderr),
+    `exit=${r.status} launched=${j?.launched} statusInDir=${stExists} err=${(r.stderr || "").split("\n").slice(0, 2).join(" | ")}`);
+  killTree(j?.guardPid || null);
+}
+
+// V2: epoch deadlines (13 digits = ms exact, 10 digits = seconds ±2s)
+{
+  const d = path.join(root, "v2a");
+  mkdirSync(d);
+  const epochMs = Date.now() + 25 * 60000;
+  const L1 = await runLaunch(d, ["--mode", "idle", "--deadline", String(epochMs)]);
+  report("V2a epoch ms (13 digits) → exact deadlineMs",
+    L1.code === 0 && L1.json?.deadline?.deadline === new Date(epochMs).toISOString(),
+    `exit=${L1.code} deadline=${L1.json?.deadline?.deadline} want=${new Date(epochMs).toISOString()}`);
+  killTree(L1.json?.guardPid || null);
+
+  const d2 = path.join(root, "v2b");
+  mkdirSync(d2);
+  const epochS = Math.floor((Date.now() + 25 * 60000) / 1000);
+  const L2 = await runLaunch(d2, ["--mode", "idle", "--deadline", String(epochS)]);
+  const got = L2.json?.deadline ? Date.parse(L2.json.deadline.deadline) : NaN;
+  report("V2b epoch seconds (10 digits) → deadlineMs within 2s",
+    L2.code === 0 && Number.isFinite(got) && Math.abs(got - epochS * 1000) <= 2000
+    && /\[epoch \d{10}\]/.test(L2.json?.deadline?.deadlineLocal || ""),
+    `exit=${L2.code} got=${new Date(got || 0).toISOString()} want≈${new Date(epochS * 1000).toISOString()} local=${L2.json?.deadline?.deadlineLocal}`);
+  killTree(L2.json?.guardPid || null);
+}
+
+// V3: monitor auto-tag (no --tag) + deadline countdown in the output
+{
+  const d = path.join(root, "v3");
+  mkdirSync(d);
+  writeFileSync(path.join(d, "pi-child-status.json"), JSON.stringify({
+    v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed",
+    guardPid: 99999999, attempt: 1, sessionId: "v3", toolCalls: 1,
+    deadlineIso: new Date(Date.now() + 30 * 60000).toISOString(),
+  }));
+  const M = await runMonitor(path.join(d, "pi-child-status.json"), ["--cycle-min", "1"]);
+  report("V3 monitor auto-tag + deadline countdown",
+    M.json?.reason === "settle"
+    && typeof M.json?.tag === "string" && M.json.tag.startsWith("auto-"),
+    `reason=${M.json?.reason} tag=${M.json?.tag}`);
+  const dl = M.json?.deadline;
+  report("V3b deadline countdown", dl && typeof dl.remainingMin === "number" && dl.remainingMin >= 28 && dl.remainingMin <= 30,
+    JSON.stringify(dl));
+}
+
+// V4: monitor --steer on a LIVE run → writes the inbox file (the parent nudge channel)
+{
+  const d = path.join(root, "v4");
+  mkdirSync(d);
+  writeFileSync(path.join(d, "pi-child-status.json"), JSON.stringify({
+    v: 2, at: new Date().toISOString(), status: "running", guardPid: 1, attempt: 1, sessionId: "v4", toolCalls: 1,
+  }));
+  const r = spawnSync(node, [
+    path.join(HERE, "monitor.mjs"), "--status", path.join(d, "pi-child-status.json"),
+    "--steer", "PARENT_V4_MESSAGE: also check the self-test",
+  ], { encoding: "utf8", timeout: 15000 });
+  const inbox = path.join(d, ".steer-inbox");
+  const files = existsSync0(inbox) ? readdirSync0(inbox).filter((f) => f.endsWith(".txt")) : [];
+  const content = files.length ? readFileSync(path.join(inbox, files[0]), "utf8") : "";
+  report("V4 monitor --steer live → inbox file written",
+    r.status === 0 && JSON.parse(r.stdout.trim().split("\n").pop())?.steer === true
+    && files.length === 1 && content === "PARENT_V4_MESSAGE: also check the self-test",
+    `exit=${r.status} files=${JSON.stringify(files)} content=${JSON.stringify(content.slice(0, 60))}`);
+}
+
+// V5: monitor --steer on a DEAD run → exit 1, nothing written
+{
+  const d = path.join(root, "v5");
+  mkdirSync(d);
+  writeFileSync(path.join(d, "pi-child-status.json"), JSON.stringify({
+    v: 2, at: new Date().toISOString(), status: "running", guardPid: 99999999, attempt: 1, sessionId: "v5", toolCalls: 1,
+  }));
+  const r = spawnSync(node, [
+    path.join(HERE, "monitor.mjs"), "--status", path.join(d, "pi-child-status.json"),
+    "--steer", "PARENT_V5_MESSAGE",
+  ], { encoding: "utf8", timeout: 15000 });
+  const inbox = path.join(d, ".steer-inbox");
+  const files = existsSync0(inbox) ? readdirSync0(inbox).filter((f) => f.endsWith(".txt")) : [];
+  report("V5 monitor --steer dead run → exit 1, nothing written",
+    r.status === 1 && files.length === 0 && /no live run to steer/.test(r.stdout + r.stderr),
+    `exit=${r.status} files=${JSON.stringify(files)}`);
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);

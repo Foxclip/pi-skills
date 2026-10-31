@@ -35,7 +35,7 @@ const TASK = "task with enough length to pass the short-task warning threshold f
 // Fake pi package (PI_PACKAGE_DIR override)
 // ---------------------------------------------------------------------------
 const FAKE_INDEX = `
-import { readFileSync, writeFileSync as wfs } from "node:fs";
+import { readFileSync, writeFileSync as wfs, appendFileSync as aws } from "node:fs";
 const spec = process.env.PI_TEST_JSON ? JSON.parse(readFileSync(process.env.PI_TEST_JSON, "utf8")) : { phases: [] };
 class RpcClient {
   constructor(opts) {
@@ -60,6 +60,7 @@ class RpcClient {
   }
   async prompt(text) {
     this.prompts.push(text);
+    try { aws("pi-test-prompts.txt", "===PROMPT===\\n" + text + "\\n", "utf8"); } catch {}
     const id = "user-" + this.entries.length;
     const last = this.entries[this.entries.length - 1];
     this.entries.push({ type: "message", id, parentId: last ? last.id : null, message: { role: "user", content: [{ type: "text", text }] } });
@@ -68,6 +69,7 @@ class RpcClient {
   }
   async steer(msg) {
     this.steers.push(msg);
+    try { aws("pi-test-prompts.txt", "===STEER===\\n" + msg + "\\n", "utf8"); } catch {}
     const id = "user-" + this.entries.length;
     const last = this.entries[this.entries.length - 1];
     this.entries.push({ type: "message", id, parentId: last ? last.id : null, message: { role: "user", content: [{ type: "text", text: msg }] } });
@@ -698,6 +700,104 @@ run({
     })),
   });
 }
+
+// ---------------------------------------------------------------------------
+// v0.17.0: workspace invariants, empty-final settle, --preamble, parent steer
+// ---------------------------------------------------------------------------
+run({
+  name: "v0.17 invariant fail → L1 steer → recovery → completed",
+  args: [TASK, "--invariant", "test -f good.txt"],
+  phases: [
+    [...tool("bash", { cmd: "work" })],
+    [{ writeFile: "good.txt" }, ...tool("bash", { cmd: "fix" }), ...done("Fixed; report saved.")],
+  ],
+  expect: ["L1 invariant steer", "workspace invariant(s) failing", "test -f good.txt", "\"status\":\"completed\""],
+  expectNot: ["L2 fork"],
+  assertFiles: [{ path: "pi-child-progress.log", expect: ["[invariant]"] }],
+});
+
+run({
+  name: "v0.17 invariant fail, no budget → stuck-invariant (exit 3)",
+  args: [TASK, "--invariant", "test -f never-created.txt", "--max-steers", "0", "--max-forks", "0"],
+  phases: [[...tool("bash", { cmd: "work" })]],
+  expect: ["\"exitReason\":\"stuck-invariant\"", "\"status\":\"stuck\""],
+  expectExit: 3,
+});
+
+run({
+  name: "v0.17 consult mode: invariant parks with trigger=invariant (exit 4)",
+  args: [TASK, "--consult", "--invariant", "test -f never-created.txt"],
+  phases: [[...tool("bash", { cmd: "work" })]],
+  expect: ["CONSULT (invariant)"],
+  expectExit: 4,
+  assertFiles: [{ path: "pi-child-consult.json", expect: ['"trigger": "invariant"'] }],
+});
+
+run({
+  name: "v0.17 passing invariant → no intervention",
+  args: [TASK, "--invariant", "true"],
+  phases: [[...tool("bash", { cmd: "work" }), ...done("Done, report saved.")]],
+  expect: ["\"status\":\"completed\""],
+  expectNot: ["L1 invariant steer", "WORKSPACE INVENTORY VIOLATION"],
+});
+
+run({
+  name: "v0.17 empty final after activity, no budget → empty-final (exit 3)",
+  args: [TASK, "--max-steers", "0", "--max-forks", "0"],
+  phases: [[...tool("bash", { cmd: "work" }), { settled: {} }]],
+  expect: ["EMPTY", "\"exitReason\":\"empty-final\"", "\"status\":\"stuck\""],
+  expectExit: 3,
+});
+
+run({
+  name: "v0.17 empty final → corrective prompt → proper status → completed",
+  args: [TASK, "--max-steers", "1", "--max-forks", "0"],
+  phases: [
+    [...tool("bash", { cmd: "work" }), { settled: {} }],
+    [say("Status: task done, report saved to report.md."), { settled: {} }],
+  ],
+  expect: ["empty final message", "\"status\":\"completed\""],
+});
+
+run({
+  name: "v0.17 --preamble standard injects the bundled contract before the task",
+  args: [TASK, "--preamble", "standard"],
+  phases: [[...tool("bash", { cmd: "work" }), ...done("Done, report saved.")]],
+  expect: ["\"status\":\"completed\""],
+  expectExit: 0,
+  assertFiles: [{ path: "pi-test-prompts.txt", expect: ["Standard task contract", TASK] }],
+});
+
+run({
+  name: "v0.17 --preamble <custom> used verbatim",
+  args: [TASK, "--preamble", "CUSTOM_PREAMBLE_SENTINEL"],
+  phases: [[...tool("bash", { cmd: "work" }), ...done("Done, report saved.")]],
+  expect: ["\"status\":\"completed\""],
+  expectExit: 0,
+  assertFiles: [{ path: "pi-test-prompts.txt", expect: ["CUSTOM_PREAMBLE_SENTINEL", TASK] }],
+});
+
+run({
+  name: "v0.17 parent steer inbox: delivered to live child, logged, counted, archived",
+  args: [TASK],
+  phases: [
+    [...tool("bash", { cmd: "work" })],
+    [...done("Got the steer; done.")],
+  ],
+  setup: (dir) => {
+    const inbox = join(dir, ".steer-inbox");
+    mkdirSync(inbox, { recursive: true });
+    writeFileSync(join(inbox, "steer-test.txt"), "PARENT_STEER_SENTINEL: also write a summary file\n");
+  },
+  expect: ["L1 parent-steer", "\"status\":\"completed\""],
+  expectExit: 0,
+  assertFiles: [
+    { path: "pi-child-progress.log", expect: ["[steer-inbox]", "disposition="] },
+    { path: "pi-child-result.json", expect: ['"parentSteers": 1'] },
+    { path: ".steer-inbox/processed/steer-test.txt", expect: ["PARENT_STEER_SENTINEL"] },
+    { path: "pi-test-prompts.txt", expect: ["PARENT_STEER_SENTINEL"] },
+  ],
+});
 
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);
 process.exit(failCount === 0 ? 0 : 1);

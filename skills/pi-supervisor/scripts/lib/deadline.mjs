@@ -26,6 +26,13 @@ export function parseDeadline(s) {
       ? { ok: true, ts: d, label: fmtLocal(d) }
       : { ok: false, why: `cannot parse deadline "${s}" (ISO form did not parse)` };
   }
+  if (/^\d{10,13}$/.test(str)) { // v0.17.0: epoch seconds (10) or milliseconds (13)
+    const ms = str.length === 13 ? Number(str) : Number(str) * 1000;
+    const d = new Date(ms);
+    return Number.isFinite(d.getTime())
+      ? { ok: true, ts: d, label: `${fmtLocal(d)} [epoch ${str}]` }
+      : { ok: false, why: `cannot parse deadline "${s}" (epoch did not parse)` };
+  }
   let m = str.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
   if (m) { // local YYYY-MM-DD[ HH:MM[:SS]]
     const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]),

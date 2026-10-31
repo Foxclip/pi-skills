@@ -114,7 +114,12 @@ let pendingValueFor = null; // last seen flag awaiting its value
 const passthrough = [];
 const argv = process.argv.slice(2);
 for (let i = 0; i < argv.length; i++) {
-  const x = argv[i];
+  // v0.17.0: ergonomic aliases (the strict guard CLI rejects both spellings;
+  // they used to be silently rejected after a 382-min fallback had confused
+  // a parent — now they map with a warning instead).
+  let x = argv[i];
+  if (x === "--state-dir") { process.stderr.write(`[launch] --state-dir is an alias for --out-dir\n`); x = "--out-dir"; }
+  else if (x === "--tag") { process.stderr.write(`[launch] --tag is an alias for --name\n`); x = "--name"; }
   if (x === "--guard") { guardPath = argv[++i]; pendingValueFor = null; continue; }
   if (x === "--verify-sec") { verifySec = Number(argv[++i]); pendingValueFor = null; continue; }
   if (x === "--grace-sec") { graceSec = Number(argv[++i]); pendingValueFor = null; continue; }
