@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.21.0: run a supervised child with zero arguments.
+# ralph.sh — v0.21.1: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -124,16 +124,19 @@ banner() { # $1=mode: launch|attach — uses RUN_DIR, DEADLINE_EPOCH, PROJECT_DI
   local runrel="$RUN_DIR" pd="${PROJECT_DIR:-}"
   case "$RUN_DIR" in "$pd"/*) [ -n "$pd" ] && runrel=".pi-supervisor/runs/$(basename "$RUN_DIR")" ;; esac
   {
+  local mon
+  if [ "$1" = attach ]; then
+    mon="monitoring attached run — cycle every $(human_secs "${CYCLE_SEC:-1200}") · Ctrl+C stops the monitor only (child keeps running)"
+  else
+    mon="monitoring — cycle every $(human_secs "${CYCLE_SEC:-1200}") · Ctrl+C stops the monitor only (child keeps running)"
+  fi
   printf '%s┌ ralph%s %s\n' "$C_B" "$C_N" "$(rule)"
   printf '│ project   %s\n' "$( [ -n "$pd" ] && basename "$pd" || echo unknown )"
   printf '│ run       %s\n' "$runrel"
   printf '│ deadline  %s\n' "$(human_dl "${DEADLINE_EPOCH:-}")"
   printf '│ models    child=%s · parent=%s\n' "${CHILD_MODEL_VAL:-pi-default}" "${PARENT_MODEL_VAL:-pi-default}"
-  if [ "$1" = attach ]; then
-    printf '└ monitoring attached run — cycle every %s · Ctrl+C stops the monitor only (child keeps running)\n' "$(human_secs "${CYCLE_SEC:-1200}")"
-  else
-    printf '└ monitoring — cycle every %s · Ctrl+C stops the monitor only (child keeps running)\n' "$(human_secs "${CYCLE_SEC:-1200}")"
-  fi
+  printf '│ %s\n' "$mon"
+  printf '└%s\n' "$(rule)"
   } >&2; }
 
 # ------------------------------------------------------------- CLI flags

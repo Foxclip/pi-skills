@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.21.0: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.21.1: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -137,6 +137,9 @@ const tick = (n, verdict, detail, reasoning) => {
   tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${sym} ${C(1)}cycle ${n} · ${verdict}${C(0)}${detail ? " — " + detail : ""}`);
   for (const line of (reasoning || "").split("\n")) tlog(`${C(2)}    ${line}${C(0)}`);
 };
+// "in progress" indicator (terminal only — the log file's format is unchanged):
+// a parent LLM call can take a while, and without this the terminal looks frozen
+const ask = (msg) => tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${msg}${C(0)}`);
 process.on("SIGINT", () => { log("sigint: stopping"); saveState(); process.exit(130); });
 
 // ---- helpers
@@ -283,6 +286,7 @@ Keep it under ~40 lines. Facts about the work only — no apologies, no
 meta-commentary about this report.`;
 
 async function writeFinalReport(reason) {
+  ask("final report — asking parent to summarize the run…");
   const projectLine = A.projectDir
     ? `Project directory: ${A.projectDir}`
     : "Project directory: unknown (check pi-child-status.json / git in the run dir)";
@@ -359,6 +363,7 @@ for (;;) {
     saveState();
     if (A.once) process.exit(0);
   } else {
+    ask(`cycle ${state.cycles} — asking parent for judgment…`);
     const d = await llmDecide();
     if (!d.okExit) {
       // pi itself failed (model 400 "not running", crash, timeout): log and
