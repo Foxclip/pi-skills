@@ -107,6 +107,17 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
     `exit=${r.status} log=${readLog(d).trim().slice(0, 80)}`);
 }
 
+// ---- R17: completed-finalized child → exit 0 (the guard's normal
+// finalization-window completion — exit-0 semantics on the guard side too)
+{
+  const d = runDir("r17");
+  mkStatus(d, { status: "completed", exitReason: "completed-finalized", guardPid: null, toolCalls: 99 });
+  const r = runRm(d, STUB_OK, ["--once"]);
+  report("R17 completed-finalized child → exit 0",
+    r.status === 0 && /child-terminal \(completed-finalized\)/.test(readLog(d)),
+    `exit=${r.status} log=${readLog(d).trim().slice(0, 80)}`);
+}
+
 // ---- R2: failed child terminal → exit 5
 {
   const d = runDir("r2");

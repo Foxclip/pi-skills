@@ -160,7 +160,10 @@ function preCheck(status) {
     return { stop: true, code: 4, reason: "deadline" };
   const s = status && status.status;
   if (s === "completed") {
-    const ok = status.exitReason === "completed";
+    // the guard exits 0 for "completed" AND "completed-finalized" (the timeout
+    // absorbed by the finalization window — the usual outcome of --deadline
+    // launches), so both are success here too
+    const ok = /^completed/.test(status.exitReason || "");
     return { stop: true, code: ok ? 0 : 5, reason: `child-terminal (${status.exitReason || "completed"})` };
   }
   if (s === "running" || s === "starting") {
