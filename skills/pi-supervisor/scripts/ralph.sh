@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.19.0: run a supervised child with zero arguments.
+# ralph.sh — v0.19.1: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -53,6 +53,17 @@
 #                                  dest-dir the whole run dir is copied there
 #                                  FIRST — use it to rescue a /tmp run to a
 #                                  permanent home
+#   ralph.sh stop [--all | <run-dir>] [--force]
+#                                  stop EVERY process a run started (guard +
+#                                  child, whole process group — graceful
+#                                  SIGTERM, escalating to SIGKILL), then
+#                                  harvest the stopped run. Target: --all =
+#                                  every run in .pi-supervisor/runs; a
+#                                  <run-dir>; default = the run in the pointer
+#                                  file, else the newest run with a status file.
+#                                  A still-running ralph.sh monitor notices the
+#                                  dead child on its next pre-check (≤30s) and
+#                                  exits by itself — no need to kill it.
 #
 set -euo pipefail
 
@@ -122,6 +133,70 @@ if [ "${1:-}" = "--harvest" ]; then
   fi
   node "$HERE/lib/harvest.mjs" "$TARGET" 0 0
   exit $?
+fi
+
+# ---------------------------------------------------------------- stop
+if [ "${1:-}" = "stop" ]; then
+  shift
+  STOP_ARGS=(); STOP_TARGET=""; STOP_ALL=0; STOP_RC=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)   STOP_ALL=1 ;;
+      --force) STOP_ARGS+=(--force) ;;
+      -*)      echo "ralph: stop: unknown flag: $1" >&2; exit 2 ;;
+      *)       if [ -n "$STOP_TARGET" ]; then echo "ralph: stop: one run dir at a time (or --all)" >&2; exit 2; fi
+               STOP_TARGET=$1 ;;
+    esac
+    shift
+  done
+  STOP_ROOT="${RUNS_DIR:-$PWD/.pi-supervisor/runs}"
+  STOP_PTR="$PWD/.pi-supervisor/ralph-run-dir"
+
+  stop_one() { # $1=run-dir
+    local d="$1" rc=0
+    if [ ! -f "$d/pi-child-status.json" ]; then
+      echo "ralph: stop: no status file in $d — nothing to stop" >&2
+      return 0
+    fi
+    echo "ralph: stopping $d" >&2
+    node "$HERE/stop.mjs" --out-dir "$d" "${STOP_ARGS[@]}" || rc=$?
+    node "$HERE/lib/harvest.mjs" "$d" 0 "$rc" 2>/dev/null || true
+    echo "ralph: preserved — report: $d/RUN-REPORT.md" >&2
+    return $rc
+  }
+
+  if [ "$STOP_ALL" -eq 1 ]; then
+    if [ ! -d "$STOP_ROOT" ]; then
+      echo "ralph: stop --all: no run dirs ($STOP_ROOT missing)" >&2
+    else
+      found=0
+      for d in "$STOP_ROOT"/*/; do
+        [ -d "$d" ] || continue
+        found=1
+        stop_one "${d%/}" || STOP_RC=1
+      done
+      [ "$found" -eq 1 ] || echo "ralph: stop --all: no run dirs in $STOP_ROOT" >&2
+    fi
+  elif [ -n "$STOP_TARGET" ]; then
+    stop_one "$STOP_TARGET" || STOP_RC=1
+  else
+    cand=""
+    if [ -f "$STOP_PTR" ]; then cand="$(cat "$STOP_PTR" 2>/dev/null || true)"; fi
+    if [ -n "$cand" ] && [ -f "$cand/pi-child-status.json" ]; then
+      stop_one "$cand" || STOP_RC=1
+    elif [ -d "$STOP_ROOT" ]; then
+      newest="$(for d in "$STOP_ROOT"/*/; do [ -f "$d/pi-child-status.json" ] && printf '%s\n' "${d%/}"; done | xargs -r ls -1t 2>/dev/null | head -1)"
+      if [ -n "$newest" ]; then
+        echo "ralph: stop: no pointer — using newest run with a status file: $newest" >&2
+        stop_one "$newest" || STOP_RC=1
+      else
+        echo "ralph: stop: no run with a status file found (looked in $STOP_ROOT)" >&2
+      fi
+    else
+      echo "ralph: stop: no runs found (no pointer, $STOP_ROOT missing)" >&2
+    fi
+  fi
+  exit $STOP_RC
 fi
 
 # -------------------------------------------------- attach mode (power-user)
