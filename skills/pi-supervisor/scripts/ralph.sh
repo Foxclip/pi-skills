@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.18.2: run a supervised child with zero arguments.
+# ralph.sh — v0.18.4: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -12,9 +12,11 @@
 #   and Ctrl+C stops the MONITOR cleanly (the child keeps running — it is
 #   detached; stop it with stop.mjs if you really want it gone).
 #
-#   Once per project, make it ./ralph.sh for real:
-#     ln -s ~/.pi/agent/git/github.com/Foxclip/pi-skills/skills/pi-supervisor/scripts/ralph.sh ralph.sh
-#   (or copy the script into the project).
+#   One-time setup (pick ONE, then plain `ralph.sh` works from any project):
+#     A) PATH (recommended — zero per-project files):
+#        echo 'export PATH="$HOME/.pi/agent/git/github.com/Foxclip/pi-skills/skills/pi-supervisor/scripts:$PATH"' >> ~/.bashrc
+#     B) per-project symlink (visible in the repo):
+#        ln -s ~/.pi/agent/git/github.com/Foxclip/pi-skills/skills/pi-supervisor/scripts/ralph.sh ralph.sh
 #
 # ENVIRONMENT (all optional; CLI flags in power-user mode override these):
 #   TASK_FILE      task file in cwd           (default: TASK.md)
@@ -37,9 +39,11 @@
 #
 set -euo pipefail
 
-# readlink -f: ./ralph.sh is normally a SYMLINK into the skill's scripts dir —
-# resolve it so HERE points at launch.mjs/ralph-monitor.mjs, not the project
-HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+# resolve our own real location so HERE finds launch.mjs/ralph-monitor.mjs:
+# - $0 (not BASH_SOURCE[0] — the latter expands unreliably in this box's bash)
+# - readlink -f: the entry may be a symlink (per-project ralph.sh or a PATH dir
+#   that is itself a link) — we want the scripts dir, not the project
+HERE="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
 PI_BIN="${PI:-pi}"
 
 DEADLINE_RAW="${DEADLINE:-}"
