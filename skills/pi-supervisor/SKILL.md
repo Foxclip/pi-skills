@@ -1,6 +1,6 @@
 ---
 name: pi-supervisor
-description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use for long-lived, isolated second pi — parallel work, sub-conversations, orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles guard.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer→rewind→fork→stuck ladder, workspace invariants, parent nudge inbox, --expect-file artifacts, context-overflow distill-and-relaunch, always-on progress log + v:2 liveness status), launch.mjs (verified detached launcher, --deadline sizing), monitor.mjs (early-return wait loop with liveness detection), stop.mjs (ordered group-kill stop + state snapshot) and campaign.mjs (durable multi-run campaigns — goal+deadline state file, verified-facts ledger, next-run loop).
+description: Spawn and interact with a second pi agent as a child process (RPC mode) for multi-turn agent-to-agent work. Use for long-lived, isolated second pi — parallel work, sub-conversations, orchestrated follow-ups — that one-shot `pi --print` cannot cover. Also bundles guard.mjs for unattended long runs (loop/stall/degenerate-settle detection, steer→rewind→fork→stuck ladder, workspace invariants, parent nudge inbox, --expect-file artifacts, context-overflow distill-and-relaunch, always-on progress log + v:2 liveness status), launch.mjs (verified detached launcher, --deadline sizing), monitor.mjs (early-return wait loop with liveness detection), stop.mjs (ordered group-kill stop + state snapshot), campaign.mjs (durable multi-run campaigns — goal+deadline state file, verified-facts ledger, next-run loop) and ralph-monitor.mjs (v0.18.0 — the parent as a ralph loop: schedule in the shell, one fresh bounded pi --print judgment per cycle, survives the parent model going down).
 ---
 
 # Interacting with a child pi process
@@ -13,6 +13,7 @@ A pi agent can spawn and converse with another pi agent. It is not limited to `a
 | One-shot, structured events | JSON mode | `pi --mode json "task"` |
 | Multi-turn, bidirectional | **RPC mode** | `scripts/rpc-child.mjs` in this skill, or a custom `RpcClient` script |
 | One long autonomous job, unattended | **Supervised RPC** | `scripts/guard.mjs` (loop/stall detection + steer→rewind→fork→stuck ladder) |
+| Supervising that job without a long-lived parent session | **Ralph-loop parent** | `scripts/ralph-monitor.mjs` (v0.18.0) |
 | In-process Node/Bun, full API | SDK | `createAgentSession()` from `@earendil-works/pi-coding-agent` |
 
 If the child's job is fire-and-forget with no ongoing dialogue, `acp_delegate` is usually better: clean context, async, result saved to a file.
@@ -160,6 +161,7 @@ A long autonomous task is a *contract*, not a suggestion. Every failure in this 
 
 ### Monitoring a long run (parent side)
 
+- **Runs measured in hours: do NOT supervise from a long-lived parent session.** A goal-mode/TUI parent is one 400 `model not running` (shared local pool — the child's model can evict the parent's) or one context overflow from permanently dead monitoring (BlockGame6 2026-11-01: parent blocked 07:34, child finished unwatched). Run the parent as a ralph loop instead — `ralph-monitor.mjs` (v0.18.0, its own section below): the schedule and deterministic health checks live in the shell, each cycle is one fresh bounded `pi --print` judgment, and a dead parent model costs one retried cycle, not the job.
 - **Verify the launch, before walking away — process FIRST, then file.** `launch.mjs` does all three checks and prints the result. Slow hosts (cold node / AV scan of a detached hidden process): the status file can lag ~14 s+ — `launch.mjs` covers that with the stage-2 grace and reports `launched:"unknown"` rather than a false failure when the process is alive but silent. Treat `unknown` as "go check the process", never as "relaunch". With a manual launch: (1) the guard process is actually alive (`tasklist /FI "PID eq <pid>"` / `kill -0 <pid>`) — checked *in addition to*, never *instead of*, the file; (2) `head <out-dir>/launch.out` shows the `[supervisor] task: N chars — "..."` echo — the task the child *actually received* (a typo'd `--flag` (now exit 2) or a truncated task used to become the child's entire task, and the run would "complete" doing nothing in 6 minutes); (3) `pi-child-status.json` says `starting`/`running` — not `error`, not the previous run's leftover. The process check is load-bearing: a status file can never prove liveness, only the process can.
 - **One blocking wait, not polling — with MANDATORY early return.** The wait is one `monitor.mjs` call per cycle:
 
@@ -200,6 +202,25 @@ node <skill_dir>/scripts/stop.mjs --out-dir <run-dir> --force   # straight to SI
 ```
 
 Graceful is the right default: the guard's own SIGTERM handler marks the status file `error`/`killed-SIGTERM` before it exits, so a graceful stop leaves an accurate final status — only a SIGKILL'd group leaves the file stale-`running`. One JSON line on stdout: `{stopped, stoppedVia, guardPid, childPid, confirmedDead:{guard,child}, finalStatus, manifestPath}`. **Exit codes: 0 = stopped (or already stopped); 1 = could not confirm death, or nothing was found (a missing status file is exit 1 + "verify" — it may be a typo'd `--out-dir`, never mistaken for a stop); 2 = hard error (bad args, corrupt status file).** Use it whenever a human says "stop the child", a campaign deadline is forced, or you need to tear a run down before relaunching; then audit the final `pi-child-result.json` (if it settled) and the expect-files before the next run.
+
+## Ralph-loop parent monitor (`ralph-monitor.mjs`, v0.18.0)
+
+A long-lived parent session is the fragile component of supervising a child: one 400 `model name=X is not running` (child's model evicts the parent's on a shared `parallel=1` local server), one context overflow, or one API error wedges the WHOLE supervision — BlockGame6 2026-11-01: the goal-mode parent went `blocked` at 07:34 while its child finished fine 26 minutes later. `ralph-monitor.mjs` inverts the design: the SCHEDULE and all deterministic health checks live in a Node loop that never touches a model; the LLM is one fresh, bounded `pi --print` turn per cycle (stateless by default; all memory on disk). A dead model now kills one *iteration* (logged, retried next cycle, auto-recovers when the model returns) instead of the job. It is the anti-wedge parent — use it for any run measured in hours, or whenever the parent and child share one local model pool.
+
+```bash
+node <skill_dir>/scripts/ralph-monitor.mjs --run-dir /tmp/<task>/run1 --pi <pi-path> \
+  [--project-dir <repo>] [--model <spec>] [--provider <spec>] \
+  [--deadline "2026-11-01 12:00" | --max-hours 12] [--cycle-sec 1200] [--timeout-sec 600] \
+  [--max-interventions 3] [--stuck-sec 3600] [--stale-sec 180] \
+  [--session <file|id>] [--prompt-file <p>] [--llm-fail-max 6] [--dry-run] [--once]
+```
+
+- **Loop-owned, zero LLM cost (runs every cycle before any model call):** deadline → exit 4; child terminal (`completed` → exit 0, other exitReasons → exit 5); guard pid dead or status stale-while-running → exit 2; `toolCalls` unchanged for `--stuck-sec` → exit 4 (stalled); intervention budget exhausted → exit 4; `--llm-fail-max` consecutive failed LLM cycles → exit 4 (`llm-down`). The LLM is consulted ONLY when the child is alive, fresh, and within budget — most of its value is NOT being called.
+- **The judgment turn:** one `pi --print` per cycle (fresh `--no-session` unless `--session` is given), bounded by `--timeout-sec` (default 600 — slow local models read 4 files in minutes, not seconds; a timeout is just an `llm-failed` cycle). Default contract (override with `--prompt-file`): read ≤4 files — status via jq, the loop's own log tail, the child's progress log tail, and STATUS.md/TASK.md — then end with exactly one of `DECISION: OK` / `DECISION: NUDGE: <msg>` / `DECISION: STOP: <reason>` (any other final line is treated as OK; a non-zero pi exit or empty output is counted as a FAILED cycle, never as OK). Keep the read budget small — E2E proved a 6-file read list outruns a 26B local model's per-cycle budget.
+- **NUDGE delivery** reuses the v0.17.0 parent-nudge channel (`monitor.mjs --steer` → `.steer-inbox/` → live guard). Delivery failure (dead guard) burns the budget slot and moves on — the pre-checks catch a truly dead child next cycle. `STOP` exits 4 with the reason in the log. **SIGINT → exit 130** with state saved; the handler is signal-safe mid-LLM-turn (the loop runs `pi` asynchronously on purpose — a synchronous `spawnSync` swallows signals arriving during the call, verified in testing).
+- **Disk state (run dir):** `ralph-monitor-state.json` (cycles, interventions, lastDecision, lastToolCalls, llmFailStreak — also what a resumed/new parent session reads first) and `ralph-monitor.log` (one line per cycle + every pre-check exit — the audit trail, and the only cross-iteration memory the judgment prompt sees: prior NUDGES live there, so iterations don't re-nudge the same thing). **Exit codes: 0 child completed · 2 child dead/stale · 4 deadline/stall/budget/llm-down/STOP · 5 child failed · 130 SIGINT.**
+- **Model choice:** a cloud model for the parent is still safest (no shared pool), but a local one is now *acceptable* — worst case is `llm-failed` cycles up to `--llm-fail-max`, not a dead job. **Relationship to monitor.mjs:** that one is a single early-return wait for an INTERACTIVE parent turn; ralph-monitor is the whole job for an UNATTENDED parent. They compose: ralph's NUDGE path *is* monitor.mjs.
+- E2E-verified 2026-11-01 against real `gemma-4-26B` child runs: OK cycles, NUDGE ×2 → budget stop (exit 4), llm-failed recovery, child-completed exit 0, SIGINT exit 130 — plus 16 stub-based unit tests in `scripts/test-ralph-monitor.mjs`.
 
 ## Multi-run campaigns (`campaign.mjs`, v0.16.0)
 
