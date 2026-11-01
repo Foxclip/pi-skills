@@ -24,7 +24,7 @@
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, chmodSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, chmodSync, cpSync, openSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -331,6 +331,99 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   report("R15 llm-down after 2 consecutive failures → exit 4",
     code === 4 && /llm-down/.test(readLog(d)),
     `exit=${code} log=${readLog(d).trim().split("\\n").map(l => l.slice(0, 60)).join(" | ")}`);
+}
+
+// ================= RALPH.SH integration (v0.21.0 terminal design) =================
+// sandbox: ralph.sh + ralph-monitor.mjs + stop.mjs + lib/ copied into root/sbx/scripts,
+// launch.mjs REPLACED with a stub (writes launch-args.txt, spawns a detached
+// `sleep 600` child, writes a v:2 status file) — no real pi child is ever started.
+const sbx = path.join(root, "sbx", "scripts");
+mkdirSync(sbx, { recursive: true });
+for (const f of ["ralph.sh", "ralph-monitor.mjs", "stop.mjs"]) cpSync(path.join(HERE, f), path.join(sbx, f));
+cpSync(path.join(HERE, "lib"), path.join(sbx, "lib"), { recursive: true });
+chmodSync(path.join(sbx, "ralph.sh"), 0o755);
+writeFileSync(path.join(sbx, "launch.mjs"), `
+import fs from "fs"; import path from "path"; import { spawn } from "child_process";
+const a = process.argv.slice(2);
+const get = (f) => { const i = a.indexOf(f); return i >= 0 ? a[i + 1] : null; };
+const out = get("--out-dir");
+fs.writeFileSync(path.join(out, "launch-args.txt"), JSON.stringify({ deadline: get("--deadline"), model: get("--model"), provider: get("--provider"), parentModel: process.env.PARENT_MODEL || null }, null, 2));
+const s = spawn("sleep", ["600"], { detached: true, stdio: "ignore" }); s.unref();
+fs.writeFileSync(path.join(out, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "running", exitReason: null, guardPid: s.pid, childPid: s.pid, attempt: 1, rewinds: 0, toolCalls: 0, elapsedMs: 0, deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
+console.log(JSON.stringify({ launched: true, guardPid: s.pid }));
+`);
+const SBX_RALPH = path.join(sbx, "ralph.sh");
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+const waitExit = (p, ms) => new Promise((resolve) => {
+  if (p.exitCode !== null) return resolve(p.exitCode);
+  const t0 = Date.now();
+  const iv = setInterval(() => {
+    if (p.exitCode !== null) { clearInterval(iv); resolve(p.exitCode); }
+    else if (Date.now() - t0 > ms) { try { p.kill("SIGKILL"); } catch {} resolve("timeout"); }
+  }, 100);
+});
+
+// R18 zero-arg launch: context banner, human deadline, short-ts terminal lines,
+// no epoch leak, flags reach launch.mjs, monitor log file format unchanged
+{
+  const proj = path.join(root, "p18"); mkdirSync(proj, { recursive: true });
+  writeFileSync(path.join(proj, "TASK.md"), "# T18 task");
+  const dl = String(Math.floor(Date.now() / 1000) + 7200);
+  const logf = path.join(root, "r18.log");
+  const child = spawn("bash", [SBX_RALPH], { cwd: proj, stdio: ["ignore", "ignore", openSync(logf, "w")],
+    env: { ...process.env, PI: STUB_OK, DEADLINE: dl, CHILD_MODEL: "cm-e2e", PARENT_MODEL: "pm-e2e", CYCLE_SEC: "1" } });
+  await sleepMs(4000);   // banner + launch + a couple of cycles
+  const rd = path.join(proj, ".pi-supervisor", "runs", "run1");
+  let st = { childPid: null };
+  try { st = JSON.parse(readFileSync(path.join(rd, "pi-child-status.json"), "utf8")); } catch {}
+  // kill the MONITOR only (unique pattern; escaped dot avoids self-matching this shell)
+  const monPids = spawnSync("pgrep", ["-f", `ralph-monitor\\.mjs --run-dir ${rd}`], { encoding: "utf8" }).stdout.trim();
+  for (const p of monPids.split("\n").filter(Boolean)) { try { process.kill(Number(p), "SIGTERM"); } catch {} }
+  const rc18 = await waitExit(child, 15000);
+  try { if (st.childPid) process.kill(st.childPid, "SIGKILL"); } catch {}
+  const out = readFileSync(logf, "utf8");
+  let la = null;
+  try { la = JSON.parse(readFileSync(path.join(rd, "launch-args.txt"), "utf8")); } catch {}
+  let mlog = "";
+  try { mlog = readFileSync(path.join(rd, "ralph-monitor.log"), "utf8"); } catch {}
+  const relDlOk = /\(in 2h/.test(out);
+  const shortTsOk = /\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] /.test(out);
+  const epochLeak = /deadline=\d+/.test(out);
+  const fileFmtOk = /\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] cycle=1/.test(mlog);
+  report("R18 ralph.sh: banner + human deadline + short-ts lines + flags→launch.mjs + ISO file format",
+    out.includes("┌ ralph") && out.includes("│ project") && relDlOk
+    && shortTsOk && !epochLeak && /done · exit/.test(out)
+    && la && la.deadline === dl && la.model === "cm-e2e" && la.parentModel === "pm-e2e"
+    && fileFmtOk,
+    `rc=${rc18} banner=${out.includes("┌ ralph")} relDl=${relDlOk} shortTs=${shortTsOk} epochLeak=${epochLeak} closer=${/done · exit/.test(out)} launch=${JSON.stringify(la)} fileFmt=${fileFmtOk}`);
+}
+
+// R19 power-user attach: pre-check completed → exit 0, parent writes FINAL-REPORT.md,
+// ralph.sh prints it boxed
+{
+  const proj = path.join(root, "p19"); const rd = path.join(proj, "run1");
+  mkdirSync(rd, { recursive: true });
+  writeFileSync(path.join(proj, "TASK.md"), "# T19");
+  writeFileSync(path.join(rd, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed", guardPid: 999999, childPid: 999999, attempt: 1, rewinds: 0, toolCalls: 5, elapsedMs: 1234, deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
+  writeFileSync(path.join(rd, "pi-child-progress.log"), "tool line 1\ntool line 2\n");
+  const logf = path.join(root, "r19.log");
+  const child = spawn("bash", [SBX_RALPH, rd], { cwd: proj, stdio: ["ignore", "ignore", openSync(logf, "w")],
+    env: { ...process.env, PI: STUB_OK, NO_COLOR: "1" } });
+  const rc19 = await waitExit(child, 25000);
+  const out = readFileSync(logf, "utf8");
+  const rep = existsSync(path.join(rd, "FINAL-REPORT.md")) ? readFileSync(path.join(rd, "FINAL-REPORT.md"), "utf8") : "";
+  report("R19 attach: completed pre-check → exit 0 + FINAL-REPORT.md + boxed in terminal",
+    rc19 === 0 && rep.length > 0 && out.includes("┌ final report (parent)") && out.includes("│ thinking about") && /done · exit 0/.test(out),
+    `rc=${rc19} report=${rep.length}B boxed=${out.includes("┌ final report (parent)")} closer=${/done · exit 0/.test(out)} outTail=${out.trim().split("\n").slice(-3).join(" | ").slice(0, 120)}`);
+
+  // R20 pty → ANSI colors; NO_COLOR → plain
+  const ttyLog = path.join(root, "r20.tty"), plainLog = path.join(root, "r20.plain");
+  spawnSync("bash", ["-c", `cd ${proj} && PI=${STUB_OK} script -qec "bash ${SBX_RALPH} ${rd}" /dev/null > ${ttyLog} 2>&1 || true`], { timeout: 60000 });
+  spawnSync("bash", ["-c", `cd ${proj} && PI=${STUB_OK} NO_COLOR=1 script -qec "bash ${SBX_RALPH} ${rd}" /dev/null > ${plainLog} 2>&1 || true`], { timeout: 60000 });
+  const t = readFileSync(ttyLog, "utf8"), pl = readFileSync(plainLog, "utf8");
+  report("R20 pty → colored banner + box; NO_COLOR → plain",
+    t.includes("\x1b[") && t.includes("┌ ralph") && pl.includes("┌ ralph") && !pl.includes("\x1b["),
+    `ttyEsc=${t.includes("\x1b[")} plainEsc=${pl.includes("\x1b[")} ttyBanner=${t.includes("┌ ralph")} plainBanner=${pl.includes("┌ ralph")}`);
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);

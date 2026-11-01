@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.20.0: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.21.0: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -120,13 +120,22 @@ state = state || {
   lastDecision: null, llmFailStreak: 0,
 };
 const saveState = () => writeFileSync(statePath, JSON.stringify(state, null, 2));
-// file: ISO-8601 UTC (machine-facing: sortable, TZ-proof, cross-artifact)
-// terminal: LOCAL time `[YYYY-MM-DD HH:MM:SS.mmm]` (human-facing)
-const localTs = (d) => { const p = (n, l = 2) => String(n).padStart(l, "0");
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`; };
-const log = (line) => {
-  appendFileSync(logPath, `[${new Date().toISOString()}] ${line}\n`);
-  process.stderr.write(`[${localTs(new Date())}] ${line}\n`);
+// v0.21.0 terminal design (terminal is human-facing, files are machine-facing —
+// ralph-monitor.log's format is UNCHANGED: `[iso] cycle=N decision=...`):
+//   terminal: dim short local-ts [HH:MM:SS], one scannable line per cycle,
+//   verdict glyphs, colored when stderr is a tty (NO_COLOR respected),
+//   reasoning in dim type under each cycle. Files: full ISO-8601 UTC, everything.
+const tsLocalShort = (d) => { const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; };
+const flog = (line) => appendFileSync(logPath, `[${new Date().toISOString()}] ${line}\n`);
+const tty = Boolean(process.stderr.isTTY) && !process.env.NO_COLOR;
+const C = (code) => (tty ? `\x1b[${code}m` : "");
+const tlog = (line) => process.stderr.write(line + "\n");
+const log = (line) => { flog(line); tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${line}`); };
+const tick = (n, verdict, detail, reasoning) => {
+  const sym = verdict === "OK" ? `${C(32)}✓${C(0)}` : verdict === "NUDGE" ? `${C(33)}→${C(0)}` : `${C(31)}✗${C(0)}`;
+  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${sym} ${C(1)}cycle ${n} · ${verdict}${C(0)}${detail ? " — " + detail : ""}`);
+  for (const line of (reasoning || "").split("\n")) tlog(`${C(2)}    ${line}${C(0)}`);
 };
 process.on("SIGINT", () => { log("sigint: stopping"); saveState(); process.exit(130); });
 
@@ -375,22 +384,26 @@ for (;;) {
       }
     } else {
       state.llmFailStreak = 0;
-      // the parent's full message, every cycle — terminal + ralph-monitor.log,
-      // so the run dir keeps the reasoning, not just the terse decision line
-      if (d.text) log(`cycle=${state.cycles} parent:\n${d.text}`);
+      // v0.21.0: the FULL reasoning goes to ralph-monitor.log (the permanent
+      // record — format unchanged); the terminal gets a scannable tick line
+      // plus the reasoning in dim type.
+      if (d.text) flog(`cycle=${state.cycles} parent:\n${d.text}`);
+      // a judgment whose final line was not DECISION: — treat as OK, log the anomaly
       const wasBadLine = !/^DECISION:\s*(OK|NUDGE|STOP)\b/i.test(d.raw || "");
+      const reasoning = (d.text || "").replace(/\n*DECISION:[^\n]*\s*$/i, "").trimEnd();
       if (d.decision === "OK") {
         state.lastDecision = "OK";
-        log(`cycle=${state.cycles} decision=OK${wasBadLine ? " (note: final line was not DECISION:, treated as OK)" : ""}`);
+        flog(`cycle=${state.cycles} decision=OK${wasBadLine ? " (note: final line was not DECISION:, treated as OK)" : ""}`);
+        tick(state.cycles, "OK", wasBadLine ? "final line was not DECISION: — treated as OK" : undefined, reasoning);
       } else if (d.decision === "NUDGE") {
         state.lastDecision = `NUDGE: ${d.detail}`;
         state.interventions += 1;
         const nr = await deliverNudge(d.detail || "please continue and update STATUS.md");
-        log(`cycle=${state.cycles} decision=NUDGE interventions=${state.interventions} delivered=${nr.ok}${nr.why ? " why=" + nr.why : ""} msg=${JSON.stringify(d.detail)}`);
-        if (!nr.ok) {
-          // delivery failed (dead guard, etc.) — the pre-checks will catch a
-          // truly dead child next cycle; burn the budget slot, move on
-        }
+        flog(`cycle=${state.cycles} decision=NUDGE interventions=${state.interventions} delivered=${nr.ok}${nr.why ? " why=" + nr.why : ""} msg=${JSON.stringify(d.detail)}`);
+        tick(state.cycles, "NUDGE", d.detail, reasoning);
+        // nudge delivery status (dead guard, etc.) — the pre-checks will catch a
+        // truly dead child next cycle; the budget slot is burned either way
+        tlog(`${C(2)}    nudge ${nr.ok ? "delivered" : `NOT delivered${nr.why ? ` (${nr.why})` : ""}`}${C(0)}`);
         if (state.interventions >= A.maxInterventions) {
           log(`budget exhausted (${state.interventions}/${A.maxInterventions}) — stopping loop`);
           await writeFinalReport(`parent stop: intervention budget exhausted (${state.interventions}/${A.maxInterventions})`);
@@ -399,12 +412,14 @@ for (;;) {
         }
       } else if (d.decision === "STOP") {
         state.lastDecision = `STOP: ${d.detail}`;
-        log(`cycle=${state.cycles} decision=STOP reason=${JSON.stringify(d.detail)}`);
+        flog(`cycle=${state.cycles} decision=STOP reason=${JSON.stringify(d.detail)}`);
+        tick(state.cycles, "STOP", d.detail || "no reason given", reasoning);
         await writeFinalReport(`parent stop: ${d.detail || "no reason given"}`);
         saveState();
         process.exit(4);
       } else {
-        log(`cycle=${state.cycles} unknown-decision=${JSON.stringify(d.raw.slice(0, 120))} — treating as OK`);
+        flog(`cycle=${state.cycles} unknown-decision=${JSON.stringify(d.raw.slice(0, 120))} — treating as OK`);
+        tick(state.cycles, "OK", "unknown final line — treated as OK", reasoning);
         state.lastDecision = "unknown→OK";
       }
       saveState();

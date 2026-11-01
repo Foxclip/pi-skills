@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.20.0: run a supervised child with zero arguments.
+# ralph.sh — v0.21.0: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -91,9 +91,50 @@ HARVEST_TARGET=""   # set once RUN_DIR is known; the EXIT trap harvests it
 
 # every wrapper message is timestamped in LOCAL time (terminal = human-facing;
 # the log files keep ISO-8601 UTC — see ts() format vs the monitor's log())
+# ------------------------------------------------------------- terminal (v0.21.0)
+# human-facing terminal: short local ts [HH:MM:SS] (full precision lives in
+# the log FILES, whose formats are unchanged), ANSI colors only when stderr is
+# a tty and NO_COLOR is unset, a context banner at start, boxed final report.
 ts()   { date +"%Y-%m-%d %H:%M:%S.%3N"; }
+ts_s() { date +"%H:%M:%S"; }
+if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_B=$(printf '\033[1m'); C_D=$(printf '\033[2m'); C_G=$(printf '\033[32m')
+  C_Y=$(printf '\033[33m'); C_R=$(printf '\033[31m'); C_N=$(printf '\033[0m')
+else C_B=""; C_D=""; C_G=""; C_Y=""; C_R=""; C_N=""; fi
 say()  { printf '[%s] %s\n' "$(ts)" "$*"; }
-saye() { printf '[%s] %s\n' "$(ts)" "$*" >&2; }
+saye() { printf '%s[%s]%s %s\n' "$C_D" "$(ts_s)" "$C_N" "$*" >&2; }
+human_secs() { local s=${1:-0}; case "$s" in ''|*[!0-9]*) echo "${s}s"; return;; esac
+  if [ "$s" -ge 3600 ] && [ $((s % 3600)) -eq 0 ]; then echo "$((s / 3600))h";
+  elif [ "$s" -ge 60 ] && [ $((s % 60)) -eq 0 ]; then echo "$((s / 60))m";
+  else echo "${s}s"; fi; }
+human_dl() { # $1 epoch|ISO|HH:MM → "YYYY-MM-DD HH:MM (in 11h 58m)"
+  local sec now rel sign span
+  case "$1" in
+    ''|*[!0-9]*) sec=$(date -d "$1" +%s 2>/dev/null) || { echo "${1}"; return; } ;;  # ISO / HH:MM
+    *) sec="$1" ;;                                                                 # bare epoch — date -d rejects it
+  esac
+  now=$(date +%s); rel=$(( sec - now )); sign="in"
+  [ $rel -lt 0 ] && { rel=$(( -rel )); sign="ago"; }
+  if [ $rel -ge 86400 ]; then span="$((rel / 86400))d $((rel % 86400 / 3600))h"
+  elif [ $rel -ge 3600 ]; then span="$((rel / 3600))h $((rel % 3600 / 60))m"
+  else span="$((rel / 60))m"; fi
+  echo "$(date -d "@$sec" +'%Y-%m-%d %H:%M')   ($sign $span)"; }
+rule() { printf '─%.0s' $(seq 1 50); }
+banner() { # $1=mode: launch|attach — uses RUN_DIR, DEADLINE_EPOCH, PROJECT_DIR (all may be unset in attach)
+  local runrel="$RUN_DIR" pd="${PROJECT_DIR:-}"
+  case "$RUN_DIR" in "$pd"/*) [ -n "$pd" ] && runrel=".pi-supervisor/runs/$(basename "$RUN_DIR")" ;; esac
+  {
+  printf '%s┌ ralph%s %s\n' "$C_B" "$C_N" "$(rule)"
+  printf '│ project   %s\n' "$( [ -n "$pd" ] && basename "$pd" || echo unknown )"
+  printf '│ run       %s\n' "$runrel"
+  printf '│ deadline  %s\n' "$(human_dl "${DEADLINE_EPOCH:-}")"
+  printf '│ models    child=%s · parent=%s\n' "${CHILD_MODEL_VAL:-pi-default}" "${PARENT_MODEL_VAL:-pi-default}"
+  if [ "$1" = attach ]; then
+    printf '└ monitoring attached run — cycle every %s · Ctrl+C stops the monitor only (child keeps running)\n' "$(human_secs "${CYCLE_SEC:-1200}")"
+  else
+    printf '└ monitoring — cycle every %s · Ctrl+C stops the monitor only (child keeps running)\n' "$(human_secs "${CYCLE_SEC:-1200}")"
+  fi
+  } >&2; }
 
 # ------------------------------------------------------------- CLI flags
 # The three most-used knobs as flags, parseable BEFORE mode dispatch so they
@@ -261,10 +302,15 @@ ATTACHED=0
 if [ $# -ge 1 ]; then
   ATTACHED=1
   RUN_DIR=$1; shift
+  # display: adopt the run's own deadline from its status file if the user gave none
+  # (so the banner shows it AND the monitor is told the run's real deadline)
+  if [ -z "${DEADLINE_EPOCH:-}" ] && [ -f "$RUN_DIR/pi-child-status.json" ]; then
+    DEADLINE_EPOCH="$(node -e "try{const j=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));if(j.deadlineIso)process.stdout.write(String(Math.floor(new Date(j.deadlineIso).getTime()/1000)))}catch{}" "$RUN_DIR/pi-child-status.json" 2>/dev/null || true)"
+  fi
   if [ -n "${PROJECT_DIR:-}" ]; then ralph_flags+=(--project-dir "$PROJECT_DIR"); fi
   if [ -n "$DEADLINE_EPOCH" ]; then ralph_flags+=(--deadline "$DEADLINE_EPOCH"); fi
   EXTRA=("$@")
-  saye "ralph-monitor: run-dir=$RUN_DIR (attaching to existing run)"
+  RALPH_MODE=attach   # the banner prints before the monitor starts
   MONITOR_ARGS=(--run-dir "$RUN_DIR" "${ralph_flags[@]}" "${EXTRA[@]}")
 fi
 
@@ -319,7 +365,8 @@ if [ "$ATTACHED" -eq 0 ]; then
     if [ -n "$CHILD_MODEL_VAL" ];    then launch_args+=(--model "$CHILD_MODEL_VAL"); fi
     if [ -n "$CHILD_PROVIDER_VAL" ]; then launch_args+=(--provider "$CHILD_PROVIDER_VAL"); fi
 
-    saye "ralph: launching child (task=.$TASK_FILE, run-dir=$RUN_DIR, deadline=$DEADLINE_EPOCH, child-model=${CHILD_MODEL_VAL:-pi-default}, parent-model=${PARENT_MODEL_VAL:-pi-default})"
+    RALPH_MODE=launch
+    banner launch
     launch_out=$(node "$HERE/launch.mjs" "${launch_args[@]}" 2>&1) || true
     case "$launch_out" in
       *'"launched":true'*)
@@ -346,7 +393,7 @@ if [ "$ATTACHED" -eq 0 ]; then
       iso=$(status_field "$RUN_DIR/pi-child-status.json" deadlineIso)
       [ -n "$iso" ] && DEADLINE_EPOCH="$iso"
     fi
-    saye "ralph: attaching to live run $RUN_DIR (no new child launched)"
+    RALPH_MODE=attach
   fi
 
   MONITOR_ARGS=(--run-dir "$RUN_DIR" --project-dir "$PROJECT_DIR" --deadline "$DEADLINE_EPOCH" "${ralph_flags[@]}")
@@ -360,20 +407,26 @@ on_exit() {
   if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then interrupted=1; fi
   if [ -n "$HARVEST_TARGET" ] && [ -d "$HARVEST_TARGET" ]; then
     harvest "$HARVEST_TARGET" "$interrupted" "$rc"
-    saye "ralph: preserved — report: $HARVEST_TARGET/RUN-REPORT.md   index: $(dirname "$HARVEST_TARGET")/INDEX.json"
+    if [ "$rc" -eq 0 ]; then saye "${C_B}done · exit 0${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"
+    else saye "${C_R}done · exit $rc${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"; fi
   fi
 }
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-saye "ralph: monitoring — cycles every ${CYCLE_SEC:-1200}s, Ctrl+C stops the MONITOR only (the child keeps running)"
+# launch mode printed its banner at launch; attach mode prints it here
+if [ "${RALPH_MODE:-launch}" = "attach" ]; then
+  [ -n "$DEADLINE_EPOCH" ] || DEADLINE_EPOCH=$(status_field "$RUN_DIR/pi-child-status.json" deadlineIso 2>/dev/null)
+  banner attach
+fi
 rc=0
 node "$HERE/ralph-monitor.mjs" "${MONITOR_ARGS[@]}" || rc=$?
 # the parent's final report (v0.20.0 — written by the monitor on completion or
 # parent-stop; absent otherwise, e.g. Ctrl+C with a still-live child)
 if [ -f "$RUN_DIR/FINAL-REPORT.md" ]; then
-  saye "ralph: final report (written by the parent):"
-  cat "$RUN_DIR/FINAL-REPORT.md" >&2
+  printf '%s┌ final report (parent)%s %s\n' "$C_B" "$C_N" "$(rule)" >&2
+  while IFS= read -r line; do printf '│ %s\n' "$line" >&2; done < "$RUN_DIR/FINAL-REPORT.md"
+  printf '└%s\n' "$(rule)" >&2
 fi
 exit $rc
