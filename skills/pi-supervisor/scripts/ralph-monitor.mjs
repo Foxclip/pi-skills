@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.18.0: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.19.5: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -120,10 +120,13 @@ state = state || {
   lastDecision: null, llmFailStreak: 0,
 };
 const saveState = () => writeFileSync(statePath, JSON.stringify(state, null, 2));
+// file: ISO-8601 UTC (machine-facing: sortable, TZ-proof, cross-artifact)
+// terminal: LOCAL time `[YYYY-MM-DD HH:MM:SS.mmm]` (human-facing)
+const localTs = (d) => { const p = (n, l = 2) => String(n).padStart(l, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`; };
 const log = (line) => {
-  const l = `[${new Date().toISOString()}] ${line}`;
-  appendFileSync(logPath, l + "\n");
-  process.stderr.write(l + "\n");
+  appendFileSync(logPath, `[${new Date().toISOString()}] ${line}\n`);
+  process.stderr.write(`[${localTs(new Date())}] ${line}\n`);
 };
 process.on("SIGINT", () => { log("sigint: stopping"); saveState(); process.exit(130); });
 
@@ -237,7 +240,8 @@ async function llmDecide() {
     const m = tail[i].match(/^DECISION:\s*([A-Za-z]+)(?::\s*(.*))?$/);
     if (m) { raw = tail[i]; decision = m[1].toUpperCase(); detail = (m[2] || "").trim(); break; }
   }
-  return { okExit: r.status === 0, decision, detail, raw, tail, exitStatus: r.status === 0 ? 0 : (r.status ?? r.signal) };
+  // text = the parent's full response (stdout only — stderr is noise for display)
+  return { okExit: r.status === 0, decision, detail, raw, tail, text: (r.stdout || "").trim(), exitStatus: r.status === 0 ? 0 : (r.status ?? r.signal) };
 }
 
 async function deliverNudge(msg) {
@@ -307,6 +311,9 @@ for (;;) {
       }
     } else {
       state.llmFailStreak = 0;
+      // the parent's full message, every cycle — terminal + ralph-monitor.log,
+      // so the run dir keeps the reasoning, not just the terse decision line
+      if (d.text) log(`cycle=${state.cycles} parent:\n${d.text}`);
       const wasBadLine = !/^DECISION:\s*(OK|NUDGE|STOP)\b/i.test(d.raw || "");
       if (d.decision === "OK") {
         state.lastDecision = "OK";

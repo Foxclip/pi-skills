@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.19.4: run a supervised child with zero arguments.
+# ralph.sh — v0.19.5: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -50,8 +50,10 @@
 #   --parent-model <spec>           = PARENT_MODEL  (ralph's judgment model)
 # Both `--flag value` and `--flag=value` forms work.
 #
-# EVERY message this wrapper prints is timestamped `[YYYY-MM-DDTHH:MM:SS.mmmZ]`
-# (same format as ralph-monitor.log) — quoted output blocks (a launch failure,
+# EVERY message this wrapper prints is timestamped `[YYYY-MM-DD HH:MM:SS.mmm]`
+# in LOCAL time (the terminal is for humans; the log FILES keep ISO-8601 UTC
+# — the two differ only in the prefix, so a terminal line is still findable
+# in the log by its text). Quoted output blocks (a launch failure,
 # ralph-monitor's child-stderr) keep their body raw under a timestamped header.
 #
 # MODES:
@@ -87,9 +89,9 @@ HERE="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
 PI_BIN="${PI:-pi}"
 HARVEST_TARGET=""   # set once RUN_DIR is known; the EXIT trap harvests it
 
-# every wrapper message is timestamped like the monitor's log lines:
-# [YYYY-MM-DDTHH:MM:SS.mmmZ]   (UTC, GNU date %3N)
-ts()   { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
+# every wrapper message is timestamped in LOCAL time (terminal = human-facing;
+# the log files keep ISO-8601 UTC — see ts() format vs the monitor's log())
+ts()   { date +"%Y-%m-%d %H:%M:%S.%3N"; }
 say()  { printf '[%s] %s\n' "$(ts)" "$*"; }
 saye() { printf '[%s] %s\n' "$(ts)" "$*" >&2; }
 
