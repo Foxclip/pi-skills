@@ -19,9 +19,11 @@
 # ENVIRONMENT (all optional; CLI flags in power-user mode override these):
 #   TASK_FILE      task file in cwd           (default: TASK.md)
 #   PI             pi executable             (default: pi)
-#   MODEL/PROVIDER for BOTH child and parent (default: pi's default model —
-#                child and parent always share the choice, the safe config
-#                on shared local model servers)
+#   MODEL/PROVIDER   for BOTH child and parent (default: pi's default model —
+#                the safe shared config on shared local model servers)
+#   CHILD_MODEL/CHILD_PROVIDER    override the CHILD's model only
+#   PARENT_MODEL/PARENT_PROVIDER  override the PARENT's (ralph's) model only
+#                (e.g. child on a big local model, parent on a fast/cloud one)
 #   DEADLINE       ISO | "HH:MM" | epoch     (default: now + MAX_HOURS)
 #   MAX_HOURS      deadline horizon          (default: 12)
 #   PREAMBLE       child preamble text       (default: standard)
@@ -47,11 +49,17 @@ else
   DEADLINE_EPOCH=$(( $(date +%s) + ${MAX_HOURS:-12} * 3600 ))
 fi
 
+# model selection: MODEL/PROVIDER set BOTH sides; CHILD_*/PARENT_* override one side
+CHILD_MODEL_VAL="${CHILD_MODEL:-${MODEL:-}}"
+CHILD_PROVIDER_VAL="${CHILD_PROVIDER:-${PROVIDER:-}}"
+PARENT_MODEL_VAL="${PARENT_MODEL:-${MODEL:-}}"
+PARENT_PROVIDER_VAL="${PARENT_PROVIDER:-${PROVIDER:-}}"
+
 # common ralph-monitor flags from env (explicit CLI args in power-user mode
 # win: they are appended last and ralph-monitor takes the last occurrence)
 ralph_flags=(--pi "$PI_BIN")
-if [ -n "${MODEL:-}" ];             then ralph_flags+=(--model "$MODEL"); fi
-if [ -n "${PROVIDER:-}" ];          then ralph_flags+=(--provider "$PROVIDER"); fi
+if [ -n "$PARENT_MODEL_VAL" ];      then ralph_flags+=(--model "$PARENT_MODEL_VAL"); fi
+if [ -n "$PARENT_PROVIDER_VAL" ];   then ralph_flags+=(--provider "$PARENT_PROVIDER_VAL"); fi
 if [ -n "${CYCLE_SEC:-}" ];         then ralph_flags+=(--cycle-sec "$CYCLE_SEC"); fi
 if [ -n "${TIMEOUT_SEC:-}" ];       then ralph_flags+=(--timeout-sec "$TIMEOUT_SEC"); fi
 if [ -n "${MAX_INTERVENTIONS:-}" ]; then ralph_flags+=(--max-interventions "$MAX_INTERVENTIONS"); fi
@@ -127,10 +135,10 @@ if [ -z "$RUN_DIR" ]; then
                --deadline "$DEADLINE_EPOCH"
                --preamble "${PREAMBLE:-standard}"
                --idle-timeout "${IDLE_TIMEOUT:-300}")
-  if [ -n "${MODEL:-}" ];     then launch_args+=(--model "$MODEL"); fi
-  if [ -n "${PROVIDER:-}" ]; then launch_args+=(--provider "$PROVIDER"); fi
+  if [ -n "$CHILD_MODEL_VAL" ];    then launch_args+=(--model "$CHILD_MODEL_VAL"); fi
+  if [ -n "$CHILD_PROVIDER_VAL" ]; then launch_args+=(--provider "$CHILD_PROVIDER_VAL"); fi
 
-  echo "ralph: launching child (task=.$TASK_FILE, run-dir=$RUN_DIR, deadline=$DEADLINE_EPOCH, model=${MODEL:-pi-default})" >&2
+  echo "ralph: launching child (task=.$TASK_FILE, run-dir=$RUN_DIR, deadline=$DEADLINE_EPOCH, child-model=${CHILD_MODEL_VAL:-pi-default}, parent-model=${PARENT_MODEL_VAL:-pi-default})" >&2
   launch_out=$(node "$HERE/launch.mjs" "${launch_args[@]}" 2>&1) || true
   case "$launch_out" in
     *'"launched":true'*)
