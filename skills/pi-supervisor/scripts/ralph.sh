@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.21.2: run a supervised child with zero arguments.
+# ralph.sh — v0.21.3: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)

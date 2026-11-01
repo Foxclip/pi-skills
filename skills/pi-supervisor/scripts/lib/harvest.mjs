@@ -22,10 +22,12 @@ import path from "path";
 // every harvest message is timestamped in LOCAL time (terminal = human-facing;
 // matches ralph.sh's ts() — the log files keep ISO-8601 UTC)
 // terminal-facing: short local [HH:MM:SS] like the rest of the ralph terminal
-// (files stay ISO-8601 UTC)
+// (files stay ISO-8601 UTC); ts dimmed like the monitor's lines (same tty/NO_COLOR guard)
+const tty = Boolean(process.stderr.isTTY) && !process.env.NO_COLOR;
+const C = (code) => (tty ? `\x1b[${code}m` : "");
 const say = (msg) => {
   const d = new Date(); const p = (n) => String(n).padStart(2, "0");
-  console.error(`[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}] ${msg}`);
+  console.error(`${C(2)}[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]${C(0)} ${msg}`);
 };
 
 const [runDir, interruptedRaw = "0", rcRaw = "0"] = process.argv.slice(2);
