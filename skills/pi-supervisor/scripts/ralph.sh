@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.21.3: run a supervised child with zero arguments.
+# ralph.sh — v0.22.0: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -39,6 +39,8 @@
 #   MAX_HOURS      deadline horizon          (default: 12)
 #   PREAMBLE       child preamble text       (default: standard)
 #   IDLE_TIMEOUT   guard idle timeout, sec   (default: 300)
+#   TURN_STALL_SEC guard turn-stall limit, sec — abort + fork a single turn still alive
+#                after this long (degenerate-generation catch; default: 900, 0=off)
 #   CYCLE_SEC (1200)  TIMEOUT_SEC (600)  MAX_INTERVENTIONS (3)
 #   STUCK_SEC (3600)  STALE_SEC (180)  LLM_FAIL_MAX (6)
 #   PROMPT_FILE  PROJECT_DIR  SESSION  LOG_FILE   (ralph-monitor passthrough)
@@ -166,7 +168,7 @@ ralph.sh — supervised pi child (ralph loop). Zero-arg pipeline:
 normal-mode flags (anywhere in the arg list): --deadline <ISO|HH:MM|epoch>
   --child-model <spec>  --parent-model <spec>    (--flag value and --flag=value)
 environment: PI TASK_FILE RUNS_DIR DEADLINE MAX_HOURS MODEL PROVIDER
-  CHILD_MODEL CHILD_PROVIDER PARENT_MODEL PARENT_PROVIDER PREAMBLE IDLE_TIMEOUT
+  CHILD_MODEL CHILD_PROVIDER PARENT_MODEL PARENT_PROVIDER PREAMBLE IDLE_TIMEOUT TURN_STALL_SEC
   CYCLE_SEC TIMEOUT_SEC MAX_INTERVENTIONS STUCK_SEC STALE_SEC LLM_FAIL_MAX
   PROMPT_FILE SESSION LOG_FILE
 See the header comment in ralph.sh for the full contract.
@@ -364,7 +366,8 @@ if [ "$ATTACHED" -eq 0 ]; then
     launch_args=(--task-file "$TASK_FILE" --out-dir "$RUN_DIR"
                  --deadline "$DEADLINE_EPOCH"
                  --preamble "${PREAMBLE:-standard}"
-                 --idle-timeout "${IDLE_TIMEOUT:-300}")
+                 --idle-timeout "${IDLE_TIMEOUT:-300}"
+                 --turn-stall "${TURN_STALL_SEC:-900}")
     if [ -n "$CHILD_MODEL_VAL" ];    then launch_args+=(--model "$CHILD_MODEL_VAL"); fi
     if [ -n "$CHILD_PROVIDER_VAL" ]; then launch_args+=(--provider "$CHILD_PROVIDER_VAL"); fi
 

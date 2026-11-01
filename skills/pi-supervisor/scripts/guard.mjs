@@ -3,6 +3,11 @@
 // and supervise it: detect repetitive tool-call loops and stalls, and escalate
 // (steer → fork+retry → give up) instead of letting a watchdog kill the run.
 //
+// v0.22.0: --turn-stall — L0 cap on a SINGLE TURN's wall time (default 900s):
+// abort an overlong live turn + L2 fork. Catches "degenerate generation"
+// (a local model streaming one token every few seconds — eventful, so
+// idle-timeout never fires, yet the turn outlives the whole run).
+//
 // Why this exists:
 //   billion-context-pi's `repetitionGuard` (issue #308; acp.json key
 //   `repetitionGuard`, defaults warn=3 / abort=5, counter is PER SESSION)
@@ -166,6 +171,8 @@ Options:
                         guard's default abort-at-5, so the steer lands first)
   --max-steers <n>      L1 budget: corrective steer messages (default: 3)
   --max-rewinds <n>     L1.5 budget: abort+rewind attempts (default: 1, 0=off)
+  --turn-stall <sec>  L0: abort a single turn still alive after this many seconds,
+                        then L2-fork from the pre-task checkpoint (default: 900, 0=off)
   --max-forks <n>       L2 budget: abort+fork+retry attempts (default: 2)
   --steer-msg <t>       Full replacement for the built-in L1 steer message
                         (variables: {tool}, {count})
@@ -274,6 +281,7 @@ let loopThreshold = 4;
 let maxSteers = 3;
 let maxForks = 2;
 let maxRewinds = 1;
+let turnStallSec = 900;
 let steerMsg = "";
 let forkNote = "";
 let rewindNote = "";
@@ -306,7 +314,7 @@ let idleTimeoutSpecified = false;
 const VALID_FLAGS = [
   "--task", "--task-file", "--session-id", "--session", "--no-session", "--session-dir",
   "--name", "--provider", "--model", "--loop-threshold", "--max-steers",
-  "--max-forks", "--max-rewinds", "--steer-msg", "--rewind-note", "--fork-note", "--consult", "--consult-file",
+  "--max-forks", "--max-rewinds", "--turn-stall", "--steer-msg", "--rewind-note", "--fork-note", "--consult", "--consult-file",
   "--action", "--message", "--max-errors", "--heartbeat", "--max-text",
   "--idle-timeout", "--tool-timeout", "--timeout", "--finalize", "--stagnation", "--invariant", "--invariant-interval",
   "--progress-log", "--expect-file", "--preamble", "--keep-question-tool",
@@ -330,6 +338,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--max-steers") maxSteers = Number(argv[++i]);
   else if (a === "--max-forks") maxForks = Number(argv[++i]);
   else if (a === "--max-rewinds") maxRewinds = Number(argv[++i]);
+  else if (a === "--turn-stall") turnStallSec = Number(argv[++i]);
   else if (a === "--steer-msg") steerMsg = argv[++i];
   else if (a === "--rewind-note") rewindNote = argv[++i];
   else if (a === "--fork-note") forkNote = argv[++i];
@@ -494,6 +503,7 @@ for (const [flag, value] of [
   ["--max-steers", maxSteers],
   ["--max-forks", maxForks],
   ["--max-rewinds", maxRewinds],
+  ["--turn-stall", turnStallSec],
   ["--max-errors", maxErrors],
   ["--heartbeat", heartbeatN],
   ["--max-text", maxTextLen],
@@ -939,8 +949,11 @@ function checkInvariants() {
 // queueing path mid-turn; prompt() is only safe between turns (right after an
 // agent_settled). turnActive is set at every prompt site, cleared at settle.
 let turnActive = false;
+let turnStartAt = Date.now(); // v0.22.0: reset at every prompt (single prompt site)
+let turnStallBudgetWarned = false;
 async function promptChild(text) {
   turnActive = true;
+  turnStartAt = Date.now();
   return client.prompt(text);
 }
 async function deliverToChild(text) {
@@ -1034,6 +1047,7 @@ async function doConsult(trigger, extra) {
     maxSteers,
     maxForks,
     maxRewinds,
+    turnStallSec,
     startTs,
     hardTimeoutMs,
     sessionId: stateSessionId || null,
@@ -1559,6 +1573,7 @@ try {
     maxSteers = resumePayload.maxSteers ?? maxSteers;
     maxForks = resumePayload.maxForks ?? maxForks;
     maxRewinds = resumePayload.maxRewinds ?? maxRewinds;
+    turnStallSec = resumePayload.turnStallSec ?? turnStallSec;
     startTs = resumePayload.startTs ?? startTs;
     hardTimeoutMs = resumePayload.hardTimeoutMs ?? hardTimeoutMs;
     computeDeadline(); // startTs/hardTimeoutMs were restored from the file
@@ -1658,6 +1673,31 @@ try {
   while (!settled) {
     const ev = await nextEvent(250);
     const now = Date.now();
+    // v0.22.0: L0 — turn-level stall. idle-timeout only measures SILENCE
+    // (eventful-but-degenerate: a local model streaming one token every few
+    // seconds is "active" forever — one turn can outlive the whole run
+    // (2026-11-02 run3: degenerate generation for hours; with parallel=1 the
+    // parent was starved the entire run and only the deadline ended it)).
+    // Cap a SINGLE TURN's wall time; the remedy is the existing L2 (abort +
+    // fork from the pre-task checkpoint + re-prompt), which also discards the
+    // degenerate context. Skipped during the finalization window (report
+    // writing, no recovery); if the fork budget is spent, the idle path +
+    // hard deadline still bound the run.
+    if (turnStallSec > 0 && !finalized && turnActive && now - turnStartAt > turnStallSec * 1000) {
+      const secs = Math.round((now - turnStartAt) / 1000);
+      if (forksUsed < maxForks) {
+        logSup(`[guard] L0 turn-stall: turn alive for ${secs}s (> ${turnStallSec}s limit) — aborting + L2 fork`);
+        await doFork(`turn alive for ${secs}s with no settle (> ${turnStallSec}s turn limit)`);
+        continue; // fork re-prompted: turnStartAt was reset, re-evaluate fresh
+      }
+      // Budget exhausted: NO continue — fall through so the idle sensor and
+      // the hard deadline still bound the run (a continue here would skip the
+      // idle check every tick and leave the run bounded only by the deadline).
+      if (!turnStallBudgetWarned) {
+        turnStallBudgetWarned = true;
+        logSup(`[guard] L0 turn-stall (turn ${secs}s) but fork budget exhausted — bounded by idle-timeout/deadline`);
+      }
+    }
     if (ev) {
       lastEventAt = now;
       if (ev.type === "agent_settled") {

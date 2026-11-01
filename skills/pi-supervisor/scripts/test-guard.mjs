@@ -236,6 +236,32 @@ run({
   expect: ["L2 fork #1", "stalled", "\"status\":\"completed\""],
 });
 
+// 2b. Turn-stall (v0.22.0, L0): the turn keeps "living" past --turn-stall
+// (streaming-or-paused, never settling — the run3 degenerate-generation shape)
+// → abort + L2 fork → recovery completes.
+run({
+  name: "turn-stall: overlong live turn → L0 abort + L2 fork → completed",
+  args: ["task with enough length to pass the short-task warning threshold for tests", "--turn-stall", "1"],
+  phases: [
+    [say("degenerate"), { pauseMs: 2500 }, { settled: {} }],
+    done("Finished after turn-stall fork."),
+  ],
+  expect: ["L0 turn-stall", "turn alive for", "L2 fork #1", "\"status\":\"completed\""],
+});
+
+// 2c. Turn-stall with no fork budget: L0 warns once and FALLS THROUGH to the
+// idle sensor (a `continue` here would skip idle every tick and leave the run
+// bounded only by the deadline) → stuck-idle, exit 3.
+run({
+  name: "turn-stall, no fork budget → warn once, idle path bounds → stuck",
+  args: ["task with enough length to pass the short-task warning threshold for tests", "--turn-stall", "1", "--max-forks", "0", "--idle-timeout", "1"],
+  phases: [
+    [say("degenerate"), { pauseMs: 4000 }, { settled: {} }],
+  ],
+  expect: ["L0 turn-stall", "fork budget exhausted", "\"status\":\"stuck\""],
+  expectExit: 3,
+});
+
 // 3. Error loop → L1 steer → recovery → completed
 run({
   name: "error loop → L1 steer → recovery",

@@ -83,7 +83,7 @@ PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK DEADLINE=$DEADLINE ralph.sh > $T/D1.
 sleep 4
 PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh > $T/D2.log 2>&1 &
 sleep 3
-grep -qi "attaching to" $T/D2.log && ok "D: attach to live run (no second child)" || bad "D: $(head -3 $T/D2.log)"
+grep -qi "attached run" $T/D2.log && ok "D: attach to live run (no second child)" || bad "D: $(head -8 $T/D2.log)"
 [ "$(ls -d $T/projD/.pi-supervisor/runs/run* 2>/dev/null | wc -l)" -eq 1 ] \
   && ok "D: exactly one run dir after attach" || bad "D: extra run dirs"
 stoprun $T/projD > $T/D3b.log 2>&1
@@ -100,8 +100,9 @@ DL=$(( $(date +%s) + 600 ))
 PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK \
   ralph.sh --deadline $DL --child-model cm-e2e --parent-model pm-e2e > $T/E.log 2>&1 &
 sleep 4
-grep -q "deadline=$DL" $T/E.log && ok "E: --deadline flag parsed" || bad "E: $(head -3 $T/E.log)"
-grep -q "child-model=cm-e2e" $T/E.log && grep -q "parent-model=pm-e2e" $T/E.log \
+grep -q "deadline.*$(date -d @"$DL" '+%Y-%m-%d %H:%M')" $T/E.log \
+  && ok "E: --deadline flag parsed" || bad "E: $(head -8 $T/E.log)"
+grep -q "child=cm-e2e" $T/E.log && grep -q "parent=pm-e2e" $T/E.log \
   && ok "E: --child-model/--parent-model flags parsed" || bad "E: model flags"
 grep -q -- "--model cm-e2e" $T/projE/.pi-supervisor/runs/run1/launch-args.txt 2>/dev/null \
   && ok "E: flags reached launch.mjs (--model cm-e2e)" || bad "E: launch-args ($(cat $T/projE/.pi-supervisor/runs/run1/launch-args.txt 2>/dev/null))"
@@ -113,7 +114,7 @@ DLF=$(( $(date +%s) + 600 ))
 PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK \
   ralph.sh --deadline=$DLF --child-model=fv-e2e > $T/F.log 2>&1 &
 sleep 4
-grep -q "child-model=fv-e2e" $T/F.log && ok "F: --flag=value form parsed (no hang — a spin would print nothing)" || bad "F: $(cat $T/F.log | head -3)"
+grep -q "child=fv-e2e" $T/F.log && ok "F: --flag=value form parsed (no hang — a spin would print nothing)" || bad "F: $(cat $T/F.log | head -8)"
 stoprun $T/projF
 
 # ---- G: stale child → exit 2 -------------------------------------------------
@@ -168,8 +169,8 @@ grep -q "## Final report (written by the parent)" $T/projH/.pi-supervisor/runs/r
   && ok "J: RUN-REPORT.md embeds FINAL-REPORT.md" || bad "J: $(tail -2 $T/J.log)"
 
 # ---- K: terminal timestamps local; log files keep ISO UTC ---------------------
-grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] ralph: launching child' $T/C.log \
-  && ok "K: terminal timestamps local [YYYY-MM-DD HH:MM:SS.mmm]" || bad "K: $(grep 'launching child' $T/C.log | head -1)"
+grep -qE '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] ralph: child launched' $T/C.log \
+  && ok "K: terminal timestamps short local [HH:MM:SS]" || bad "K: $(grep 'child launched' $T/C.log | head -1)"
 grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}\.[0-9]{3}Z\] cycle=' $T/projC/.pi-supervisor/runs/run1/ralph-monitor.log 2>/dev/null \
   && ok "K: ralph-monitor.log keeps ISO UTC" || bad "K: log file format"
 
