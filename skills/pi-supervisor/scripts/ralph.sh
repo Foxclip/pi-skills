@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.19.1: run a supervised child with zero arguments.
+# ralph.sh — v0.19.3: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -43,6 +43,13 @@
 #   STUCK_SEC (3600)  STALE_SEC (180)  LLM_FAIL_MAX (6)
 #   PROMPT_FILE  PROJECT_DIR  SESSION  LOG_FILE   (ralph-monitor passthrough)
 #
+# FLAGS (v0.19.3 — accepted anywhere in the argument list, in any mode;
+# they map onto the env vars above, so FLAGS WIN OVER ENV):
+#   --deadline <ISO|HH:MM|epoch>    = DEADLINE
+#   --child-model <spec>            = CHILD_MODEL   (the child's model)
+#   --parent-model <spec>           = PARENT_MODEL  (ralph's judgment model)
+# Both `--flag value` and `--flag=value` forms work.
+#
 # MODES:
 #   ralph.sh                       zero-arg pipeline (above)
 #   ralph.sh <run-dir> [args...]   attach to an existing run (power-user;
@@ -75,6 +82,27 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
 PI_BIN="${PI:-pi}"
 HARVEST_TARGET=""   # set once RUN_DIR is known; the EXIT trap harvests it
+
+# ------------------------------------------------------------- CLI flags
+# The three most-used knobs as flags, parseable BEFORE mode dispatch so they
+# work in normal (zero-arg) mode: --deadline / --child-model / --parent-model.
+# They set the same variables the rest of the script reads (DEADLINE,
+# CHILD_MODEL, PARENT_MODEL) → flags win over env, by construction. Accepted
+# anywhere in the arg list; positional args (run-dir, stop, --harvest, …) are
+# preserved in order for mode dispatch below.
+_cli_pos=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --deadline)        [ $# -ge 2 ] || { echo "ralph: --deadline needs a value" >&2; exit 2; }; DEADLINE=$2; shift 2 ;;
+    --deadline=*)      DEADLINE=${1#*=}; shift ;;
+    --child-model)     [ $# -ge 2 ] || { echo "ralph: --child-model needs a value" >&2; exit 2; }; CHILD_MODEL=$2; shift 2 ;;
+    --child-model=*)   CHILD_MODEL=${1#*=}; shift ;;
+    --parent-model)    [ $# -ge 2 ] || { echo "ralph: --parent-model needs a value" >&2; exit 2; }; PARENT_MODEL=$2; shift 2 ;;
+    --parent-model=*)  PARENT_MODEL=${1#*=}; shift ;;
+    *) _cli_pos+=("$1"); shift ;;
+  esac
+done
+if [ ${#_cli_pos[@]} -gt 0 ]; then set -- "${_cli_pos[@]}"; else set --; fi
 
 DEADLINE_RAW="${DEADLINE:-}"
 if [ -n "$DEADLINE_RAW" ]; then
