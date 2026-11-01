@@ -254,7 +254,11 @@ async function deliverNudge(msg) {
 }
 
 // ---- main loop
-let lastCycle = Date.now();
+// Tight poll: the pre-checks (pure file reads, no LLM) run every POLL_SEC so a
+// completed/stale/deadline child is noticed within ~30s, not up to one full
+// cycle later. The LLM judgment still only runs every --cycle-sec.
+const POLL_SEC = 30;
+let lastJudgment = 0; // 0 = judgment due immediately
 (async () => {
 for (;;) {
   const status = readStatus();
@@ -264,8 +268,14 @@ for (;;) {
     saveState();
     process.exit(pc.code);
   }
+  const nowMs = Date.now();
+  if (nowMs - lastJudgment < A.cycleSec * 1000 - 500) {
+    await sleep(Math.min(POLL_SEC * 1000, Math.max(5000, A.cycleSec * 1000 - (nowMs - lastJudgment))));
+    continue;
+  }
   state.cycles += 1;
-  state.lastCycleAt = new Date().toISOString();
+  state.lastCycleAt = new Date(nowMs).toISOString();
+  lastJudgment = nowMs;
 
   if (A.dryRun) {
     log(`cycle=${state.cycles} dry-run: status=${status ? status.status : "absent"} toolCalls=${status ? status.toolCalls : "?"} — no LLM call`);
@@ -329,9 +339,6 @@ for (;;) {
     }
   }
 
-  const elapsed = (Date.now() - lastCycle) / 1000;
-  const waitSec = Math.min(3600, Math.max(5, A.cycleSec - elapsed));
-  await sleep(waitSec * 1000);
-  lastCycle = Date.now();
+  await sleep(Math.min(POLL_SEC * 1000, Math.max(5000, A.cycleSec * 1000 - (Date.now() - lastJudgment))));
 }
 })();
