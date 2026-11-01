@@ -85,6 +85,10 @@ const STUB_SLOW = mkStub("pi-slow.mjs", `
 import { spawnSync } from "node:child_process";
 spawnSync("sleep", ["4"]);
 console.log("DECISION: OK");`);
+const STUB_SLOWER = mkStub("pi-slower.mjs", `
+import { spawnSync } from "node:child_process";
+spawnSync("sleep", ["12"]);
+console.log("DECISION: OK");`);
 const runDir = (name) => { const d = path.join(root, name); mkdirSync(d, { recursive: true }); return d; };
 const rmArgs = (d, stub, extra = []) => [
   path.join(HERE, "ralph-monitor.mjs"),
@@ -229,15 +233,17 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
     `exit=${r.status}`);
 }
 
-// ---- R11: deadline past → exit 4, no LLM
+// ---- R11: deadline past, child still running (v0.23.0: the monitor waits out
+// the finalization window, grace-bounded — a short --finalize-grace-sec makes
+// the expiry immediate here) → exit 4, no LLM
 {
   const d = runDir("r11");
   mkStatus(d);
   const past = String(Math.floor(Date.now() / 1000) - 60);
-  const r = runRm(d, STUB_OK, ["--once", "--deadline", past]);
-  report("R11 deadline past → exit 4, no LLM call",
-    r.status === 4 && /deadline/.test(readLog(d)) && invLog("r11") === "",
-    `exit=${r.status}`);
+  const r = runRm(d, STUB_OK, ["--once", "--deadline", past, "--finalize-grace-sec", "2"]);
+  report("R11 deadline past + running child → grace expires → exit 4, no LLM",
+    r.status === 4 && /deadline \(child still running after 2s grace\)/.test(readLog(d)) && invLog("r11") === "",
+    `exit=${r.status} log=${readLog(d).trim().slice(0, 200)}`);
 }
 
 // ---- R12: progress resets stall → LLM runs → OK → exit 0
@@ -331,6 +337,62 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   report("R15 llm-down after 2 consecutive failures → exit 4",
     code === 4 && /llm-down/.test(readLog(d)),
     `exit=${code} log=${readLog(d).trim().split("\\n").map(l => l.slice(0, 60)).join(" | ")}`);
+}
+
+// ---- R21: deadline hits while a judgment is in flight (v0.23.0) — the
+// judgment is KILLED (it would otherwise burn its --timeout-sec budget behind
+// the child on a parallel=1 server, run4 shape), the loop hands off to the
+// pre-checks, the grace window expires with the child still running, and the
+// parent's final report still runs before exit 4.
+{
+  const d = runDir("r21");
+  mkStatus(d, { status: "running" });
+  const dl = Math.floor(Date.now() / 1000) + 1; // 1s: lands inside the 12s judgment
+  const child = spawn(NODE, rmArgs(d, STUB_SLOWER, ["--deadline", String(dl), "--finalize-grace-sec", "2"]), {
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  const code = await new Promise((resolve) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (child.exitCode !== null) { clearInterval(iv); resolve(child.exitCode); }
+      else if (Date.now() - t0 > 60_000) { child.kill("SIGINT"); resolve("timeout"); }
+    }, 300);
+  });
+  const log = readLog(d);
+  report("R21 deadline mid-judgment → judgment killed + grace expiry + final report → exit 4",
+    code === 4 && /deadline passed while asking parent/.test(log) &&
+      /child still running after 2s grace/.test(log) &&
+      /final-report: written/.test(log) && existsSync(path.join(d, "FINAL-REPORT.md")),
+    `exit=${code} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
+}
+
+// ---- R22: deadline lands while the child is still finalizing (v0.23.0) — the
+// monitor WAITS OUT the guard's finalization window (grace-bounded) instead of
+// exiting immediately, then exits with the run's TRUE terminal state
+// (completed-finalized → exit 0) and the parent's final report runs AFTER the
+// child is dead (the model slot is free).
+{
+  const d = runDir("r22");
+  const s = mkStatus(d, { status: "running" });
+  const dl = Math.floor(Date.now() / 1000) + 4;
+  const child = spawn(NODE, rmArgs(d, STUB_OK, ["--deadline", String(dl), "--finalize-grace-sec", "30"]), {
+    stdio: ["ignore", "ignore", "ignore"],
+  });
+  await waitMs(6000); // after the deadline (t=4s): the guard "finishes" finalizing
+  writeFileSync(path.join(d, "pi-child-status.json"),
+    JSON.stringify({ ...s, status: "completed", exitReason: "completed-finalized", at: new Date().toISOString() }, null, 2));
+  const code = await new Promise((resolve) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (child.exitCode !== null) { clearInterval(iv); resolve(child.exitCode); }
+      else if (Date.now() - t0 > 60_000) { child.kill("SIGINT"); resolve("timeout"); }
+    }, 300);
+  });
+  const log = readLog(d);
+  report("R22 deadline + child finalizing → grace wait → true state completed-finalized → exit 0 + report",
+    code === 0 && /deadline: child-terminal \(completed-finalized\)/.test(log) &&
+      /final-report: written/.test(log) && existsSync(path.join(d, "FINAL-REPORT.md")),
+    `exit=${code} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
 }
 
 // ================= RALPH.SH integration (v0.21.0 terminal design) =================

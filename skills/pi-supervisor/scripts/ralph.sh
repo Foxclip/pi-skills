@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.22.0: run a supervised child with zero arguments.
+# ralph.sh — v0.23.0: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -168,7 +168,7 @@ ralph.sh — supervised pi child (ralph loop). Zero-arg pipeline:
 normal-mode flags (anywhere in the arg list): --deadline <ISO|HH:MM|epoch>
   --child-model <spec>  --parent-model <spec>    (--flag value and --flag=value)
 environment: PI TASK_FILE RUNS_DIR DEADLINE MAX_HOURS MODEL PROVIDER
-  CHILD_MODEL CHILD_PROVIDER PARENT_MODEL PARENT_PROVIDER PREAMBLE IDLE_TIMEOUT TURN_STALL_SEC
+  CHILD_MODEL CHILD_PROVIDER PARENT_MODEL PARENT_PROVIDER PREAMBLE IDLE_TIMEOUT TURN_STALL_SEC FINALIZE
   CYCLE_SEC TIMEOUT_SEC MAX_INTERVENTIONS STUCK_SEC STALE_SEC LLM_FAIL_MAX
   PROMPT_FILE SESSION LOG_FILE
 See the header comment in ralph.sh for the full contract.
@@ -199,6 +199,9 @@ if [ -n "$PARENT_MODEL_VAL" ];      then ralph_flags+=(--model "$PARENT_MODEL_VA
 if [ -n "$PARENT_PROVIDER_VAL" ];   then ralph_flags+=(--provider "$PARENT_PROVIDER_VAL"); fi
 if [ -n "${CYCLE_SEC:-}" ];         then ralph_flags+=(--cycle-sec "$CYCLE_SEC"); fi
 if [ -n "${TIMEOUT_SEC:-}" ];       then ralph_flags+=(--timeout-sec "$TIMEOUT_SEC"); fi
+# v0.23.0: the monitor waits the finalization window (+5 min slack) for the child's
+# true terminal state after the deadline before exiting (default: FINALIZE*60+300)
+ralph_flags+=(--finalize-grace-sec "${FINALIZE_GRACE_SEC:-$(( ${FINALIZE:-10} * 60 + 300 ))}")
 if [ -n "${MAX_INTERVENTIONS:-}" ]; then ralph_flags+=(--max-interventions "$MAX_INTERVENTIONS"); fi
 if [ -n "${STUCK_SEC:-}" ];         then ralph_flags+=(--stuck-sec "$STUCK_SEC"); fi
 if [ -n "${STALE_SEC:-}" ];         then ralph_flags+=(--stale-sec "$STALE_SEC"); fi
@@ -367,7 +370,8 @@ if [ "$ATTACHED" -eq 0 ]; then
                  --deadline "$DEADLINE_EPOCH"
                  --preamble "${PREAMBLE:-standard}"
                  --idle-timeout "${IDLE_TIMEOUT:-300}"
-                 --turn-stall "${TURN_STALL_SEC:-900}")
+                 --turn-stall "${TURN_STALL_SEC:-900}"
+                 --finalize "${FINALIZE:-10}")
     if [ -n "$CHILD_MODEL_VAL" ];    then launch_args+=(--model "$CHILD_MODEL_VAL"); fi
     if [ -n "$CHILD_PROVIDER_VAL" ]; then launch_args+=(--provider "$CHILD_PROVIDER_VAL"); fi
 

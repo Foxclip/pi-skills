@@ -386,14 +386,19 @@ run({
   expectNot: ["L2 fork"],
 });
 
-// 12. Hard timeout WITH finalization: budget warning at 90%, finalize prompt at
-//     the wall clock, child settles with a report → completed-finalized, exit 0
+// 12. Hard timeout WITH finalization (v0.23.0): the turn is still live at the
+//     wall clock (it never settled) → the guard ABORTS it (a steer would sit
+//     in the queue forever) and delivers the finalization as a FRESH prompt.
+//     Fake-client note: abort() emits nothing — the phase supplies the
+//     abortSettled the real pi RPC would deliver; the budget-warning steer
+//     (8.1s) opens phase 1, the deadline (9s) lands mid-pause with no event
+//     queued, and the abort settle (9.6s) triggers the finalize prompt.
 run({
   name: "hard timeout → finalization window → completed-finalized",
   args: [TASK, "--timeout", "0.15", "--finalize", "0.5"],
   phases: [
     [{ pauseMs: 7000 }], // task run (silence; idle-timeout is 300s, no stall)
-    [{ pauseMs: 1500 }], // budget-warning prompt (90% of 9s = 8.1s) — child silent
+    [{ pauseMs: 1500 }, { abortSettled: true }], // budget-warning steer (8.1s) opens this
     [
       say("FINAL REPORT: partial — items 1-2 done, item 3 unfinished (out of time)."),
       { writeFile: "report.md" },
@@ -403,6 +408,7 @@ run({
   expect: [
     "BUDGET WARNING",
     "HARD TIMEOUT",
+    "deadline reached mid-turn",
     "finalization window",
     "\"status\":\"completed\"",
     "\"exitReason\":\"completed-finalized\"",
@@ -419,6 +425,60 @@ run({
   ],
   expect: ["\"exitReason\":\"hard-timeout\"", "\"status\":\"stuck\""],
   expectNot: ["finalization window", "BUDGET WARNING"],
+  expectExit: 3,
+});
+
+// 13b. v0.23.0: hard timeout with a LIVE (degenerate) turn — the finalization
+//      prompt cannot steer a turn that will not settle, so the guard ABORTS
+//      the turn and delivers the finalization as a FRESH prompt (the run4
+//      shape: one turn outlived the whole deadline; with parallel=1 the
+//      parent was starved for the entire run).
+run({
+  name: "finalize over live degenerate turn → abort + fresh finalize prompt → completed-finalized",
+  args: [TASK, "--timeout", "0.15", "--finalize", "0.5"],
+  phases: [
+    [{ pauseMs: 9500 }], // degenerate turn: alive well past the 9s deadline
+    [{ pauseMs: 1500 }, { abortSettled: true }], // budget-warning steer (8.1s) opens this; deadline abort (9s) settles it at 9.6s
+    [say("FINAL REPORT: partial — items 1-2 done, item 3 unfinished (out of time)."), { writeFile: "report.md" }, { settled: {} }],
+  ],
+  expect: [
+    "deadline reached mid-turn",
+    "aborting for a clean finalize turn",
+    "finalization window",
+    "\"exitReason\":\"completed-finalized\"",
+    "\"status\":\"completed\"",
+  ],
+  expectExit: 0,
+});
+
+// 13c. v0.23.0: the re-prompted FINALIZE turn degenerates too — L0 stays
+//      active inside the window: abort + re-prompt (bounded at 3), then the
+//      window end bounds the run → hard-timeout, exit 3.
+//      Fake-client choreography: --max-forks 0 keeps the pre-deadline L0
+//      (turn-stall 1s) from forking before the 3s deadline; phase 1 absorbs
+//      the budget-warning steer as a no-op; each turn's phase supplies its
+//      own timed abortSettled (the fake's abort() emits nothing — the phase
+//      emulates pi's post-abort settle), 1.5s after the prompt so the
+//      in-window L0 (1s) fires first and sets the pending re-prompt.
+run({
+  name: "finalize re-prompt ladder: degenerate finalize turns → 3 re-prompts → window end → hard-timeout",
+  args: [TASK, "--timeout", "0.05", "--finalize", "0.25", "--turn-stall", "1", "--max-forks", "0"],
+  phases: [
+    [{ pauseMs: 9500 }, { abortSettled: true }], // 0: degenerate task turn; the 9.5s settle emulates the post-abort settle that delivers the finalize prompt
+    [], // 1: budget-warning steer (2.7s) — no-op
+    [say("finalize 1"), { pauseMs: 1500 }, { abortSettled: true }], // 2: finalize prompt (9.5s) → degenerates → re-prompt 1
+    [say("finalize 2"), { pauseMs: 1500 }, { abortSettled: true }], // 3: re-prompt 1 → degenerates → re-prompt 2
+    [say("finalize 3"), { pauseMs: 1500 }, { abortSettled: true }], // 4: re-prompt 2 → degenerates → re-prompt 3
+    [say("finalize 4"), { pauseMs: 6000 }], // 5: re-prompt 3 → re-prompts exhausted (warn); the window end (18s) bounds
+  ],
+  expect: [
+    "deadline reached mid-turn",
+    "finalize re-prompt 1/3",
+    "finalize re-prompt 2/3",
+    "finalize re-prompt 3/3",
+    "re-prompts exhausted",
+    "\"exitReason\":\"hard-timeout\"",
+  ],
   expectExit: 3,
 });
 

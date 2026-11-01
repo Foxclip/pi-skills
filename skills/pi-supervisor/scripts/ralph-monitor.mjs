@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.21.3: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.23.0: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -71,7 +71,7 @@ const num = (s) => { const n = Number(s); if (!Number.isFinite(n)) { console.err
 const A = {
   runDir: null, pi: null, projectDir: null, model: null, provider: null, session: null,
   cycleSec: 1200, maxInterventions: 3, stuckSec: 3600, staleSec: 180,
-  deadline: null, maxHours: 12, llmFailMax: 6, timeoutSec: 600,
+  deadline: null, maxHours: 12, llmFailMax: 6, timeoutSec: 600, finalizeGraceSec: 900,
   promptFile: null, logFile: null, once: false, dryRun: false,
 };
 for (let i = 0; i < argv.length; i++) {
@@ -87,6 +87,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (x === "--stuck-sec") A.stuckSec = num(argv[++i]);
   else if (x === "--stale-sec") A.staleSec = num(argv[++i]);
   else if (x === "--deadline") A.deadline = argv[++i];
+  else if (x === "--finalize-grace-sec") A.finalizeGraceSec = num(argv[++i]);
   else if (x === "--max-hours") A.maxHours = num(argv[++i]);
   else if (x === "--llm-fail-max") A.llmFailMax = num(argv[++i]);
   else if (x === "--timeout-sec") A.timeoutSec = num(argv[++i]);
@@ -182,12 +183,48 @@ function runCmd(cmd, args, timeoutMs) {
     p.on("close", (status, signal) => finish({ status, signal, stdout, stderr }));
   });
 }
+// v0.23.0: judgment invocations are tracked so the deadline watcher can KILL a
+// judgment stuck in the model queue (run4: the judgment burned its whole
+// --timeout-sec budget behind the degenerate child while the loop — pre-checks
+// included — was blind for the entire wait).
+let judgmentProc = null;
+async function runCmdTracked(cmd, args, timeoutMs) {
+  return new Promise((resolve) => {
+    let stdout = "", stderr = "", done = false;
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs, killSignal: "SIGKILL" });
+    judgmentProc = p;
+    const finish = (extra) => { if (!done) { done = true; if (judgmentProc === p) judgmentProc = null; resolve({ ...extra }); } };
+    p.stdout.on("data", (d) => { stdout += d; if (stdout.length > 16 * 1024 * 1024) p.kill("SIGKILL"); });
+    p.stderr.on("data", (d) => { stderr += d; if (stderr.length > 16 * 1024 * 1024) p.kill("SIGKILL"); });
+    p.on("error", (e) => finish({ status: null, signal: null, stdout, stderr, error: String(e) }));
+    p.on("close", (status, signal) => finish({ status, signal, stdout, stderr }));
+  });
+}
 
 // ---- deterministic pre-checks (run before any LLM call)
 function preCheck(status) {
   const now = Date.now();
-  if (deadlineMs !== null && now >= deadlineMs)
+  if (deadlineMs !== null && now >= deadlineMs) {
+    // v0.23.0: the deadline is the CHILD's wall clock — the guard enforces it
+    // (finalization window). If the child is still running, wait it out
+    // (bounded by the grace cap) so the monitor exits with the run's TRUE
+    // terminal state and the parent's final report runs AFTER the child is
+    // dead (the model slot is free). run4: the old immediate exit skipped the
+    // report entirely and orphaned the guard's window.
+    const s0 = status && status.status;
+    if (s0 === "completed") {
+      const ok0 = /^completed/.test(status.exitReason || "");
+      return { stop: true, code: ok0 ? 0 : 5, reason: `deadline: child-terminal (${status.exitReason || "completed"})` };
+    }
+    if (s0 === "stuck" || s0 === "failed" || s0 === "aborted")
+      return { stop: true, code: 4, reason: `deadline: child-terminal (${s0})` };
+    if (s0 === "running" || s0 === "starting") {
+      if (now >= deadlineMs + A.finalizeGraceSec * 1000)
+        return { stop: true, code: 4, reason: `deadline (child still running after ${A.finalizeGraceSec}s grace)` };
+      return { stop: false, waiting: "child-finalizing" };
+    }
     return { stop: true, code: 4, reason: "deadline" };
+  }
   const s = status && status.status;
   if (s === "completed") {
     // the guard exits 0 for "completed" AND "completed-finalized" (the timeout
@@ -259,7 +296,7 @@ async function llmDecide() {
   if (A.model) args.push("--model", A.model);
   if (A.provider) args.push("--provider", A.provider);
   args.push(prompt);
-  const r = await runCmd(A.pi, args, A.timeoutSec * 1000);
+  const r = await runCmdTracked(A.pi, args, A.timeoutSec * 1000);
   const out = ((r.stdout || "") + "\n" + (r.stderr || "")).trim();
   const tail = out.split("\n").filter(Boolean);
   let decision = "OK", detail = "", raw = "";
@@ -354,16 +391,21 @@ async function deliverNudge(msg) {
 // cycle later. The LLM judgment still only runs every --cycle-sec.
 const POLL_SEC = 30;
 let lastJudgment = 0; // 0 = judgment due immediately
+// v0.23.0: one stop path for all pre-check stops. The parent's final report
+// also runs on deadline/stuck endings — that is exactly when the user needs
+// the "what happened" answer, and the child is terminal here, so the model
+// slot is free for the report (a failed report never changes the exit code).
+async function stopLoop(pc) {
+  log(`pre-check STOP: ${pc.reason} (cycle=${state.cycles} interventions=${state.interventions})`);
+  saveState();
+  if (pc.code === 0 || pc.code === 4) await writeFinalReport(pc.reason);
+  process.exit(pc.code);
+}
 (async () => {
 for (;;) {
   const status = readStatus();
   const pc = preCheck(status);
-  if (pc.stop) {
-    log(`pre-check STOP: ${pc.reason} (cycle=${state.cycles} interventions=${state.interventions})`);
-    saveState();
-    if (pc.code === 0) await writeFinalReport(`child completed (${pc.reason})`);
-    process.exit(pc.code);
-  }
+  if (pc.stop) await stopLoop(pc);
   if (status && status.status === "running") beat(status);
   const nowMs = Date.now();
   if (nowMs - lastJudgment < A.cycleSec * 1000 - 500) {
@@ -380,7 +422,24 @@ for (;;) {
     if (A.once) process.exit(0);
   } else {
     ask(`cycle ${state.cycles} — asking parent for judgment…`);
-    const d = await llmDecide();
+    // v0.23.0: race the judgment against the deadline — see runCmdTracked.
+    let watcherDone = false;
+    const watcher = (async () => {
+      while (!watcherDone) {
+        if (deadlineMs !== null && Date.now() >= deadlineMs) return "deadline";
+        await sleep(5000);
+      }
+      return null;
+    })();
+    const raced = await Promise.race([llmDecide(), watcher]);
+    watcherDone = true;
+    if (raced === "deadline") {
+      if (judgmentProc) { try { judgmentProc.kill("SIGKILL"); } catch { /* best effort */ } }
+      log(`cycle=${state.cycles} deadline passed while asking parent — judgment killed, handing off to the pre-checks`);
+      saveState();
+      continue;
+    }
+    const d = raced;
     if (!d.okExit) {
       // pi itself failed (model 400 "not running", crash, timeout): log and
       // RETRY next cycle — the loop never dies on one bad LLM call

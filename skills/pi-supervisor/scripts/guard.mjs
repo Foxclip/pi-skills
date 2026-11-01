@@ -3,6 +3,12 @@
 // and supervise it: detect repetitive tool-call loops and stalls, and escalate
 // (steer → fork+retry → give up) instead of letting a watchdog kill the run.
 //
+// v0.23.0: deadline-mid-turn abort — a live (usually degenerate) turn at the
+//         wall clock is ABORTED and the finalization is re-prompted as a fresh
+//         turn (a steer into it would sit in the queue until the turn settles —
+//         which for a degenerate turn never happens); L0 turn-stall stays
+//         active inside the finalization window (abort + bounded finalize
+//         re-prompts, no fork).
 // v0.22.0: --turn-stall — L0 cap on a SINGLE TURN's wall time (default 900s):
 // abort an overlong live turn + L2 fork. Catches "degenerate generation"
 // (a local model streaming one token every few seconds — eventful, so
@@ -732,6 +738,11 @@ let noContentStreak = 0;       // consecutive no-content tool results (--stagnat
 let finalized = false;         // inside the finalization window at the hard timeout
 let finalizeDeadlineMs = 0;    // end of the finalization window
 let budgetWarned = false;      // the 90%-of-budget warning was sent
+// v0.23.0: finalization-via-abort — the message to prompt once the finalize
+// abort has settled (null = nothing pending), plus the bounded re-prompts.
+let finalizePromptPending = null;
+let finalizeReprompts = 0;
+let finalizeStallWarned = false;
 let deadlineLocal = "";        // local-time rendering of the hard deadline
 let deadlineIso = "";
 function resetAttemptCounters() {
@@ -1683,6 +1694,30 @@ try {
     // degenerate context. Skipped during the finalization window (report
     // writing, no recovery); if the fork budget is spent, the idle path +
     // hard deadline still bound the run.
+    // v0.23.0: L0 stays active INSIDE the finalization window — the re-prompted
+    // finalize turn can degenerate too (poisoned context). No fork in the
+    // window (it is for the report, not retries): abort + re-prompt the
+    // finalize instruction, bounded.
+    if (turnStallSec > 0 && finalized && turnActive && now - turnStartAt > turnStallSec * 1000) {
+      const fsecs = Math.round((now - turnStartAt) / 1000);
+      if (finalizeReprompts < 3) {
+        finalizeReprompts++;
+        logSup(`[guard] L0 turn-stall inside the finalization window (turn ${fsecs}s) — abort + finalize re-prompt ${finalizeReprompts}/3`);
+        plog(`[finalize] ${new Date().toISOString()} re-prompt ${finalizeReprompts}/3 (turn ${fsecs}s aborted)\n`);
+        abortedByMe = true;
+        turnActive = false;
+        finalizePromptPending =
+          `[guard] FINALIZE RE-PROMPT ${finalizeReprompts}/3 — your final-report turn was aborted (still ` +
+          `running when the turn limit hit). You have ${Math.max(1, Math.round((finalizeDeadlineMs - now) / 60000))} ` +
+          `minutes until force-kill. Write the final report NOW from what you have; mark everything ` +
+          `unfinished clearly.`;
+        try { await client.abort(); } catch { /* best effort */ }
+        try { await client.clearQueue(); } catch { /* best effort */ }
+      } else if (!finalizeStallWarned) {
+        finalizeStallWarned = true;
+        logSup(`[guard] L0 turn-stall inside the finalization window, re-prompts exhausted — bounded by the window end`);
+      }
+    }
     if (turnStallSec > 0 && !finalized && turnActive && now - turnStartAt > turnStallSec * 1000) {
       const secs = Math.round((now - turnStartAt) / 1000);
       if (forksUsed < maxForks) {
@@ -1735,7 +1770,21 @@ try {
             settled = true;
             continue;
           }
-          continue; // abortedByMe — should not happen in finalization; keep waiting
+          // v0.23.0: our own finalize abort has settled — deliver the
+          // finalization as a fresh turn (turnActive is false, so
+          // deliverToChild prompts instead of steering).
+          if (finalizePromptPending) {
+            const m = finalizePromptPending;
+            finalizePromptPending = null;
+            resetAttemptCounters();
+            try {
+              const disp = await deliverToChild(m);
+              logSup(`[guard] finalize prompt (post-abort) disposition=${disp}`);
+            } catch (e) {
+              logSup(`[guard] finalize prompt (post-abort) warn: ${e.message}`);
+            }
+          }
+          continue;
         }
         if (ev.aborted) {
           if (!abortedByMe) {
@@ -1858,16 +1907,34 @@ try {
           logSup(`[guard] HARD TIMEOUT at the wall clock — entering a ${finalizeMin}-minute finalization window (ladder suppressed)`);
           plog(`[finalize] ${new Date().toISOString()} window=${finalizeMin}min\n`);
           try {
-            // deliverToChild: at wall-clock time the child is mid-turn — a raw
-            // prompt() is rejected ("Agent is already processing") and the
-            // finalization would silently never reach the child.
-            const disp = await deliverToChild(
-              `[guard] HARD DEADLINE REACHED — you have ${finalizeMin} minutes before the process ` +
-              `is force-killed. STOP all new work immediately. Write the final report NOW with the ` +
-              `partial results gathered so far (state explicitly what is done, what is unfinished ` +
-              `and why). This message runs after your current turn ends.`
-            );
-            logSup(`[guard] finalize prompt disposition=${disp}`);
+            if (turnActive) {
+              // v0.23.0: a live turn at the wall clock is usually a degenerate
+              // one (a TestProject run: one turn outlived the whole deadline;
+              // with parallel=1 the parent couldn't even be asked while it
+              // ran). A steer would sit in the queue until that turn settles —
+              // which may never happen — so ABORT the turn and deliver the
+              // finalization as a FRESH turn (prompted from the settle handler
+              // via finalizePromptPending, once agent_settled lands).
+              logSup(`[guard] deadline reached mid-turn (turn active ${Math.round((now - turnStartAt) / 1000)}s) — aborting for a clean finalize turn`);
+              plog(`[finalize] ${new Date().toISOString()} mid-turn: aborting live turn (active ${Math.round((now - turnStartAt) / 1000)}s)\n`);
+              abortedByMe = true;
+              turnActive = false; // abort in flight — deliverToChild must not steer
+              finalizePromptPending =
+                `[guard] HARD DEADLINE REACHED — you have ${finalizeMin} minutes before the process ` +
+                `is force-killed. STOP all new work immediately. Write the final report NOW with the ` +
+                `partial results gathered so far (state explicitly what is done, what is unfinished ` +
+                `and why). Your previous turn was aborted at the deadline.`;
+              try { await client.abort(); } catch (e) { logSup(`[guard] finalize abort warn: ${e.message}`); }
+              try { await client.clearQueue(); } catch { /* best effort */ }
+            } else {
+              const disp = await deliverToChild(
+                `[guard] HARD DEADLINE REACHED — you have ${finalizeMin} minutes before the process ` +
+                `is force-killed. STOP all new work immediately. Write the final report NOW with the ` +
+                `partial results gathered so far (state explicitly what is done, what is unfinished ` +
+                `and why). This message runs after your current turn ends.`
+              );
+              logSup(`[guard] finalize prompt disposition=${disp}`);
+            }
           } catch (e) {
             logSup(`[guard] finalize prompt warn: ${e.message}`);
           }
