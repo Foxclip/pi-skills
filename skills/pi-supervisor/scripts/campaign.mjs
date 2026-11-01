@@ -192,7 +192,7 @@ function inspectRun(c, run) {
       sessionFile: r.sessionFile || null,
     };
   }
-  if (!out.outDirPresent) out.note = [run.note, "out dir gone (reboot wipes /tmp — the run's artifacts are lost, its history lives here)"].filter(Boolean).join(" | ");
+  if (!out.outDirPresent) out.note = [run.note, "out dir gone (removed manually — the run's history lives here)"].filter(Boolean).join(" | ");
   return out;
 }
 
@@ -247,7 +247,7 @@ function assembleBrief(c, { runNum, goalOverride = null, acceptOverride = null, 
   if (last) {
     const sf = lastInsp.statusFile;
     L.push(`- final: ${sf ? `status=${sf.status}${sf.exitReason ? ` exitReason=${sf.exitReason}` : ""} toolCalls=${sf.toolCalls ?? "?"}` : "no status file (out dir gone?)"}`);
-    L.push(`- out dir: ${last.outDir} — ${lastInsp.outDirPresent ? "present" : "GONE (reboot wipes /tmp — artifacts lost, history survives in the campaign file)"}`);
+    L.push(`- out dir: ${last.outDir} — ${lastInsp.outDirPresent ? "present" : "GONE (removed? — history survives in the campaign file)"}`);
     if (lastInsp.manifest?.finalText) {
       L.push(`- final text (tail, ≤2000 chars):`);
       lastInsp.manifest.finalText.split("\n").forEach((l) => L.push(`  > ${l}`));
@@ -267,7 +267,7 @@ function assembleBrief(c, { runNum, goalOverride = null, acceptOverride = null, 
   L.push(`## Where to work`);
   L.push(`- project dir (your cwd): ${c.project}`);
   L.push(`- STATUS.md to maintain: ${c.statusFile || "(none configured — create it in the project root)"}`);
-  L.push(`- run artifacts (supervisor-managed, do not edit): ${outDir || path.join(os.tmpdir(), `pi-sup-${c.name}-r${runNum}-<time>`)} → pi-child-progress.log, pi-child-status.json, pi-child-result.json`);
+  L.push(`- run artifacts (supervisor-managed, do not edit): ${outDir || path.join(c.__dir || ".pi-supervisor", "runs", `pi-sup-${c.name}-r${runNum}-<time>`)} → pi-child-progress.log, pi-child-status.json, pi-child-result.json`);
   L.push("");
   L.push(`## Parent notes`);
   L.push(next.notes || "(none)", "");
@@ -417,7 +417,8 @@ function cmdNext() {
 
   // 4. Fresh out-dir + the brief file (assembled sources are written for inspection)
   const stamp = now.toISOString().replace(/[-:]/g, "").replace("T", "-").slice(0, 15);
-  const outDir = path.join(os.tmpdir(), `pi-sup-${c.name}-r${runNum}-${stamp}`);
+  // project-local (NOT /tmp): survives reboots, stays findable next to the campaign state
+  const outDir = path.join(c.__dir, "runs", `pi-sup-${c.name}-r${runNum}-${stamp}`);
   const briefFile = path.join(c.__dir, `brief-run${runNum}.md`);
   if (source === "goal-flag" || source === "next.slot") {
     const asm = assembleBrief(c, {
@@ -491,7 +492,7 @@ function cmdStop() {
   if (!last) emit({ ok: false, reason: "no runs recorded — nothing to stop" }, 1);
   if (!existsSync(last.outDir)) {
     last.status = "gone";
-    last.note = [last.note, "out dir gone (reboot wiped /tmp) — nothing to stop"].filter(Boolean).join(" | ");
+    last.note = [last.note, "out dir gone — nothing to stop"].filter(Boolean).join(" | ");
     saveCampaign(c);
     return emit({ ok: true, stop: { note: "out dir gone — nothing to stop" }, run: { id: last.id, outDir: last.outDir } }, 0, `run ${last.id}: out dir gone, marked gone (nothing to stop)`);
   }

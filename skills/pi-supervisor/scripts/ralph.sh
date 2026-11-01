@@ -1,16 +1,24 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.18.4: run a supervised child with zero arguments.
+# ralph.sh — v0.19.0: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
 #   2. ./ralph.sh
-#   that's it — the script finds TASK.md, allocates a run dir
-#   (/tmp/ralph-<project>/run-N), launches the guarded child via launch.mjs,
-#   then execs the ralph monitor loop IN THE FOREGROUND.
+#   that's it — the script finds TASK.md, allocates a run dir IN THE PROJECT
+#   (<project>/.pi-supervisor/runs/run-N — permanent: nothing lives in /tmp,
+#   a reboot mid-run leaves every artifact on disk), launches the guarded
+#   child via launch.mjs, then runs the ralph monitor loop IN THE FOREGROUND.
 #
 #   Your terminal is the view: every ralph cycle is printed as it happens,
 #   and Ctrl+C stops the MONITOR cleanly (the child keeps running — it is
 #   detached; stop it with stop.mjs if you really want it gone).
+#
+#   When the monitor exits (success, failure, deadline, or Ctrl+C) the run
+#   dir is HARVESTED: the child transcript is copied into the run dir,
+#   RUN-REPORT.md + run-summary.json are written, and INDEX.json (one entry
+#   per run) is updated. Every run ends as a self-contained, findable
+#   evidence folder — even one killed by a reboot: the NEXT launch sees the
+#   dead run in the pointer file and harvests it before starting fresh.
 #
 #   One-time setup (pick ONE, then plain `ralph.sh` works from any project):
 #     A) PATH (recommended — zero per-project files):
@@ -20,6 +28,7 @@
 #
 # ENVIRONMENT (all optional; CLI flags in power-user mode override these):
 #   TASK_FILE      task file in cwd           (default: TASK.md)
+#   RUNS_DIR       run-dir root               (default: <project>/.pi-supervisor/runs)
 #   PI             pi executable             (default: pi)
 #   MODEL/PROVIDER   for BOTH child and parent (default: pi's default model —
 #                the safe shared config on shared local model servers)
@@ -34,17 +43,27 @@
 #   STUCK_SEC (3600)  STALE_SEC (180)  LLM_FAIL_MAX (6)
 #   PROMPT_FILE  PROJECT_DIR  SESSION  LOG_FILE   (ralph-monitor passthrough)
 #
-# POWER-USER MODE (attach to an existing run dir; same as v0.18.1):
-#   ./ralph.sh <run-dir> [ralph-monitor.mjs args...]
+# MODES:
+#   ralph.sh                       zero-arg pipeline (above)
+#   ralph.sh <run-dir> [args...]   attach to an existing run (power-user;
+#                                  args go to ralph-monitor.mjs and win over
+#                                  env vars — last occurrence wins)
+#   ralph.sh --harvest <run-dir> [dest-dir]
+#                                  post-mortem any run dir (idempotent); with
+#                                  dest-dir the whole run dir is copied there
+#                                  FIRST — use it to rescue a /tmp run to a
+#                                  permanent home
 #
 set -euo pipefail
 
 # resolve our own real location so HERE finds launch.mjs/ralph-monitor.mjs:
 # - $0 (not BASH_SOURCE[0] — the latter expands unreliably in this box's bash)
-# - readlink -f: the entry may be a symlink (per-project ralph.sh or a PATH dir
-#   that is itself a link) — we want the scripts dir, not the project
+# - works for both invocation styles: `./ralph.sh` (symlink) and bare `ralph.sh`
+#   via PATH (bash passes the full resolved path as $0 in both cases)
+# - readlink -f: the entry may be a symlink — we want the scripts dir, not the project
 HERE="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
 PI_BIN="${PI:-pi}"
+HARVEST_TARGET=""   # set once RUN_DIR is known; the EXIT trap harvests it
 
 DEADLINE_RAW="${DEADLINE:-}"
 if [ -n "$DEADLINE_RAW" ]; then
@@ -74,33 +93,6 @@ if [ -n "${PROMPT_FILE:-}" ];       then ralph_flags+=(--prompt-file "$PROMPT_FI
 if [ -n "${SESSION:-}" ];           then ralph_flags+=(--session "$SESSION"); fi
 if [ -n "${LOG_FILE:-}" ];          then ralph_flags+=(--log-file "$LOG_FILE"); fi
 
-# ---------------------------------------------------------------- power-user
-if [ $# -ge 1 ]; then
-  RUN_DIR=$1; shift
-  if [ -n "${PROJECT_DIR:-}" ]; then ralph_flags+=(--project-dir "$PROJECT_DIR"); fi
-  if [ -n "$DEADLINE_EPOCH" ];  then ralph_flags+=(--deadline "$DEADLINE_EPOCH"); fi
-  echo "ralph-monitor: run-dir=$RUN_DIR (attaching to existing run)" >&2
-  exec node "$HERE/ralph-monitor.mjs" --run-dir "$RUN_DIR" "${ralph_flags[@]}" "$@"
-fi
-
-# ------------------------------------------------------------- zero-arg mode
-TASK_FILE="${TASK_FILE:-TASK.md}"
-if [ ! -f "$TASK_FILE" ]; then
-  cat >&2 <<EOF
-ralph: no $TASK_FILE in $(pwd)
-
-Zero-arg mode: write the task in ./$TASK_FILE, then run ./ralph.sh
-(or set TASK_FILE=<name> to point elsewhere).
-To attach to an existing run instead:  ./ralph.sh <run-dir> [ralph args...]
-EOF
-  exit 1
-fi
-
-PROJECT_DIR=$PWD
-PROJECT_NAME=$(basename "$PROJECT_DIR")
-RUNROOT="/tmp/ralph-$PROJECT_NAME"
-PTR="$PROJECT_DIR/.pi-supervisor/ralph-run-dir"
-
 status_field() { # $1=file $2=key → prints value or empty
   node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const v=j[process.argv[2]];process.stdout.write(v===null||v===undefined?"":String(v))}catch{}' "$1" "$2" 2>/dev/null || true
 }
@@ -109,66 +101,145 @@ guard_alive() { # $1=run-dir → 0 if the status file names a live guard pid
   pid=$(status_field "$1/pi-child-status.json" guardPid)
   [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
 }
+harvest() { # $1=run-dir $2=interrupted(0|1) $3=monitor exit code (best effort)
+  node "$HERE/lib/harvest.mjs" "$1" "$2" "$3" || true
+}
 
-RUN_DIR=""; ATTACH=0
-if [ -f "$PTR" ]; then
-  cand="$(cat "$PTR" 2>/dev/null || true)"
-  if [ -n "$cand" ] && [ -f "$cand/pi-child-status.json" ] && guard_alive "$cand"; then
-    RUN_DIR=$cand; ATTACH=1
+# ------------------------------------------------------------- --harvest
+if [ "${1:-}" = "--harvest" ]; then
+  SRC="${2:-}"; DEST="${3:-}"
+  if [ -z "$SRC" ] || [ ! -d "$SRC" ]; then
+    echo "usage: ralph.sh --harvest <run-dir> [dest-dir]" >&2
+    exit 1
   fi
+  TARGET="$SRC"
+  if [ -n "$DEST" ]; then
+    if [ -e "$DEST" ]; then echo "ralph: dest $DEST exists — refusing to overwrite" >&2; exit 1; fi
+    mkdir -p "$(dirname "$DEST")"
+    cp -a "$SRC" "$DEST"
+    echo "ralph: copied $SRC → $DEST" >&2
+    TARGET="$DEST"
+  fi
+  node "$HERE/lib/harvest.mjs" "$TARGET" 0 0
+  exit $?
 fi
 
-if [ -z "$RUN_DIR" ]; then
-  mkdir -p "$RUNROOT"
-  n=0
-  for d in "$RUNROOT"/run*; do
-    [ -d "$d" ] || continue
-    b="$(basename "$d")"
-    case "$b" in
-      run[0-9]*)
-        num="${b#run}"
-        if [ "$num" -gt "$n" ] 2>/dev/null; then n="$num"; fi
-        ;;
+# -------------------------------------------------- attach mode (power-user)
+ATTACHED=0
+if [ $# -ge 1 ]; then
+  ATTACHED=1
+  RUN_DIR=$1; shift
+  if [ -n "${PROJECT_DIR:-}" ]; then ralph_flags+=(--project-dir "$PROJECT_DIR"); fi
+  if [ -n "$DEADLINE_EPOCH" ]; then ralph_flags+=(--deadline "$DEADLINE_EPOCH"); fi
+  EXTRA=("$@")
+  echo "ralph-monitor: run-dir=$RUN_DIR (attaching to existing run)" >&2
+  MONITOR_ARGS=(--run-dir "$RUN_DIR" "${ralph_flags[@]}" "${EXTRA[@]}")
+fi
+
+# ------------------------------------------------------------- zero-arg mode
+if [ "$ATTACHED" -eq 0 ]; then
+  TASK_FILE="${TASK_FILE:-TASK.md}"
+  if [ ! -f "$TASK_FILE" ]; then
+    cat >&2 <<EOF
+ralph: no $TASK_FILE in $(pwd)
+
+Zero-arg mode: write the task in ./$TASK_FILE, then run ./ralph.sh
+(or set TASK_FILE=<name> to point elsewhere).
+To attach to an existing run instead:  ./ralph.sh <run-dir> [ralph args...]
+EOF
+    exit 1
+  fi
+
+  PROJECT_DIR=$PWD
+  RUNROOT="${RUNS_DIR:-$PROJECT_DIR/.pi-supervisor/runs}"
+  PTR="$PROJECT_DIR/.pi-supervisor/ralph-run-dir"
+
+  RUN_DIR=""
+  if [ -f "$PTR" ]; then
+    cand="$(cat "$PTR" 2>/dev/null || true)"
+    if [ -n "$cand" ] && [ -f "$cand/pi-child-status.json" ] && guard_alive "$cand"; then
+      RUN_DIR=$cand   # live run → attach below
+    elif [ -n "$cand" ] && [ -d "$cand" ] && [ ! -f "$cand/run-summary.json" ]; then
+      # dead run without a summary — reboot or crash mid-run: post-mortem it
+      # now so it becomes permanent evidence, then start a fresh run below
+      echo "ralph: previous run $cand is dead (reboot/crash?) — harvesting post-mortem" >&2
+      harvest "$cand" 1 0
+    fi
+  fi
+
+  if [ -z "$RUN_DIR" ]; then
+    mkdir -p "$RUNROOT"
+    n=0
+    for d in "$RUNROOT"/run*; do
+      [ -d "$d" ] || continue
+      b="$(basename "$d")"
+      case "$b" in
+        run[0-9]*)
+          num="${b#run}"
+          if [ "$num" -gt "$n" ] 2>/dev/null; then n="$num"; fi
+          ;;
+      esac
+    done
+    n=$((n + 1))
+    RUN_DIR="$RUNROOT/run$n"
+    mkdir -p "$RUN_DIR"
+
+    launch_args=(--task-file "$TASK_FILE" --out-dir "$RUN_DIR"
+                 --deadline "$DEADLINE_EPOCH"
+                 --preamble "${PREAMBLE:-standard}"
+                 --idle-timeout "${IDLE_TIMEOUT:-300}")
+    if [ -n "$CHILD_MODEL_VAL" ];    then launch_args+=(--model "$CHILD_MODEL_VAL"); fi
+    if [ -n "$CHILD_PROVIDER_VAL" ]; then launch_args+=(--provider "$CHILD_PROVIDER_VAL"); fi
+
+    echo "ralph: launching child (task=.$TASK_FILE, run-dir=$RUN_DIR, deadline=$DEADLINE_EPOCH, child-model=${CHILD_MODEL_VAL:-pi-default}, parent-model=${PARENT_MODEL_VAL:-pi-default})" >&2
+    launch_out=$(node "$HERE/launch.mjs" "${launch_args[@]}" 2>&1) || true
+    case "$launch_out" in
+      *'"launched":true'*)
+        guard_pid=$(status_field "$RUN_DIR/pi-child-status.json" guardPid)
+        echo "ralph: child launched (guardPid=$guard_pid)" >&2 ;;
+      *'"launched":"unknown"'*)
+        echo "ralph: WARNING launch.mjs reported 'unknown' (alive but silent) — proceeding, the pre-checks will catch a dead child" >&2 ;;
+      *)
+        echo "ralph: LAUNCH FAILED — output from launch.mjs:" >&2
+        echo "$launch_out" | tail -20 >&2
+        exit 1 ;;
     esac
-  done
-  n=$((n + 1))
-  RUN_DIR="$RUNROOT/run$n"
-  mkdir -p "$RUN_DIR"
 
-  launch_args=(--task-file "$TASK_FILE" --out-dir "$RUN_DIR"
-               --deadline "$DEADLINE_EPOCH"
-               --preamble "${PREAMBLE:-standard}"
-               --idle-timeout "${IDLE_TIMEOUT:-300}")
-  if [ -n "$CHILD_MODEL_VAL" ];    then launch_args+=(--model "$CHILD_MODEL_VAL"); fi
-  if [ -n "$CHILD_PROVIDER_VAL" ]; then launch_args+=(--provider "$CHILD_PROVIDER_VAL"); fi
-
-  echo "ralph: launching child (task=.$TASK_FILE, run-dir=$RUN_DIR, deadline=$DEADLINE_EPOCH, child-model=${CHILD_MODEL_VAL:-pi-default}, parent-model=${PARENT_MODEL_VAL:-pi-default})" >&2
-  launch_out=$(node "$HERE/launch.mjs" "${launch_args[@]}" 2>&1) || true
-  case "$launch_out" in
-    *'"launched":true'*)
-      guard_pid=$(status_field "$RUN_DIR/pi-child-status.json" guardPid)
-      echo "ralph: child launched (guardPid=$guard_pid)" >&2 ;;
-    *'"launched":"unknown"'*)
-      echo "ralph: WARNING launch.mjs reported 'unknown' (alive but silent) — proceeding, the pre-checks will catch a dead child" >&2 ;;
-    *)
-      echo "ralph: LAUNCH FAILED — output from launch.mjs:" >&2
-      echo "$launch_out" | tail -20 >&2
-      exit 1 ;;
-  esac
-
-  mkdir -p "$PROJECT_DIR/.pi-supervisor"
-  echo "$RUN_DIR" > "$PTR"
-  if [ ! -d "$PROJECT_DIR/.git" ] || ! grep -qF '.pi-supervisor/' "$PROJECT_DIR/.gitignore" 2>/dev/null; then
-    echo "ralph: tip — add .pi-supervisor/ to .gitignore" >&2
+    mkdir -p "$PROJECT_DIR/.pi-supervisor"
+    echo "$RUN_DIR" > "$PTR"
+    # keep run artifacts out of git's way (idempotent — the line is added once)
+    if [ -d "$PROJECT_DIR/.git" ] && ! grep -qxF '.pi-supervisor/' "$PROJECT_DIR/.gitignore" 2>/dev/null; then
+      { printf '\n# pi-supervisor run artifacts\n.pi-supervisor/\n' >> "$PROJECT_DIR/.gitignore"; } 2>/dev/null \
+        && echo "ralph: added .pi-supervisor/ to .gitignore" >&2 || true
+    fi
+  else
+    # attach to a live run: honor the run's own deadline unless the user overrode it
+    if [ -z "$DEADLINE_RAW" ]; then
+      iso=$(status_field "$RUN_DIR/pi-child-status.json" deadlineIso)
+      [ -n "$iso" ] && DEADLINE_EPOCH="$iso"
+    fi
+    echo "ralph: attaching to live run $RUN_DIR (no new child launched)" >&2
   fi
-else
-  # attach: honor the attached run's own deadline unless the user overrode it
-  if [ -z "$DEADLINE_RAW" ]; then
-    iso=$(status_field "$RUN_DIR/pi-child-status.json" deadlineIso)
-    [ -n "$iso" ] && DEADLINE_EPOCH="$iso"
-  fi
-  echo "ralph: attaching to live run $RUN_DIR (no new child launched)" >&2
+
+  MONITOR_ARGS=(--run-dir "$RUN_DIR" --project-dir "$PROJECT_DIR" --deadline "$DEADLINE_EPOCH" "${ralph_flags[@]}")
 fi
+
+# ------------------------------------- foreground monitor + harvest on exit
+HARVEST_TARGET="$RUN_DIR"
+on_exit() {
+  local rc=$?
+  local interrupted=0
+  if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then interrupted=1; fi
+  if [ -n "$HARVEST_TARGET" ] && [ -d "$HARVEST_TARGET" ]; then
+    harvest "$HARVEST_TARGET" "$interrupted" "$rc"
+    echo "ralph: preserved — report: $HARVEST_TARGET/RUN-REPORT.md   index: $(dirname "$HARVEST_TARGET")/INDEX.json" >&2
+  fi
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "ralph: monitoring — cycles every ${CYCLE_SEC:-1200}s, Ctrl+C stops the MONITOR only (the child keeps running)" >&2
-exec node "$HERE/ralph-monitor.mjs" --run-dir "$RUN_DIR" --project-dir "$PROJECT_DIR" --deadline "$DEADLINE_EPOCH" "${ralph_flags[@]}"
+rc=0
+node "$HERE/ralph-monitor.mjs" "${MONITOR_ARGS[@]}" || rc=$?
+exit $rc
