@@ -390,12 +390,16 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   const shortTsOk = /\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] /.test(out);
   const epochLeak = /deadline=\d+/.test(out);
   const fileFmtOk = /\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] cycle=1/.test(mlog);
-  report("R18 ralph.sh: banner + human deadline + short-ts lines + flags→launch.mjs + ISO file format",
+  // v0.21.2: child heartbeat line visible; harvest lines use the short ts too
+  const beatOk = /· child running · 0 tool calls · \d+h \d+m left/.test(out);
+  const hlines = out.split("\n").filter((l) => l.includes("harvest:"));
+  const harvestShortOk = hlines.length > 0 && hlines.every((l) => /^\[\d{2}:\d{2}:\d{2}\] harvest:/.test(l));
+  report("R18 ralph.sh: banner + human deadline + short-ts lines + flags→launch.mjs + ISO file format + heartbeat",
     out.includes("┌ ralph") && out.includes("│ project") && relDlOk
     && shortTsOk && !epochLeak && /done · exit/.test(out)
     && la && la.deadline === dl && la.model === "cm-e2e" && la.parentModel === "pm-e2e"
-    && fileFmtOk,
-    `rc=${rc18} banner=${out.includes("┌ ralph")} relDl=${relDlOk} shortTs=${shortTsOk} epochLeak=${epochLeak} closer=${/done · exit/.test(out)} launch=${JSON.stringify(la)} fileFmt=${fileFmtOk}`);
+    && fileFmtOk && beatOk && harvestShortOk,
+    `rc=${rc18} banner=${out.includes("┌ ralph")} relDl=${relDlOk} shortTs=${shortTsOk} epochLeak=${epochLeak} closer=${/done · exit/.test(out)} launch=${JSON.stringify(la)} fileFmt=${fileFmtOk} beat=${beatOk} harvest=${harvestShortOk}(${hlines.length})`);
 }
 
 // R19 power-user attach: pre-check completed → exit 0, parent writes FINAL-REPORT.md,
