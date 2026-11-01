@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.19.5: run a supervised child with zero arguments.
+# ralph.sh — v0.20.0: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -111,6 +111,23 @@ while [ $# -gt 0 ]; do
     --child-model=*)   CHILD_MODEL=${1#*=}; shift ;;
     --parent-model)    [ $# -ge 2 ] || { saye "ralph: --parent-model needs a value"; exit 2; }; PARENT_MODEL=$2; shift 2 ;;
     --parent-model=*)  PARENT_MODEL=${1#*=}; shift ;;
+    -h|--help)
+      cat <<'USAGE'
+ralph.sh — supervised pi child (ralph loop). Zero-arg pipeline:
+  ralph.sh                     find ./TASK.md → launch guarded child → monitor in foreground
+  ralph.sh <run-dir> [flags]   attach to an existing run (power-user)
+  ralph.sh stop [--all | <run-dir>] [--force]   stop a run's processes + harvest it
+  ralph.sh --harvest <run-dir> [dest-dir]       harvest (re-runnable)
+  ralph.sh -h | --help         this help
+normal-mode flags (anywhere in the arg list): --deadline <ISO|HH:MM|epoch>
+  --child-model <spec>  --parent-model <spec>    (--flag value and --flag=value)
+environment: PI TASK_FILE RUNS_DIR DEADLINE MAX_HOURS MODEL PROVIDER
+  CHILD_MODEL CHILD_PROVIDER PARENT_MODEL PARENT_PROVIDER PREAMBLE IDLE_TIMEOUT
+  CYCLE_SEC TIMEOUT_SEC MAX_INTERVENTIONS STUCK_SEC STALE_SEC LLM_FAIL_MAX
+  PROMPT_FILE SESSION LOG_FILE
+See the header comment in ralph.sh for the full contract.
+USAGE
+      exit 0 ;;
     *) _cli_pos+=("$1"); shift ;;
   esac
 done
@@ -353,4 +370,10 @@ trap 'exit 143' TERM
 saye "ralph: monitoring — cycles every ${CYCLE_SEC:-1200}s, Ctrl+C stops the MONITOR only (the child keeps running)"
 rc=0
 node "$HERE/ralph-monitor.mjs" "${MONITOR_ARGS[@]}" || rc=$?
+# the parent's final report (v0.20.0 — written by the monitor on completion or
+# parent-stop; absent otherwise, e.g. Ctrl+C with a still-live child)
+if [ -f "$RUN_DIR/FINAL-REPORT.md" ]; then
+  saye "ralph: final report (written by the parent):"
+  cat "$RUN_DIR/FINAL-REPORT.md" >&2
+fi
 exit $rc

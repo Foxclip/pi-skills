@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.19.5: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.20.0: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -244,6 +244,69 @@ async function llmDecide() {
   return { okExit: r.status === 0, decision, detail, raw, tail, text: (r.stdout || "").trim(), exitStatus: r.status === 0 ? 0 : (r.status ?? r.signal) };
 }
 
+// ---- final report (v0.20.0) — when the work ENDS, the parent (one fresh
+// judgment-model turn) writes a summary of what was done to FINAL-REPORT.md.
+// ralph.sh prints the file to the terminal when the monitor exits.
+// Triggers: child completed, parent STOP decision, intervention budget
+// exhausted. NOT on deadline/stale/stuck/child-dead (plumbing exits, not
+// work outcomes) — and a failed report never changes the exit code.
+const SUMMARY_PROMPT = `You are the final report writer for a ralph-supervised child run that has just ended.
+End reason: <end-reason>
+
+Run directory: <run-dir>
+<project-dir-line>
+
+Read (budget: AT MOST 4 tool calls, use tail — be fast):
+1. <project-dir>/STATUS.md or TASK.md — the task and the child's own notes
+2. <run-dir>/pi-child-progress.log — tail -60 (what the child has been doing)
+3. <run-dir>/ralph-monitor.log — tail -40 (supervisor decisions)
+4. <run-dir>/pi-child-status.json — the final status
+
+Then print the final report as MARKDOWN. This IS your answer — print the report
+to stdout and nothing else (no preamble, no DECISION line).
+
+# Final report — <one line: what was asked → what happened>
+## What was requested
+## What was done
+## Outcome
+## Remaining
+Keep it under ~40 lines. Facts about the work only — no apologies, no
+meta-commentary about this report.`;
+
+async function writeFinalReport(reason) {
+  const projectLine = A.projectDir
+    ? `Project directory: ${A.projectDir}`
+    : "Project directory: unknown (check pi-child-status.json / git in the run dir)";
+  const prompt = SUMMARY_PROMPT.replaceAll("<run-dir>", A.runDir)
+    .replaceAll("<project-dir-line>", projectLine)
+    .replaceAll("<end-reason>", reason);
+  const args = ["--print", "--no-session"];   // fresh writer, never the judgment session
+  if (A.model) args.push("--model", A.model);
+  if (A.provider) args.push("--provider", A.provider);
+  args.push(prompt);
+  let r;
+  try {
+    r = await runCmd(A.pi, args, A.timeoutSec * 1000);
+  } catch (e) {
+    log(`final-report: FAILED (${e.message}) — skipping`);
+    return null;
+  }
+  const text = (r.stdout || "").trim();
+  if (r.status !== 0 || !text) {
+    log(`final-report: FAILED (exit=${r.status ?? r.signal}) — skipping`);
+    return null;
+  }
+  const p = path.join(A.runDir, "FINAL-REPORT.md");
+  try {
+    writeFileSync(p, text + "\n");
+    log(`final-report: written (${text.length} chars) → ${p}`);
+    return p;
+  } catch (e) {
+    log(`final-report: write failed (${e.message})`);
+    return null;
+  }
+}
+
 async function deliverNudge(msg) {
   // reuse the v0.17.0 parent-nudge channel (monitor.mjs --steer → .steer-inbox/)
   const r = await runCmd(NODE, [
@@ -270,6 +333,7 @@ for (;;) {
   if (pc.stop) {
     log(`pre-check STOP: ${pc.reason} (cycle=${state.cycles} interventions=${state.interventions})`);
     saveState();
+    if (pc.code === 0) await writeFinalReport(`child completed (${pc.reason})`);
     process.exit(pc.code);
   }
   const nowMs = Date.now();
@@ -329,12 +393,14 @@ for (;;) {
         }
         if (state.interventions >= A.maxInterventions) {
           log(`budget exhausted (${state.interventions}/${A.maxInterventions}) — stopping loop`);
+          await writeFinalReport(`parent stop: intervention budget exhausted (${state.interventions}/${A.maxInterventions})`);
           saveState();
           process.exit(4);
         }
       } else if (d.decision === "STOP") {
         state.lastDecision = `STOP: ${d.detail}`;
         log(`cycle=${state.cycles} decision=STOP reason=${JSON.stringify(d.detail)}`);
+        await writeFinalReport(`parent stop: ${d.detail || "no reason given"}`);
         saveState();
         process.exit(4);
       } else {

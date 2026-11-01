@@ -122,6 +122,12 @@ if (files.length) {
   L.push("|---|---|");
   for (const f of files) L.push(`| ${f.name} | ${f.bytes} B |`);
 } else L.push("(none)");
+if (fs.existsSync(path.join(runDir, "FINAL-REPORT.md"))) {
+  L.push("");
+  L.push("## Final report (written by the parent)");
+  L.push("");
+  L.push(fs.readFileSync(path.join(runDir, "FINAL-REPORT.md"), "utf8").trimEnd());
+}
 L.push("");
 L.push(`## Ralph monitor log (last 15 lines)`);
 L.push("");
@@ -133,6 +139,7 @@ L.push("## How to read this");
 L.push("");
 L.push("- `child-transcript.jsonl` is the child agent's FULL session (every message/tool call) — the ground truth.");
 L.push("- `ralph-monitor.log` lines: `[iso] cycle=N decision=OK|NUDGE|STOP ...` — one per ralph cycle.");
+L.push("- `FINAL-REPORT.md` (if present) — the parent's final report: what was requested, what was done, outcome, remaining. Also printed to the terminal by ralph.sh when the run ends.");
 L.push("- The pointer file `ralph-run-dir` in the runs root and `INDEX.json` point here.");
 L.push("");
 try { fs.writeFileSync(path.join(runDir, "RUN-REPORT.md"), L.join("\n")); } catch (e) { say(`harvest: RUN-REPORT.md failed: ${e.message}`); }

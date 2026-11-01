@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# test-ralph.sh — end-to-end suite for ralph.sh + ralph-monitor.mjs (v0.20.0).
+# Self-contained: builds a sandbox (stub launch.mjs + stub pi models), runs
+# every case, prints PASS/FAIL lines, exits non-zero on any failure.
+# NO real child agents are launched (launch.mjs is stubbed in the sandbox).
+# Note: a foreground `ralph.sh` blocks while it monitors — cases that launch
+# run it backgrounded and assert on its log, then stop it via the pointer.
+set -u
+SELF="$(readlink -f "$0")"
+SKILL="$(cd "$(dirname "$SELF")" && pwd)"
+S=$SKILL
+T=$(mktemp -d /tmp/ralph-suite.XXXXXX)
+trap 'pkill -f "sleep 600" 2>/dev/null; true' EXIT
+PASS=0; FAIL=0
+ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
+bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
+mkproj() { mkdir -p "$1"; echo "# Test task" > "$1/TASK.md"; }
+stoprun() { (cd "$1" && PATH="$T/sandbox/scripts:$PATH" ralph.sh stop); pkill -f "sleep 600" 2>/dev/null; true; }
+
+# ---- sandbox: sandboxed scripts dir (stub launch) + stub pi models ----------
+mkdir -p $T/sandbox/scripts
+cp "$S"/ralph.sh "$S"/ralph-monitor.mjs "$S"/launch.mjs "$S"/stop.mjs $T/sandbox/scripts/
+cp -r "$S"/lib $T/sandbox/scripts/
+cat > $T/sandbox/scripts/launch.mjs <<'EOF'
+import fs from "fs"; import path from "path"; import { spawn } from "child_process";
+const a = process.argv.slice(2);
+const out = a[a.indexOf("--out-dir") + 1];
+fs.writeFileSync(path.join(out, "launch-args.txt"), a.join(" ") + "\n");
+const s = spawn("sleep", [600], { detached: true, stdio: "ignore" }); s.unref();
+const st = { v:2, at:new Date().toISOString(), status:"running", exitReason:null, guardPid:s.pid, childPid:s.pid, attempt:1, rewinds:0, toolCalls:0, lastTool:null, lastToolStartedAt:null, elapsedMs:0, deadlineIso:new Date(Date.now()+3600e3).toISOString() };
+fs.writeFileSync(path.join(out, "pi-child-status.json"), JSON.stringify(st));
+console.log(JSON.stringify({ launched: true }));
+EOF
+cat > $T/pi-OK <<'EOF'
+#!/usr/bin/env bash
+echo "DECISION: OK"
+EOF
+cat > $T/pi-STOP <<'EOF'
+#!/usr/bin/env bash
+echo "DECISION: STOP: e2e-stop-case"
+EOF
+cat > $T/pi-REPORT <<'EOF'
+#!/usr/bin/env bash
+cat <<'REP'
+# Final report — E2E stub
+## What was requested
+run the e2e case
+## What was done
+stub wrote this report
+## Outcome
+done
+## Remaining
+none
+REP
+EOF
+chmod +x $T/pi-OK $T/pi-STOP $T/pi-REPORT
+DEADLINE=$(( $(date +%s) + 3600 ))
+
+# ---- A: no TASK.md → exit 1 -------------------------------------------------
+mkdir -p $T/noTask && cd $T/noTask
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK DEADLINE=$DEADLINE ralph.sh > $T/A.log 2>&1
+[ $? -eq 1 ] && grep -q "TASK.md" $T/A.log && ok "A: no TASK.md → exit 1 with message" || bad "A: $(cat $T/A.log)"
+
+# ---- B: --help → exit 2 -----------------------------------------------------
+PATH="$T/sandbox/scripts:$PATH" ralph.sh --help > $T/B.log 2>&1
+[ $? -eq 0 ] && grep -q "ralph.sh" $T/B.log && grep -q "stop" $T/B.log \
+  && ok "B: --help → exit 0 with usage" || bad "B: $(head -3 $T/B.log)"
+
+# ---- C: launch + one judgment cycle (monitor sleeps 30s pre-check first) -----
+mkproj $T/projC && cd $T/projC
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK DEADLINE=$DEADLINE ralph.sh > $T/C.log 2>&1 &
+CPID=$!; sleep 35
+RD=$T/projC/.pi-supervisor/runs/run1
+[ -f $RD/pi-child-status.json ] && [ -f $T/projC/.pi-supervisor/ralph-run-dir ] \
+  && ok "C: run dir + guard status + pointer created" || bad "C: run dir/status/pointer"
+grep -q "cycle=1" $RD/ralph-monitor.log 2>/dev/null && grep -q "decision=OK" $RD/ralph-monitor.log \
+  && ok "C: monitor ran cycle 1 with decision=OK" || bad "C: monitor log $(tail -2 $RD/ralph-monitor.log 2>/dev/null)"
+kill $CPID 2>/dev/null; pkill -f "sleep 600" 2>/dev/null; true
+
+# ---- D: attach while live → no second child; stop via pointer ----------------
+mkproj $T/projD && cd $T/projD
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK DEADLINE=$DEADLINE ralph.sh > $T/D1.log 2>&1 &
+sleep 4
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh > $T/D2.log 2>&1 &
+sleep 3
+grep -qi "attaching to" $T/D2.log && ok "D: attach to live run (no second child)" || bad "D: $(head -3 $T/D2.log)"
+[ "$(ls -d $T/projD/.pi-supervisor/runs/run* 2>/dev/null | wc -l)" -eq 1 ] \
+  && ok "D: exactly one run dir after attach" || bad "D: extra run dirs"
+stoprun $T/projD > $T/D3b.log 2>&1
+grep -q "preserved" $T/D3b.log && ok "D: stop via pointer → stopped + preserved (pointer kept by design for post-mortem)" || bad "D: stop ($(cat $T/D3b.log))"
+# the monitors (D1/D2) notice the dead child at their next 30s pre-check and
+# harvest on exit — don't wait for that race: harvest explicitly (idempotent)
+cd $T/projD && PATH="$T/sandbox/scripts:$PATH" ralph.sh --harvest $T/projD/.pi-supervisor/runs/run1 > /dev/null 2>&1
+[ -f $T/projD/.pi-supervisor/runs/run1/RUN-REPORT.md ] && [ -f $T/projD/.pi-supervisor/runs/INDEX.json ] \
+  && ok "D: stopped run harvested (RUN-REPORT + INDEX)" || bad "D: harvest artifacts"
+
+# ---- E: --deadline / --child-model / --parent-model flags --------------------
+mkproj $T/projE && cd $T/projE
+DL=$(( $(date +%s) + 600 ))
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK \
+  ralph.sh --deadline $DL --child-model cm-e2e --parent-model pm-e2e > $T/E.log 2>&1 &
+sleep 4
+grep -q "deadline=$DL" $T/E.log && ok "E: --deadline flag parsed" || bad "E: $(head -3 $T/E.log)"
+grep -q "child-model=cm-e2e" $T/E.log && grep -q "parent-model=pm-e2e" $T/E.log \
+  && ok "E: --child-model/--parent-model flags parsed" || bad "E: model flags"
+grep -q -- "--model cm-e2e" $T/projE/.pi-supervisor/runs/run1/launch-args.txt 2>/dev/null \
+  && ok "E: flags reached launch.mjs (--model cm-e2e)" || bad "E: launch-args ($(cat $T/projE/.pi-supervisor/runs/run1/launch-args.txt 2>/dev/null))"
+stoprun $T/projE
+
+# ---- F: --flag=value form (regression: the missing-shift spin) ----------------
+mkproj $T/projF && cd $T/projF
+DLF=$(( $(date +%s) + 600 ))
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK \
+  ralph.sh --deadline=$DLF --child-model=fv-e2e > $T/F.log 2>&1 &
+sleep 4
+grep -q "child-model=fv-e2e" $T/F.log && ok "F: --flag=value form parsed (no hang — a spin would print nothing)" || bad "F: $(cat $T/F.log | head -3)"
+stoprun $T/projF
+
+# ---- G: stale child → exit 2 -------------------------------------------------
+mkproj $T/projG
+SD=$T/projG/.pi-supervisor/runs/run1; mkdir -p $SD
+OLD=$(date -u -d '-2 hours' +%Y-%m-%dT%H:%M:%SZ)
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+echo '{"l":"x"}' > $T/stale.jsonl
+cat > $SD/pi-child-status.json <<EOF
+{"v":2,"at":"$OLD","status":"running","exitReason":null,"guardPid":99999,"childPid":99998,"attempt":1,"rewinds":0,"toolCalls":0,"lastTool":"bash","lastActivityAt":"$OLD","elapsedMs":0,"deadlineIso":"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)","sessionFile":"$T/stale.jsonl"}
+EOF
+cd $T/projG
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh $SD > $T/G.log 2>&1
+RC=$?
+[ "$RC" -eq 2 ] && ok "G: stale child → exit 2" || bad "G: rc=$RC $(tail -2 $T/G.log)"
+
+# ---- H: v0.20.0 — child completed → FINAL-REPORT.md + exit 0 ------------------
+mkproj $T/projH
+SD=$T/projH/.pi-supervisor/runs/run1; mkdir -p $SD
+echo "done" > $T/projH/STATUS.md
+cat > $SD/pi-child-status.json <<EOF
+{"v":2,"at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","status":"completed","exitReason":"completed","guardPid":99997,"childPid":99996,"attempt":1,"rewinds":0,"toolCalls":5,"elapsedMs":1000,"deadlineIso":"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"}
+EOF
+cd $T/projH
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-REPORT ralph.sh $SD > $T/H.log 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && [ -f $SD/FINAL-REPORT.md ] && grep -q "E2E stub" $SD/FINAL-REPORT.md \
+  && ok "H: completed → FINAL-REPORT.md written, exit 0" || bad "H: rc=$RC $(tail -3 $T/H.log)"
+grep -q "final report" $T/H.log && ok "H: ralph.sh printed the final report to the terminal" || bad "H: report not printed"
+
+# ---- I: v0.20.0 — parent STOP → FINAL-REPORT.md + exit 4 ----------------------
+# (30s pre-check sleep first — status is fresh so pre-checks pass, then the
+#  STOP-stub judgment fires)
+mkproj $T/projI
+SD=$T/projI/.pi-supervisor/runs/run1; mkdir -p $SD
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+cat > $SD/pi-child-status.json <<EOF
+{"v":2,"at":"$NOW","status":"running","exitReason":null,"guardPid":99995,"childPid":99994,"attempt":1,"rewinds":0,"toolCalls":0,"lastTool":null,"lastActivityAt":"$NOW","elapsedMs":0,"deadlineIso":"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"}
+EOF
+cd $T/projI
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-STOP ralph.sh $SD > $T/I.log 2>&1
+RC=$?
+[ "$RC" -eq 4 ] && [ -f $SD/FINAL-REPORT.md ] \
+  && ok "I: parent STOP → FINAL-REPORT.md, exit 4" || bad "I: rc=$RC $(tail -3 $T/I.log)"
+grep -q "decision=STOP" $SD/ralph-monitor.log 2>/dev/null && ok "I: decision=STOP logged" || bad "I: reason not in log"
+
+# ---- J: v0.20.0 — RUN-REPORT.md embeds the final report -----------------------
+cd $T/projH
+PATH="$T/sandbox/scripts:$PATH" ralph.sh --harvest $T/projH/.pi-supervisor/runs/run1 > $T/J.log 2>&1
+grep -q "## Final report (written by the parent)" $T/projH/.pi-supervisor/runs/run1/RUN-REPORT.md \
+  && grep -q "stub wrote this report" $T/projH/.pi-supervisor/runs/run1/RUN-REPORT.md \
+  && ok "J: RUN-REPORT.md embeds FINAL-REPORT.md" || bad "J: $(tail -2 $T/J.log)"
+
+# ---- K: terminal timestamps local; log files keep ISO UTC ---------------------
+grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}\] ralph: launching child' $T/C.log \
+  && ok "K: terminal timestamps local [YYYY-MM-DD HH:MM:SS.mmm]" || bad "K: $(grep 'launching child' $T/C.log | head -1)"
+grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}\.[0-9]{3}Z\] cycle=' $T/projC/.pi-supervisor/runs/run1/ralph-monitor.log 2>/dev/null \
+  && ok "K: ralph-monitor.log keeps ISO UTC" || bad "K: log file format"
+
+echo ""
+echo "=== $PASS passed, $FAIL failed (sandbox: $T) ==="
+pkill -f "sleep 600" 2>/dev/null
+rm -rf $T
+exit $(( FAIL > 0 ? 1 : 0 ))
