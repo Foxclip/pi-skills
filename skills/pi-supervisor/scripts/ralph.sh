@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.19.3: run a supervised child with zero arguments.
+# ralph.sh — v0.19.4: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -50,6 +50,10 @@
 #   --parent-model <spec>           = PARENT_MODEL  (ralph's judgment model)
 # Both `--flag value` and `--flag=value` forms work.
 #
+# EVERY message this wrapper prints is timestamped `[YYYY-MM-DDTHH:MM:SS.mmmZ]`
+# (same format as ralph-monitor.log) — quoted output blocks (a launch failure,
+# ralph-monitor's child-stderr) keep their body raw under a timestamped header.
+#
 # MODES:
 #   ralph.sh                       zero-arg pipeline (above)
 #   ralph.sh <run-dir> [args...]   attach to an existing run (power-user;
@@ -83,6 +87,12 @@ HERE="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
 PI_BIN="${PI:-pi}"
 HARVEST_TARGET=""   # set once RUN_DIR is known; the EXIT trap harvests it
 
+# every wrapper message is timestamped like the monitor's log lines:
+# [YYYY-MM-DDTHH:MM:SS.mmmZ]   (UTC, GNU date %3N)
+ts()   { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
+say()  { printf '[%s] %s\n' "$(ts)" "$*"; }
+saye() { printf '[%s] %s\n' "$(ts)" "$*" >&2; }
+
 # ------------------------------------------------------------- CLI flags
 # The three most-used knobs as flags, parseable BEFORE mode dispatch so they
 # work in normal (zero-arg) mode: --deadline / --child-model / --parent-model.
@@ -93,11 +103,11 @@ HARVEST_TARGET=""   # set once RUN_DIR is known; the EXIT trap harvests it
 _cli_pos=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --deadline)        [ $# -ge 2 ] || { echo "ralph: --deadline needs a value" >&2; exit 2; }; DEADLINE=$2; shift 2 ;;
+    --deadline)        [ $# -ge 2 ] || { saye "ralph: --deadline needs a value"; exit 2; }; DEADLINE=$2; shift 2 ;;
     --deadline=*)      DEADLINE=${1#*=}; shift ;;
-    --child-model)     [ $# -ge 2 ] || { echo "ralph: --child-model needs a value" >&2; exit 2; }; CHILD_MODEL=$2; shift 2 ;;
+    --child-model)     [ $# -ge 2 ] || { saye "ralph: --child-model needs a value"; exit 2; }; CHILD_MODEL=$2; shift 2 ;;
     --child-model=*)   CHILD_MODEL=${1#*=}; shift ;;
-    --parent-model)    [ $# -ge 2 ] || { echo "ralph: --parent-model needs a value" >&2; exit 2; }; PARENT_MODEL=$2; shift 2 ;;
+    --parent-model)    [ $# -ge 2 ] || { saye "ralph: --parent-model needs a value"; exit 2; }; PARENT_MODEL=$2; shift 2 ;;
     --parent-model=*)  PARENT_MODEL=${1#*=}; shift ;;
     *) _cli_pos+=("$1"); shift ;;
   esac
@@ -148,15 +158,15 @@ harvest() { # $1=run-dir $2=interrupted(0|1) $3=monitor exit code (best effort)
 if [ "${1:-}" = "--harvest" ]; then
   SRC="${2:-}"; DEST="${3:-}"
   if [ -z "$SRC" ] || [ ! -d "$SRC" ]; then
-    echo "usage: ralph.sh --harvest <run-dir> [dest-dir]" >&2
+    saye "usage: ralph.sh --harvest <run-dir> [dest-dir]"
     exit 1
   fi
   TARGET="$SRC"
   if [ -n "$DEST" ]; then
-    if [ -e "$DEST" ]; then echo "ralph: dest $DEST exists — refusing to overwrite" >&2; exit 1; fi
+    if [ -e "$DEST" ]; then saye "ralph: dest $DEST exists — refusing to overwrite"; exit 1; fi
     mkdir -p "$(dirname "$DEST")"
     cp -a "$SRC" "$DEST"
-    echo "ralph: copied $SRC → $DEST" >&2
+    saye "ralph: copied $SRC → $DEST"
     TARGET="$DEST"
   fi
   node "$HERE/lib/harvest.mjs" "$TARGET" 0 0
@@ -171,8 +181,8 @@ if [ "${1:-}" = "stop" ]; then
     case "$1" in
       --all)   STOP_ALL=1 ;;
       --force) STOP_ARGS+=(--force) ;;
-      -*)      echo "ralph: stop: unknown flag: $1" >&2; exit 2 ;;
-      *)       if [ -n "$STOP_TARGET" ]; then echo "ralph: stop: one run dir at a time (or --all)" >&2; exit 2; fi
+      -*)      saye "ralph: stop: unknown flag: $1"; exit 2 ;;
+      *)       if [ -n "$STOP_TARGET" ]; then saye "ralph: stop: one run dir at a time (or --all)"; exit 2; fi
                STOP_TARGET=$1 ;;
     esac
     shift
@@ -183,19 +193,19 @@ if [ "${1:-}" = "stop" ]; then
   stop_one() { # $1=run-dir
     local d="$1" rc=0
     if [ ! -f "$d/pi-child-status.json" ]; then
-      echo "ralph: stop: no status file in $d — nothing to stop" >&2
+      saye "ralph: stop: no status file in $d — nothing to stop"
       return 0
     fi
-    echo "ralph: stopping $d" >&2
+    saye "ralph: stopping $d"
     node "$HERE/stop.mjs" --out-dir "$d" "${STOP_ARGS[@]}" || rc=$?
     node "$HERE/lib/harvest.mjs" "$d" 0 "$rc" 2>/dev/null || true
-    echo "ralph: preserved — report: $d/RUN-REPORT.md" >&2
+    saye "ralph: preserved — report: $d/RUN-REPORT.md"
     return $rc
   }
 
   if [ "$STOP_ALL" -eq 1 ]; then
     if [ ! -d "$STOP_ROOT" ]; then
-      echo "ralph: stop --all: no run dirs ($STOP_ROOT missing)" >&2
+      saye "ralph: stop --all: no run dirs ($STOP_ROOT missing)"
     else
       found=0
       for d in "$STOP_ROOT"/*/; do
@@ -203,7 +213,7 @@ if [ "${1:-}" = "stop" ]; then
         found=1
         stop_one "${d%/}" || STOP_RC=1
       done
-      [ "$found" -eq 1 ] || echo "ralph: stop --all: no run dirs in $STOP_ROOT" >&2
+      [ "$found" -eq 1 ] || saye "ralph: stop --all: no run dirs in $STOP_ROOT"
     fi
   elif [ -n "$STOP_TARGET" ]; then
     stop_one "$STOP_TARGET" || STOP_RC=1
@@ -215,13 +225,13 @@ if [ "${1:-}" = "stop" ]; then
     elif [ -d "$STOP_ROOT" ]; then
       newest="$(for d in "$STOP_ROOT"/*/; do [ -f "$d/pi-child-status.json" ] && printf '%s\n' "${d%/}"; done | xargs -r ls -1t 2>/dev/null | head -1)"
       if [ -n "$newest" ]; then
-        echo "ralph: stop: no pointer — using newest run with a status file: $newest" >&2
+        saye "ralph: stop: no pointer — using newest run with a status file: $newest"
         stop_one "$newest" || STOP_RC=1
       else
-        echo "ralph: stop: no run with a status file found (looked in $STOP_ROOT)" >&2
+        saye "ralph: stop: no run with a status file found (looked in $STOP_ROOT)"
       fi
     else
-      echo "ralph: stop: no runs found (no pointer, $STOP_ROOT missing)" >&2
+      saye "ralph: stop: no runs found (no pointer, $STOP_ROOT missing)"
     fi
   fi
   exit $STOP_RC
@@ -235,7 +245,7 @@ if [ $# -ge 1 ]; then
   if [ -n "${PROJECT_DIR:-}" ]; then ralph_flags+=(--project-dir "$PROJECT_DIR"); fi
   if [ -n "$DEADLINE_EPOCH" ]; then ralph_flags+=(--deadline "$DEADLINE_EPOCH"); fi
   EXTRA=("$@")
-  echo "ralph-monitor: run-dir=$RUN_DIR (attaching to existing run)" >&2
+  saye "ralph-monitor: run-dir=$RUN_DIR (attaching to existing run)"
   MONITOR_ARGS=(--run-dir "$RUN_DIR" "${ralph_flags[@]}" "${EXTRA[@]}")
 fi
 
@@ -243,13 +253,9 @@ fi
 if [ "$ATTACHED" -eq 0 ]; then
   TASK_FILE="${TASK_FILE:-TASK.md}"
   if [ ! -f "$TASK_FILE" ]; then
-    cat >&2 <<EOF
-ralph: no $TASK_FILE in $(pwd)
-
-Zero-arg mode: write the task in ./$TASK_FILE, then run ./ralph.sh
-(or set TASK_FILE=<name> to point elsewhere).
-To attach to an existing run instead:  ./ralph.sh <run-dir> [ralph args...]
-EOF
+    saye "ralph: no $TASK_FILE in $(pwd)"
+    saye "Zero-arg mode: write the task in ./$TASK_FILE, then run ralph.sh (or set TASK_FILE=<name> to point elsewhere)."
+    saye "To attach to an existing run instead: ralph.sh <run-dir> [ralph args...]"
     exit 1
   fi
 
@@ -265,7 +271,7 @@ EOF
     elif [ -n "$cand" ] && [ -d "$cand" ] && [ ! -f "$cand/run-summary.json" ]; then
       # dead run without a summary — reboot or crash mid-run: post-mortem it
       # now so it becomes permanent evidence, then start a fresh run below
-      echo "ralph: previous run $cand is dead (reboot/crash?) — harvesting post-mortem" >&2
+      saye "ralph: previous run $cand is dead (reboot/crash?) — harvesting post-mortem"
       harvest "$cand" 1 0
     fi
   fi
@@ -294,16 +300,16 @@ EOF
     if [ -n "$CHILD_MODEL_VAL" ];    then launch_args+=(--model "$CHILD_MODEL_VAL"); fi
     if [ -n "$CHILD_PROVIDER_VAL" ]; then launch_args+=(--provider "$CHILD_PROVIDER_VAL"); fi
 
-    echo "ralph: launching child (task=.$TASK_FILE, run-dir=$RUN_DIR, deadline=$DEADLINE_EPOCH, child-model=${CHILD_MODEL_VAL:-pi-default}, parent-model=${PARENT_MODEL_VAL:-pi-default})" >&2
+    saye "ralph: launching child (task=.$TASK_FILE, run-dir=$RUN_DIR, deadline=$DEADLINE_EPOCH, child-model=${CHILD_MODEL_VAL:-pi-default}, parent-model=${PARENT_MODEL_VAL:-pi-default})"
     launch_out=$(node "$HERE/launch.mjs" "${launch_args[@]}" 2>&1) || true
     case "$launch_out" in
       *'"launched":true'*)
         guard_pid=$(status_field "$RUN_DIR/pi-child-status.json" guardPid)
-        echo "ralph: child launched (guardPid=$guard_pid)" >&2 ;;
+        saye "ralph: child launched (guardPid=$guard_pid)" ;;
       *'"launched":"unknown"'*)
-        echo "ralph: WARNING launch.mjs reported 'unknown' (alive but silent) — proceeding, the pre-checks will catch a dead child" >&2 ;;
+        saye "ralph: WARNING launch.mjs reported 'unknown' (alive but silent) — proceeding, the pre-checks will catch a dead child" ;;
       *)
-        echo "ralph: LAUNCH FAILED — output from launch.mjs:" >&2
+        saye "ralph: LAUNCH FAILED — output from launch.mjs:"
         echo "$launch_out" | tail -20 >&2
         exit 1 ;;
     esac
@@ -313,7 +319,7 @@ EOF
     # keep run artifacts out of git's way (idempotent — the line is added once)
     if [ -d "$PROJECT_DIR/.git" ] && ! grep -qxF '.pi-supervisor/' "$PROJECT_DIR/.gitignore" 2>/dev/null; then
       { printf '\n# pi-supervisor run artifacts\n.pi-supervisor/\n' >> "$PROJECT_DIR/.gitignore"; } 2>/dev/null \
-        && echo "ralph: added .pi-supervisor/ to .gitignore" >&2 || true
+        && saye "ralph: added .pi-supervisor/ to .gitignore" || true
     fi
   else
     # attach to a live run: honor the run's own deadline unless the user overrode it
@@ -321,7 +327,7 @@ EOF
       iso=$(status_field "$RUN_DIR/pi-child-status.json" deadlineIso)
       [ -n "$iso" ] && DEADLINE_EPOCH="$iso"
     fi
-    echo "ralph: attaching to live run $RUN_DIR (no new child launched)" >&2
+    saye "ralph: attaching to live run $RUN_DIR (no new child launched)"
   fi
 
   MONITOR_ARGS=(--run-dir "$RUN_DIR" --project-dir "$PROJECT_DIR" --deadline "$DEADLINE_EPOCH" "${ralph_flags[@]}")
@@ -335,14 +341,14 @@ on_exit() {
   if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then interrupted=1; fi
   if [ -n "$HARVEST_TARGET" ] && [ -d "$HARVEST_TARGET" ]; then
     harvest "$HARVEST_TARGET" "$interrupted" "$rc"
-    echo "ralph: preserved — report: $HARVEST_TARGET/RUN-REPORT.md   index: $(dirname "$HARVEST_TARGET")/INDEX.json" >&2
+    saye "ralph: preserved — report: $HARVEST_TARGET/RUN-REPORT.md   index: $(dirname "$HARVEST_TARGET")/INDEX.json"
   fi
 }
 trap on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-echo "ralph: monitoring — cycles every ${CYCLE_SEC:-1200}s, Ctrl+C stops the MONITOR only (the child keeps running)" >&2
+saye "ralph: monitoring — cycles every ${CYCLE_SEC:-1200}s, Ctrl+C stops the MONITOR only (the child keeps running)"
 rc=0
 node "$HERE/ralph-monitor.mjs" "${MONITOR_ARGS[@]}" || rc=$?
 exit $rc

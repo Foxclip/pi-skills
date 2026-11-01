@@ -19,9 +19,13 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 
+// every harvest message is timestamped like the rest of the ralph.sh stream:
+// [YYYY-MM-DDTHH:MM:SS.mmmZ] (matches ralph.sh's ts() and the monitor's log)
+const say = (msg) => console.error(`[${new Date().toISOString()}] ${msg}`);
+
 const [runDir, interruptedRaw = "0", rcRaw = "0"] = process.argv.slice(2);
 if (!runDir || !fs.existsSync(runDir)) {
-  console.error(`harvest: run dir not found: ${runDir ?? "(none)"}`);
+  say(`harvest: run dir not found: ${runDir ?? "(none)"}`);
   process.exit(0);
 }
 const interrupted = interruptedRaw === "1";
@@ -128,7 +132,7 @@ L.push("- `child-transcript.jsonl` is the child agent's FULL session (every mess
 L.push("- `ralph-monitor.log` lines: `[iso] cycle=N decision=OK|NUDGE|STOP ...` — one per ralph cycle.");
 L.push("- The pointer file `ralph-run-dir` in the runs root and `INDEX.json` point here.");
 L.push("");
-try { fs.writeFileSync(path.join(runDir, "RUN-REPORT.md"), L.join("\n")); } catch (e) { console.error(`harvest: RUN-REPORT.md failed: ${e.message}`); }
+try { fs.writeFileSync(path.join(runDir, "RUN-REPORT.md"), L.join("\n")); } catch (e) { say(`harvest: RUN-REPORT.md failed: ${e.message}`); }
 
 // ---- 3. run-summary.json ----------------------------------------------------
 const summary = {
@@ -144,7 +148,7 @@ const summary = {
   files,
   pointer: path.join(runsRoot, "ralph-run-dir"),
 };
-try { fs.writeFileSync(path.join(runDir, "run-summary.json"), JSON.stringify(summary, null, 2)); } catch (e) { console.error(`harvest: run-summary.json failed: ${e.message}`); }
+try { fs.writeFileSync(path.join(runDir, "run-summary.json"), JSON.stringify(summary, null, 2)); } catch (e) { say(`harvest: run-summary.json failed: ${e.message}`); }
 
 // ---- 4. INDEX.json in the runs root ----------------------------------------
 let indexUpdated = false;
@@ -164,7 +168,7 @@ try {
   index.runs.sort((a, b) => a.run.localeCompare(b.run, undefined, { numeric: true }));
   fs.writeFileSync(indexPath, JSON.stringify(index, null, 2));
   indexUpdated = true;
-} catch (e) { console.error(`harvest: INDEX.json failed: ${e.message}`); }
+} catch (e) { say(`harvest: INDEX.json failed: ${e.message}`); }
 
-console.error(`harvest: ${runName} — status=${finalStatus} transcript=${transcript.copied ? transcript.lines + " lines" : "n/a"} index=${indexUpdated ? "updated" : "failed"} → ${path.join(runDir, "RUN-REPORT.md")}`);
+say(`harvest: ${runName} — status=${finalStatus} transcript=${transcript.copied ? transcript.lines + " lines" : "n/a"} index=${indexUpdated ? "updated" : "failed"} → ${path.join(runDir, "RUN-REPORT.md")}`);
 process.exit(0);
