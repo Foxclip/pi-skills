@@ -488,9 +488,11 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   spawnSync("bash", ["-c", `cd ${proj} && PI=${STUB_OK} script -qec "bash ${SBX_RALPH} ${rd}" /dev/null > ${ttyLog} 2>&1 || true`], { timeout: 60000 });
   spawnSync("bash", ["-c", `cd ${proj} && PI=${STUB_OK} NO_COLOR=1 script -qec "bash ${SBX_RALPH} ${rd}" /dev/null > ${plainLog} 2>&1 || true`], { timeout: 60000 });
   const t = readFileSync(ttyLog, "utf8"), pl = readFileSync(plainLog, "utf8");
-  report("R20 pty → colored banner + box; NO_COLOR → plain",
-    t.includes("\x1b[") && t.includes("┌ ralph") && pl.includes("┌ ralph") && !pl.includes("\x1b["),
-    `ttyEsc=${t.includes("\x1b[")} plainEsc=${pl.includes("\x1b[")} ttyBanner=${t.includes("┌ ralph")} plainBanner=${pl.includes("┌ ralph")}`);
+  // v0.24.1: success closer is GREEN (was bold white); failure closer is red
+  const greenDone = t.includes("\x1b[32m✓ done · exit 0");
+  report("R20 pty → colored banner + box + green success closer; NO_COLOR → plain",
+    t.includes("\x1b[") && t.includes("┌ ralph") && greenDone && pl.includes("┌ ralph") && !pl.includes("\x1b["),
+    `ttyEsc=${t.includes("\x1b[")} plainEsc=${pl.includes("\x1b[")} ttyBanner=${t.includes("┌ ralph")} plainBanner=${pl.includes("┌ ralph")} greenDone=${greenDone}`);
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.24.0: run a supervised child with zero arguments.
+# ralph.sh — v0.24.1: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -422,7 +422,7 @@ on_exit() {
   if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then interrupted=1; fi
   if [ -n "$HARVEST_TARGET" ] && [ -d "$HARVEST_TARGET" ]; then
     harvest "$HARVEST_TARGET" "$interrupted" "$rc"
-    if [ "$rc" -eq 0 ]; then saye "${C_B}✓ done · exit 0${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"
+    if [ "$rc" -eq 0 ]; then saye "${C_G}✓ done · exit 0${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"
     else saye "${C_R}✗ done · exit $rc${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"; fi
   fi
 }
