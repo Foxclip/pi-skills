@@ -77,7 +77,7 @@
 #                                  <run-dir>; default = the run in the pointer
 #                                  file, else the newest run with a status file.
 #                                  A still-running ralph.sh monitor notices the
-#                                  dead child on its next pre-check (≤30s) and
+#                                  dead child on its next pre-check (≤5s) and
 #                                  exits by itself — no need to kill it.
 #
 set -euo pipefail

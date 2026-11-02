@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.24.0: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.24.2: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -149,9 +149,12 @@ const tick = (n, verdict, detail, reasoning) => {
 // "in progress" indicator (terminal only — the log file's format is unchanged):
 // a parent LLM call can take a while, and without this the terminal looks frozen
 const ask = (msg) => tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${msg}${C(0)}`);
-// v0.21.2: child heartbeat — one dim line per ~30s poll with the CHILD's live
-// state. Without it the terminal only shows the parent's judgment lines and the
-// run reads as if the parent were doing all the work.
+// v0.21.2: child heartbeat — one dim line with the CHILD's live state.
+// Without it the terminal only shows the parent's judgment lines and the run
+// reads as if the parent were doing all the work.
+// v0.24.2: the line fires on every toolCalls CHANGE (not every poll) — with
+// the 5s poll a new tool call shows up within ~5s — plus a 60s fallback so
+// the terminal still proves the child is alive between tool calls (thinking).
 const humanLeft = (ms) => {
   let s = Math.max(0, Math.round(ms / 1000));
   const h = Math.floor(s / 3600); s -= h * 3600;
@@ -163,6 +166,18 @@ const beat = (s) => {
   const last = s.lastTool ? ` · last: ${s.lastTool}` : "";
   const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
   tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${s.status}${C(0)}${C(2)} · ${tc} tool call${tc === 1 ? "" : "s"}${last}${left}${C(0)}`);
+};
+// v0.24.2: change-driven beats — print when toolCalls CHANGES, or at least
+// once a minute (the "still alive, thinking" proof). First poll always beats.
+let lastBeat = { tc: null, at: 0 };
+const beatMaybe = (s) => {
+  const tc = Number(s.toolCalls);
+  const changed = Number.isFinite(tc) && (lastBeat.tc === null || tc !== lastBeat.tc);
+  const overdue = Date.now() - lastBeat.at >= 60_000;
+  if (!changed && !overdue) return;
+  if (Number.isFinite(tc)) lastBeat.tc = tc;
+  lastBeat.at = Date.now();
+  beat(s);
 };
 process.on("SIGINT", () => { glog("!", 33, "sigint: stopping"); saveState(); process.exit(130); });
 
@@ -395,9 +410,10 @@ async function deliverNudge(msg) {
 
 // ---- main loop
 // Tight poll: the pre-checks (pure file reads, no LLM) run every POLL_SEC so a
-// completed/stale/deadline child is noticed within ~30s, not up to one full
-// cycle later. The LLM judgment still only runs every --cycle-sec.
-const POLL_SEC = 30;
+// completed/stale/deadline child is noticed within ~5s, not up to one full
+// cycle later. The 5s cadence is what lets the child heartbeat fire per tool
+// call (v0.24.2). The LLM judgment still only runs every --cycle-sec.
+const POLL_SEC = 5;
 let lastJudgment = 0; // 0 = judgment due immediately
 // v0.23.0: one stop path for all pre-check stops. The parent's final report
 // also runs on deadline/stuck endings — that is exactly when the user needs
@@ -415,7 +431,7 @@ for (;;) {
   const status = readStatus();
   const pc = preCheck(status);
   if (pc.stop) await stopLoop(pc);
-  if (status && status.status === "running") beat(status);
+  if (status && status.status === "running") beatMaybe(status);
   const nowMs = Date.now();
   if (nowMs - lastJudgment < A.cycleSec * 1000 - 500) {
     await sleep(Math.min(POLL_SEC * 1000, Math.max(5000, A.cycleSec * 1000 - (nowMs - lastJudgment))));

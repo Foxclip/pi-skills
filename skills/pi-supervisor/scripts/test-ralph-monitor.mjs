@@ -21,6 +21,7 @@
 //   R13 llm-failed cycles (continuous)        → loop survives, retries, recovers
 //   R14 dry-run --once                        → no LLM call, exit 0
 //   R15 llm-down (llmFailMax hit, continuous) → exit 4
+//   R23 child heartbeat fires on every toolCalls CHANGE (5s poll; 60s fallback)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -270,6 +271,31 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   report("R14 dry-run --once → exit 0, no LLM call",
     r.status === 0 && /dry-run/.test(readLog(d)) && invLog("r14") === "",
     `exit=${r.status}`);
+}
+
+// ---- R23: child heartbeat on every toolCalls change (v0.24.2)
+{
+  const d = runDir("r23");
+  mkStatus(d, { toolCalls: 0 });
+  const child = spawn(NODE, rmArgs(d, STUB_OK, ["--cycle-sec", "1000"]), {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let err = "";
+  child.stderr.on("data", (x) => { err += x; });
+  await waitMs(2500);             // first beat (tc=0) printed
+  mkStatus(d, { toolCalls: 5 });  // "a tool call happened"
+  await waitMs(6000);             // next poll (≤5s) → beat for tc=5
+  mkStatus(d, { toolCalls: 9 });  // one more
+  await waitMs(6000);             // → beat for tc=9
+  child.kill("SIGINT");
+  await new Promise((r) => child.on("exit", r));
+  const beats = err.split("\n").filter((l) => /· child running · \d+ tool calls/.test(l));
+  report("R23 heartbeat on every toolCalls change (5s poll, no duplicates)",
+    beats.some((l) => /0 tool calls/.test(l))
+    && beats.some((l) => /5 tool calls/.test(l))
+    && beats.some((l) => /9 tool calls/.test(l))
+    && beats.length <= 3,
+    `beats=${beats.length} ${beats.map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 220)}`);
 }
 
 // ---- R13: llm-failed cycles in continuous mode → loop survives and recovers
