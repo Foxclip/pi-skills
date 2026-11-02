@@ -117,6 +117,34 @@ sleep 4
 grep -q "child=fv-e2e" $T/F.log && ok "F: --flag=value form parsed (no hang — a spin would print nothing)" || bad "F: $(cat $T/F.log | head -8)"
 stoprun $T/projF
 
+# ---- L: --runtime flag — relative deadline (v0.25.0) ---------------------------
+mkproj $T/projL && cd $T/projL
+T0=$(date +%s)
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh --runtime 90m > $T/L.log 2>&1 &
+sleep 4
+LARGS=$T/projL/.pi-supervisor/runs/run1/launch-args.txt
+LDL=$(grep -o -- '--deadline [0-9]*' "$LARGS" 2>/dev/null | awk '{print $2}')
+DR=$(( LDL - T0 ))
+[ -n "$LDL" ] && [ "$DR" -ge 5340 ] && [ "$DR" -le 5460 ] \
+  && ok "L: --runtime 90m → launch deadline ≈ now+5400s (got +$DR s)" \
+  || bad "L: launch-args $(cat "$LARGS" 2>/dev/null) (want deadline ≈ now+5400)"
+grep -q "deadline" $T/L.log && ok "L: banner shows the runtime-derived deadline" || bad "L: $(head -8 $T/L.log)"
+stoprun $T/projL
+
+# ---- L2: bad --runtime value → exit 2 with a message ----------------------------
+mkdir -p $T/noTask2 && cd $T/noTask2
+PATH="$T/sandbox/scripts:$PATH" ralph.sh --runtime abc > $T/L2.log 2>&1
+RC=$?
+[ "$RC" -eq 2 ] && grep -q "bad --runtime" $T/L2.log \
+  && ok "L2: bad --runtime → exit 2 with message" || bad "L2: rc=$RC $(cat $T/L2.log)"
+
+# ---- L3: --deadline AND --runtime → warning, absolute wins -----------------------
+# (run in a dir WITHOUT TASK.md, so the expected exit is 1 — after the warning)
+PATH="$T/sandbox/scripts:$PATH" ralph.sh --deadline $DEADLINE --runtime 90m > $T/L3.log 2>&1
+RC=$?
+[ "$RC" -eq 1 ] && grep -q "both --deadline and --runtime" $T/L3.log \
+  && ok "L3: both flags → warning + --deadline wins (then exit 1: no TASK.md here)" || bad "L3: rc=$RC $(cat $T/L3.log)"
+
 # ---- G: stale child → exit 2 -------------------------------------------------
 mkproj $T/projG
 SD=$T/projG/.pi-supervisor/runs/run1; mkdir -p $SD

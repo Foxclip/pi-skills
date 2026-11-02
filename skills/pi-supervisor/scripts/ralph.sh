@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.24.1: run a supervised child with zero arguments.
+# ralph.sh — v0.25.0: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -36,6 +36,9 @@
 #   PARENT_MODEL/PARENT_PROVIDER  override the PARENT's (ralph's) model only
 #                (e.g. child on a big local model, parent on a fast/cloud one)
 #   DEADLINE       ISO | "HH:MM" | epoch     (default: now + MAX_HOURS)
+#   RUNTIME        relative deadline — bare minutes (90) or a duration
+#                (45s/90m/2h/1h30m/1d); deadline = now + RUNTIME.
+#                If both DEADLINE and RUNTIME are set, DEADLINE (absolute) wins.
 #   MAX_HOURS      deadline horizon          (default: 12)
 #   PREAMBLE       child preamble text       (default: standard)
 #   IDLE_TIMEOUT   guard idle timeout, sec   (default: 300)
@@ -48,6 +51,7 @@
 # FLAGS (v0.19.3 — accepted anywhere in the argument list, in any mode;
 # they map onto the env vars above, so FLAGS WIN OVER ENV):
 #   --deadline <ISO|HH:MM|epoch>    = DEADLINE
+#   --runtime <duration>            = RUNTIME (relative: 90 = 90min, or 45s/90m/2h/1h30m)
 #   --child-model <spec>            = CHILD_MODEL   (the child's model)
 #   --parent-model <spec>           = PARENT_MODEL  (ralph's judgment model)
 # Both `--flag value` and `--flag=value` forms work.
@@ -147,10 +151,10 @@ banner() { # $1=mode: launch|attach — uses RUN_DIR, DEADLINE_EPOCH, PROJECT_DI
   } >&2; }
 
 # ------------------------------------------------------------- CLI flags
-# The three most-used knobs as flags, parseable BEFORE mode dispatch so they
-# work in normal (zero-arg) mode: --deadline / --child-model / --parent-model.
-# They set the same variables the rest of the script reads (DEADLINE,
-# CHILD_MODEL, PARENT_MODEL) → flags win over env, by construction. Accepted
+# The four most-used knobs as flags, parseable BEFORE mode dispatch so they
+# work in normal (zero-arg) mode: --deadline / --runtime / --child-model /
+# --parent-model. They set the same variables the rest of the script reads
+# (DEADLINE, RUNTIME, CHILD_MODEL, PARENT_MODEL) → flags win over env, by construction. Accepted
 # anywhere in the arg list; positional args (run-dir, stop, --harvest, …) are
 # preserved in order for mode dispatch below.
 _cli_pos=()
@@ -158,6 +162,8 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --deadline)        [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --deadline needs a value"; exit 2; }; DEADLINE=$2; shift 2 ;;
     --deadline=*)      DEADLINE=${1#*=}; shift ;;
+    --runtime)         [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --runtime needs a value"; exit 2; }; RUNTIME=$2; shift 2 ;;
+    --runtime=*)       RUNTIME=${1#*=}; shift ;;
     --child-model)     [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --child-model needs a value"; exit 2; }; CHILD_MODEL=$2; shift 2 ;;
     --child-model=*)   CHILD_MODEL=${1#*=}; shift ;;
     --parent-model)    [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --parent-model needs a value"; exit 2; }; PARENT_MODEL=$2; shift 2 ;;
@@ -171,8 +177,9 @@ ralph.sh — supervised pi child (ralph loop). Zero-arg pipeline:
   ralph.sh --harvest <run-dir> [dest-dir]       harvest (re-runnable)
   ralph.sh -h | --help         this help
 normal-mode flags (anywhere in the arg list): --deadline <ISO|HH:MM|epoch>
+  --runtime <duration>    relative deadline: 90 = 90min, or 45s/90m/2h/1h30m
   --child-model <spec>  --parent-model <spec>    (--flag value and --flag=value)
-environment: PI TASK_FILE RUNS_DIR DEADLINE MAX_HOURS MODEL PROVIDER
+environment: PI TASK_FILE RUNS_DIR DEADLINE RUNTIME MAX_HOURS MODEL PROVIDER
   CHILD_MODEL CHILD_PROVIDER PARENT_MODEL PARENT_PROVIDER PREAMBLE IDLE_TIMEOUT TURN_STALL_SEC FINALIZE
   CYCLE_SEC TIMEOUT_SEC MAX_INTERVENTIONS STUCK_SEC STALE_SEC LLM_FAIL_MAX
   PROMPT_FILE SESSION LOG_FILE
@@ -184,9 +191,29 @@ USAGE
 done
 if [ ${#_cli_pos[@]} -gt 0 ]; then set -- "${_cli_pos[@]}"; else set --; fi
 
+dur_sec() { # $1: 90 | 45s | 90m | 2h | 1d | 1h30m → seconds (a bare number = minutes)
+  local s="$1" total
+  if [[ "$s" =~ ^[0-9]+$ ]]; then [ "$s" -gt 0 ] || return 1; echo $(( s * 60 )); return 0; fi
+  [[ "$s" =~ ^([0-9]+d)?([0-9]+h)?([0-9]+m)?([0-9]+s)?$ ]] || return 1
+  local d="${BASH_REMATCH[1]%%d*}" h="${BASH_REMATCH[2]%%h*}" m="${BASH_REMATCH[3]%%m*}" sec="${BASH_REMATCH[4]%%s*}"
+  total=$(( ${d:-0} * 86400 + ${h:-0} * 3600 + ${m:-0} * 60 + ${sec:-0} ))
+  [ "$total" -gt 0 ] || return 1
+  echo "$total"
+}
 DEADLINE_RAW="${DEADLINE:-}"
+RUNTIME_RAW="${RUNTIME:-}"
+DEADLINE_USER_SET=0   # --deadline or --runtime given (env or flag) → do NOT adopt a run's stored deadline
+[ -n "$DEADLINE_RAW" ] && DEADLINE_USER_SET=1
+[ -n "$RUNTIME_RAW" ] && DEADLINE_USER_SET=1
+if [ -n "$DEADLINE_RAW" ] && [ -n "$RUNTIME_RAW" ]; then
+  saye "${C_Y}!${C_N} both --deadline and --runtime given — --deadline (absolute) wins"
+fi
 if [ -n "$DEADLINE_RAW" ]; then
   DEADLINE_EPOCH="$DEADLINE_RAW"   # ISO | "HH:MM" | epoch — launch.mjs and ralph-monitor both accept all three
+elif [ -n "$RUNTIME_RAW" ]; then
+  RUNTIME_SEC="$(dur_sec "$RUNTIME_RAW")" \
+    || { saye "${C_R}✗${C_N} bad --runtime \"${RUNTIME_RAW}\" — use bare minutes (90) or a duration (45s/90m/2h/1h30m)"; exit 2; }
+  DEADLINE_EPOCH=$(( $(date +%s) + RUNTIME_SEC ))   # relative → absolute now; epoch is accepted everywhere downstream
 else
   DEADLINE_EPOCH=$(( $(date +%s) + ${MAX_HOURS:-12} * 3600 ))
 fi
@@ -315,9 +342,12 @@ ATTACHED=0
 if [ $# -ge 1 ]; then
   ATTACHED=1
   RUN_DIR=$1; shift
-  # display: adopt the run's own deadline from its status file if the user gave none
-  # (so the banner shows it AND the monitor is told the run's real deadline)
-  if [ -z "${DEADLINE_EPOCH:-}" ] && [ -f "$RUN_DIR/pi-child-status.json" ]; then
+  # display: adopt the run's own deadline from its status file if the user gave
+  # neither --deadline nor --runtime (so the banner shows it AND the monitor is
+  # told the run's real deadline). DEADLINE_EPOCH can't be the test — it is
+  # ALWAYS set by then (defaulted to now+MAX_HOURS), which made this check
+  # dead code; v0.25.0 tests the real thing.
+  if [ "$DEADLINE_USER_SET" -eq 0 ] && [ -f "$RUN_DIR/pi-child-status.json" ]; then
     DEADLINE_EPOCH="$(node -e "try{const j=JSON.parse(require('fs').readFileSync(process.argv[1],'utf8'));if(j.deadlineIso)process.stdout.write(String(Math.floor(new Date(j.deadlineIso).getTime()/1000)))}catch{}" "$RUN_DIR/pi-child-status.json" 2>/dev/null || true)"
   fi
   if [ -n "${PROJECT_DIR:-}" ]; then ralph_flags+=(--project-dir "$PROJECT_DIR"); fi
@@ -404,7 +434,7 @@ if [ "$ATTACHED" -eq 0 ]; then
     fi
   else
     # attach to a live run: honor the run's own deadline unless the user overrode it
-    if [ -z "$DEADLINE_RAW" ]; then
+    if [ "$DEADLINE_USER_SET" -eq 0 ]; then
       iso=$(status_field "$RUN_DIR/pi-child-status.json" deadlineIso)
       [ -n "$iso" ] && DEADLINE_EPOCH="$iso"
     fi
