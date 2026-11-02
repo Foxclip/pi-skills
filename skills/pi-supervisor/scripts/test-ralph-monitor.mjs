@@ -32,6 +32,7 @@
 //   R30 child lines: baseline + per tool call + per minute while quiet (v0.25.5/7)
 //   R31 child finalizing label once the child's own deadline passed (v0.25.6/7)
 //   R32 ralph.sh flags: --task <path> + --cycle <duration> (v0.25.9)
+//   R33 Ctrl+C in the ralph terminal stops the WHOLE run (v0.25.10)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -108,6 +109,11 @@ const p = process.argv[process.argv.length - 1];
 appendFileSync(process.env.RM_INV_LOG || "/dev/null", (p.includes("final report writer") ? "REPORT" : "JUDGE") + "\\n");
 console.log("thinking about the child's progress...");
 console.log("DECISION: OK");`);
+// R33: a `pi` that stays alive (child = sleeps; parent judgment = the same
+// sleep, which is exactly what we want to prove the Ctrl+C handler kills).
+const STUB_LIVE = mkStub("pi-live.mjs", `
+import { spawnSync } from "node:child_process";
+spawnSync("sleep", ["300"]);`);
 const runDir = (name) => { const d = path.join(root, name); mkdirSync(d, { recursive: true }); return d; };
 const rmArgs = (d, stub, extra = []) => [
   path.join(HERE, "ralph-monitor.mjs"),
@@ -785,6 +791,34 @@ const waitExit = (p, ms) => new Promise((resolve) => {
     && /cycle every 2h 30m/.test(out)
     && /--cycle-sec 9000/.test(monCmd),
     `rc=${rc32} taskFile=${la ? la.taskFile : "n/a"} banner2h30m=${/cycle every 2h 30m/.test(out)} monitor9000=${/--cycle-sec 9000/.test(monCmd)} monCmd=${(monCmd.trim().split("\n")[0] || "").slice(0, 120)}`);
+}
+
+// R33 Ctrl+C (v0.25.10): SIGINT to ralph.sh stops the monitor AND the detached
+// guard + child, then the usual harvest (RUN-REPORT.md) — rc 130
+{
+  const proj = path.join(root, "p33"); mkdirSync(proj, { recursive: true });
+  writeFileSync(path.join(proj, "TASK.md"), "# T33");
+  const dl = String(Math.floor(Date.now() / 1000) + 7200);
+  const logf = path.join(root, "r33.log");
+  const child = spawn("bash", [SBX_RALPH], {
+    cwd: proj, stdio: ["ignore", "ignore", openSync(logf, "w")],
+    env: { ...process.env, PI: STUB_LIVE, DEADLINE: dl, CHILD_MODEL: "cm-e2e", PARENT_MODEL: "pm-e2e" } });
+  await sleepMs(4000);   // child launched, monitor in its (stuck) first judgment
+  const rd = path.join(proj, ".pi-supervisor", "runs", "run1");
+  let st = {};
+  try { st = JSON.parse(readFileSync(path.join(rd, "pi-child-status.json"), "utf8")); } catch {}
+  child.kill("SIGINT");            // = the user's Ctrl+C (to ralph.sh)
+  const rc33 = await waitExit(child, 20000);
+  await sleepMs(1000);             // let stop.mjs's kills + harvest settle
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const guardDead = !alive(st.guardPid);
+  const monLeft = spawnSync("pgrep", ["-f", `ralph-monitor\\.mjs --run-dir ${rd}`], { encoding: "utf8" }).stdout.trim();
+  const out = readFileSync(logf, "utf8");
+  report("R33 Ctrl+C stops the whole run: rc=130, monitor + guard + child dead, harvested",
+    rc33 === 130 && guardDead && monLeft === ""
+    && existsSync(path.join(rd, "RUN-REPORT.md"))
+    && /stopping the run/.test(out),
+    `rc=${rc33} guard=${st.guardPid ?? "?"} guardDead=${guardDead} monitorLeft=${monLeft ? "YES" : "no"} report=${existsSync(path.join(rd, "RUN-REPORT.md"))}`);
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.25.9: run a supervised child with zero arguments.
+# ralph.sh — v0.25.10: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -10,8 +10,9 @@
 #   child via launch.mjs, then runs the ralph monitor loop IN THE FOREGROUND.
 #
 #   Your terminal is the view: every ralph cycle is printed as it happens,
-#   and Ctrl+C stops the MONITOR cleanly (the child keeps running — it is
-#   detached; stop it with stop.mjs if you really want it gone).
+#   and Ctrl+C stops the WHOLE run — monitor + guard + child (graceful
+#   SIGTERM, escalating to SIGKILL — the same kill stop.mjs does), then the
+#   usual harvest.
 #
 #   When the monitor exits (success, failure, deadline, or Ctrl+C) the run
 #   dir is HARVESTED: the child transcript is copied into the run dir,
@@ -139,11 +140,8 @@ banner() { # $1=mode: launch|attach — uses RUN_DIR, DEADLINE_EPOCH, PROJECT_DI
   case "$RUN_DIR" in "$pd"/*) [ -n "$pd" ] && runrel=".pi-supervisor/runs/$(basename "$RUN_DIR")" ;; esac
   {
   local mon
-  if [ "$1" = attach ]; then
-    mon="monitoring attached run — cycle every $(human_secs "${CYCLE_SEC:-1200}") · Ctrl+C stops the monitor only (child keeps running)"
-  else
-    mon="monitoring — cycle every $(human_secs "${CYCLE_SEC:-1200}") · Ctrl+C stops the monitor only (child keeps running)"
-  fi
+  mon="monitoring — cycle every $(human_secs "${CYCLE_SEC:-1200}") · Ctrl+C stops the whole run (monitor + guard + child)"
+  if [ "$1" = attach ]; then mon="monitoring attached run — cycle every $(human_secs "${CYCLE_SEC:-1200}") · Ctrl+C stops the whole run (monitor + guard + child)"; fi
   printf '%s┌ ralph%s %s\n' "$C_B" "$C_N" "$(rule)"
   printf '│ project   %s\n' "$( [ -n "$pd" ] && basename "$pd" || echo unknown )"
   printf '│ run       %s\n' "$runrel"
@@ -471,8 +469,25 @@ on_exit() {
   fi
 }
 trap on_exit EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+# v0.25.10: Ctrl+C / SIGTERM stop the WHOLE run — the monitor (kill below),
+# then the detached guard + child (stop.mjs — the same graceful SIGTERM →
+# SIGKILL group kill `ralph.sh stop` uses), then the EXIT harvest. Before
+# v0.25.10 only the monitor died and the child kept running.
+MON_PID=""
+stop_for_signal() { # $1 = exit code (130 INT / 143 TERM)
+  trap '' INT TERM                        # a second Ctrl+C during the stop: ignored
+  if [ -n "$MON_PID" ]; then
+    kill -TERM "$MON_PID" 2>/dev/null || true
+    wait "$MON_PID" 2>/dev/null || true   # reap it
+  fi
+  if [ -n "${RUN_DIR:-}" ] && [ -f "$RUN_DIR/pi-child-status.json" ]; then
+    saye "${C_Y}!${C_N} stopping the run — guard + child (graceful, escalating to SIGKILL)"
+    node "$HERE/stop.mjs" --out-dir "$RUN_DIR" || true
+  fi
+  exit "$1"
+}
+trap 'stop_for_signal 130' INT
+trap 'stop_for_signal 143' TERM
 
 # launch mode printed its banner at launch; attach mode prints it here
 if [ "${RALPH_MODE:-launch}" = "attach" ]; then
@@ -480,9 +495,17 @@ if [ "${RALPH_MODE:-launch}" = "attach" ]; then
   banner attach
 fi
 rc=0
-node "$HERE/ralph-monitor.mjs" "${MONITOR_ARGS[@]}" || rc=$?
+# the monitor runs in the background and ralph.sh waits on it: a trapped
+# Ctrl+C interrupts the wait (a trapped signal makes `wait` return 128+sig),
+# so stop_for_signal fires even if the monitor itself is busy — and the
+# handler can kill the monitor by PID. (A plain foreground `node` would defer
+# the trap until the monitor exited on its own.)
+node "$HERE/ralph-monitor.mjs" "${MONITOR_ARGS[@]}" &
+MON_PID=$!
+wait "$MON_PID" 2>/dev/null || rc=$?
 # the parent's final report (v0.20.0 — written by the monitor on completion or
-# parent-stop; absent otherwise, e.g. Ctrl+C with a still-live child)
+# parent-stop; absent otherwise, e.g. Ctrl+C — the child is stopped before the
+# parent can summarize)
 if [ -f "$RUN_DIR/FINAL-REPORT.md" ]; then
   printf '%s┌ final report (parent)%s %s\n' "$C_B" "$C_N" "$(rule)" >&2
   while IFS= read -r line; do printf '│ %s\n' "$line" >&2; done < "$RUN_DIR/FINAL-REPORT.md"
