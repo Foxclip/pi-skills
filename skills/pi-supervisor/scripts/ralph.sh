@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.25.10: run a supervised child with zero arguments.
+# ralph.sh — v0.25.11: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -266,6 +266,30 @@ harvest() { # $1=run-dir $2=interrupted(0|1) $3=monitor exit code (best effort)
   node "$HERE/lib/harvest.mjs" "$1" "$2" "$3" || true
 }
 
+# v0.25.11: stop a run and print ONE human line. stop.mjs still prints its
+# full JSON result (consumed here, kept for the exit code) — the raw blob
+# drowned the terminal, and the paths it carries are already on the lines
+# before and after. Digest: outcome, how, and whether guard + child are
+# confirmed dead.
+stop_and_report() { # $1=run-dir; remaining args → stop.mjs (e.g. --force)
+  local d="$1"; shift
+  local out rc=0 line
+  out=$(node "$HERE/stop.mjs" --out-dir "$d" "$@" 2>/dev/null) || rc=$?
+  line=$(STOP_JSON="$out" STOP_RC="$rc" node -e '
+    const rc = Number(process.env.STOP_RC);
+    let j = {}; try { j = JSON.parse(process.env.STOP_JSON || "{}"); } catch {}
+    const t = ((j.elapsedMs || 0) / 1000).toFixed(1) + "s";
+    const dead = (v) => (v === true ? "confirmed dead" : v === false ? "STILL ALIVE" : "unknown");
+    if (rc !== 0) console.log(`stop failed (exit ${rc})${j.reason ? " — " + j.reason : ""}`);
+    else if (j.stoppedVia === "already-dead") console.log(`already stopped — guard ${j.guardPid} not running`);
+    else if (j.stopped) console.log(`stopped in ${t} via ${j.signal || "?"} — guard: ${dead(j.confirmedDead && j.confirmedDead.guard)}, child: ${dead(j.confirmedDead && j.confirmedDead.child)}`);
+    else console.log(j.reason || "nothing to stop");
+  ' 2>/dev/null) || line="stop.mjs produced no summary"
+  if [ "$rc" -eq 0 ]; then saye "${C_D}·${C_N} $line"
+  else saye "${C_R}✗${C_N} $line"; fi
+  return $rc
+}
+
 # ------------------------------------------------------------- --harvest
 if [ "${1:-}" = "--harvest" ]; then
   SRC="${2:-}"; DEST="${3:-}"
@@ -309,7 +333,7 @@ if [ "${1:-}" = "stop" ]; then
       return 0
     fi
     saye "${C_D}·${C_N} stopping $d"
-    node "$HERE/stop.mjs" --out-dir "$d" "${STOP_ARGS[@]}" || rc=$?
+    stop_and_report "$d" "${STOP_ARGS[@]}" || rc=$?
     node "$HERE/lib/harvest.mjs" "$d" 0 "$rc" 2>/dev/null || true
     saye "${C_G}✓${C_N} preserved — report: $d/RUN-REPORT.md"
     return $rc
@@ -482,7 +506,7 @@ stop_for_signal() { # $1 = exit code (130 INT / 143 TERM)
   fi
   if [ -n "${RUN_DIR:-}" ] && [ -f "$RUN_DIR/pi-child-status.json" ]; then
     saye "${C_Y}!${C_N} stopping the run — guard + child (graceful, escalating to SIGKILL)"
-    node "$HERE/stop.mjs" --out-dir "$RUN_DIR" || true
+    stop_and_report "$RUN_DIR" || true
   fi
   exit "$1"
 }

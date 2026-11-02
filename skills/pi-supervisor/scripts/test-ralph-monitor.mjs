@@ -32,7 +32,8 @@
 //   R30 child lines: baseline + per tool call + per minute while quiet (v0.25.5/7)
 //   R31 child finalizing label once the child's own deadline passed (v0.25.6/7)
 //   R32 ralph.sh flags: --task <path> + --cycle <duration> (v0.25.9)
-//   R33 Ctrl+C in the ralph terminal stops the WHOLE run (v0.25.10)
+//   R33 Ctrl+C in the ralph terminal stops the WHOLE run (v0.25.10/11 —
+//       human stop digest line, no raw JSON)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -817,8 +818,10 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   report("R33 Ctrl+C stops the whole run: rc=130, monitor + guard + child dead, harvested",
     rc33 === 130 && guardDead && monLeft === ""
     && existsSync(path.join(rd, "RUN-REPORT.md"))
-    && /stopping the run/.test(out),
-    `rc=${rc33} guard=${st.guardPid ?? "?"} guardDead=${guardDead} monitorLeft=${monLeft ? "YES" : "no"} report=${existsSync(path.join(rd, "RUN-REPORT.md"))}`);
+    && /stopping the run/.test(out)
+    && /stopped in [\d.]+s via SIGTERM — guard: confirmed dead, child: confirmed dead/.test(out)
+    && !out.includes('"guardPid"'),   // the raw stop.mjs JSON is gone (v0.25.11)
+    `rc=${rc33} guard=${st.guardPid ?? "?"} guardDead=${guardDead} monitorLeft=${monLeft ? "YES" : "no"} report=${existsSync(path.join(rd, "RUN-REPORT.md"))} digest=${/stopped in [\d.]+s/.test(out)}`);
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);
