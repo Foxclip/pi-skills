@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.24.2: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.24.3: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -374,7 +374,8 @@ async function writeFinalReport(reason) {
   args.push(prompt);
   let r;
   try {
-    r = await runCmd(A.pi, args, A.timeoutSec * 1000);
+    const stopHb = heartbeat("final report — parent summarizing");   // v0.24.3
+    try { r = await runCmd(A.pi, args, A.timeoutSec * 1000); } finally { stopHb(); }
   } catch (e) {
     glog("✗", 31, `final-report: FAILED (${e.message}) — skipping`);
     return null;
@@ -415,6 +416,28 @@ async function deliverNudge(msg) {
 // call (v0.24.2). The LLM judgment still only runs every --cycle-sec.
 const POLL_SEC = 5;
 let lastJudgment = 0; // 0 = judgment due immediately
+// v0.24.3: heartbeats for the waits where the loop BLOCKS on a long LLM call —
+// without them the terminal goes silent for the whole call (run8: 8 minutes
+// between '… asking parent for judgment…' and '✓ cycle 1 · OK', because the
+// beat lines stop while the loop is blocked in llmDecide). One dim `…` line
+// per RM_HEARTBEAT_SEC (default 60s) with the elapsed wait + the child's live
+// state, read fresh from disk on every tick. Returns a stop function.
+const HEARTBEAT_SEC = Math.max(1, Number(process.env.RM_HEARTBEAT_SEC) || 60);
+const heartbeat = (label) => {
+  const startedAt = Date.now();
+  const iv = setInterval(() => {
+    const el = Math.round((Date.now() - startedAt) / 1000);
+    const s = readStatus();
+    const tc = s && Number.isFinite(Number(s.toolCalls)) ? ` · ${s.toolCalls} tool calls` : "";
+    const last = s && s.lastTool ? ` · last: ${s.lastTool}` : "";
+    const child = s ? ` · child ${s.status}${tc}${last}` : "";
+    const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
+    tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${label}${C(0)}${C(2)} · ${el}s${child}${left}${C(0)}`);
+  }, HEARTBEAT_SEC * 1000);
+  iv.unref?.();
+  return () => clearInterval(iv);
+};
+let finalWaitAnnounced = false;   // v0.24.3: announce the finalization wait once
 // v0.23.0: one stop path for all pre-check stops. The parent's final report
 // also runs on deadline/stuck endings — that is exactly when the user needs
 // the "what happened" answer, and the child is terminal here, so the model
@@ -431,6 +454,13 @@ for (;;) {
   const status = readStatus();
   const pc = preCheck(status);
   if (pc.stop) await stopLoop(pc);
+  // v0.24.3: the grace-bounded finalization wait (deadline passed, child still
+  // finishing its turn) was the last silent stretch — announce entry once; the
+  // 60s child beats keep the wait visible until it ends.
+  if (pc.waiting === "child-finalizing" && !finalWaitAnnounced) {
+    finalWaitAnnounced = true;
+    glog("…", 36, `deadline reached — waiting for the child to finalize (grace ${A.finalizeGraceSec}s)`);
+  }
   if (status && status.status === "running") beatMaybe(status);
   const nowMs = Date.now();
   if (nowMs - lastJudgment < A.cycleSec * 1000 - 500) {
@@ -447,6 +477,7 @@ for (;;) {
     if (A.once) process.exit(0);
   } else {
     ask(`cycle ${state.cycles} — asking parent for judgment…`);
+    const stopHb = heartbeat(`cycle ${state.cycles} — parent judging`);   // v0.24.3
     // v0.23.0: race the judgment against the deadline — see runCmdTracked.
     let watcherDone = false;
     const watcher = (async () => {
@@ -458,6 +489,7 @@ for (;;) {
     })();
     const raced = await Promise.race([llmDecide(), watcher]);
     watcherDone = true;
+    stopHb();
     if (raced === "deadline") {
       if (judgmentProc) { try { judgmentProc.kill("SIGKILL"); } catch { /* best effort */ } }
       glog("!", 33, `cycle=${state.cycles} deadline passed while asking parent — judgment killed, handing off to the pre-checks`);

@@ -22,6 +22,7 @@
 //   R14 dry-run --once                        → no LLM call, exit 0
 //   R15 llm-down (llmFailMax hit, continuous) → exit 4
 //   R23 child heartbeat fires on every toolCalls CHANGE (5s poll; 60s fallback)
+//   R24 heartbeat while a judgment is in flight (RM_HEARTBEAT_SEC knob)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -296,6 +297,26 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
     && beats.some((l) => /9 tool calls/.test(l))
     && beats.length <= 3,
     `beats=${beats.length} ${beats.map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 220)}`);
+}
+
+// ---- R24: heartbeat while a judgment is in flight (v0.24.3) — the loop
+// BLOCKS in the LLM call, so without this the terminal goes silent for the
+// whole judgment (run8: 8 minutes). RM_HEARTBEAT_SEC=2 → ticks at ~2s.
+{
+  const d = runDir("r24");
+  mkStatus(d);
+  const child = spawn(NODE, rmArgs(d, STUB_SLOW, ["--cycle-sec", "1000"]), {
+    stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, RM_HEARTBEAT_SEC: "2" },
+  });
+  let err = "";
+  child.stderr.on("data", (x) => { err += x; });
+  await waitMs(8000);               // stub judgment takes ~4s; ticks at ~2s, ~4s
+  child.kill("SIGINT");
+  await new Promise((r) => child.on("exit", r));
+  const hb = err.split("\n").filter((l) => /… cycle 1 — parent judging · \d+s/.test(l));
+  report("R24 heartbeat while a judgment is in flight (with child state)",
+    hb.length >= 1 && /· child running/.test(hb[0]),
+    `hb=${hb.length} ${hb.map((l) => l.trim().slice(0, 90)).join(" | ").slice(0, 220)}`);
 }
 
 // ---- R13: llm-failed cycles in continuous mode → loop survives and recovers
