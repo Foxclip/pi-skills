@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.25.4: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.25.5: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -155,6 +155,16 @@ const ask = (msg) => tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}�
 // v0.24.2: the line fires on every toolCalls CHANGE (not every poll) — with
 // the 5s poll a new tool call shows up within ~5s — plus a 60s fallback so
 // the terminal still proves the child is alive between tool calls (thinking).
+// v0.25.5: TWO message types (was one line shape for both):
+//   (A) per tool call — toolCalls GREW since the last poll → line shows the
+//       tool (· last: X). The monitor only sees count snapshots at 5s
+//       granularity — two calls in one poll gap = one line, final count.
+//   (B) per minute AFTER the last tool call — child alive but quiet: fires
+//       QUIET_SEC (default 60s) after the last tool call, then every
+//       QUIET_SEC while still quiet, with the idle duration
+//       (· no new tool call for 1m 5s). The anchor is the last TOOL CALL,
+//       not the last line: an active child gets one line per tool call and
+//       nothing else; a quiet child gets exactly one line per minute.
 const humanLeft = (ms) => {
   let s = Math.max(0, Math.round(ms / 1000));
   const h = Math.floor(s / 3600); s -= h * 3600;
@@ -167,17 +177,40 @@ const beat = (s) => {
   const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
   tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${s.status}${C(0)}${C(2)} · ${tc} tool call${tc === 1 ? "" : "s"}${last}${left}${C(0)}`);
 };
-// v0.24.2: change-driven beats — print when toolCalls CHANGES, or at least
-// once a minute (the "still alive, thinking" proof). First poll always beats.
-let lastBeat = { tc: null, at: 0 };
+// v0.25.5: (B) the quiet line — same shape as (A) plus the idle duration.
+const beatQuiet = (s, idleMs) => {
+  const tc = Number(s.toolCalls) || 0;
+  const last = s.lastTool ? ` · last: ${s.lastTool}` : "";
+  const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
+  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${s.status}${C(0)}${C(2)} · ${tc} tool call${tc === 1 ? "" : "s"} · no new tool call for ${humanLeft(idleMs)}${last}${left}${C(0)}`);
+};
+// The first poll prints the baseline line and anchors the quiet timer to the
+// child's own data when available (attach: real idle, not 0).
+const QUIET_SEC = Math.max(1, Number(process.env.RM_QUIET_SEC) || 60);
+let seen = { tc: null, lastToolAt: 0, lastQuiet: 0 };
 const beatMaybe = (s) => {
   const tc = Number(s.toolCalls);
-  const changed = Number.isFinite(tc) && (lastBeat.tc === null || tc !== lastBeat.tc);
-  const overdue = Date.now() - lastBeat.at >= 60_000;
-  if (!changed && !overdue) return;
-  if (Number.isFinite(tc)) lastBeat.tc = tc;
-  lastBeat.at = Date.now();
-  beat(s);
+  if (!Number.isFinite(tc)) return;
+  const now = Date.now();
+  if (seen.tc === null) {
+    seen.tc = tc;
+    const lts = s.lastToolStartedAt ? Date.parse(s.lastToolStartedAt) : NaN;
+    seen.lastToolAt = Number.isFinite(lts) ? lts : now;
+    seen.lastQuiet = now;
+    beat(s);
+    return;
+  }
+  if (tc !== seen.tc) {                     // (A) a tool call happened
+    seen.tc = tc;
+    seen.lastToolAt = now;
+    seen.lastQuiet = now;
+    beat(s);
+    return;
+  }
+  if (now - seen.lastQuiet >= QUIET_SEC * 1000) {   // (B) quiet for a minute
+    seen.lastQuiet = now;
+    beatQuiet(s, now - seen.lastToolAt);
+  }
 };
 process.on("SIGINT", () => { glog("!", 33, "sigint: stopping"); saveState(); process.exit(130); });
 

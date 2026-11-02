@@ -29,6 +29,7 @@
 //   R27 child-deadline grace expiry → exit 4 + report, no judgments (v0.25.1)
 //   R28 LIVE view present in the rendered judgment prompt (v0.25.1)
 //   R29 child-deadline mid-judgment → judgment killed at child deadline (v0.25.2)
+//   R30 child line types: per tool call + every minute while quiet (v0.25.5)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -584,6 +585,35 @@ console.log("DECISION: OK");`);
       && /deadline: child-terminal \(completed-finalized\)/.test(log)
       && /final-report: written/.test(log) && existsSync(path.join(d, "FINAL-REPORT.md")),
     `exit=${code} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
+}
+
+// ---- R30: the two child line types (v0.25.5) — (A) per tool call, (B) every
+// minute while quiet (RM_QUIET_SEC knob). Timeline: baseline (tc=0) → quiet
+// line at ~10s → tool line (tc 0→4, anchor resets) → quiet line again.
+{
+  const d = runDir("r30");
+  mkStatus(d, { toolCalls: 0 });
+  process.env.RM_QUIET_SEC = "6";
+  const child = spawn(NODE, rmArgs(d, STUB_OK, ["--cycle-sec", "1000"]), {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let err = "";
+  child.stderr.on("data", (x) => { err += x; });
+  await waitMs(14000);            // baseline (tc=0) + one quiet line (~10s)
+  mkStatus(d, { toolCalls: 4 });  // a tool call happened
+  await waitMs(4000);             // → type-A line (tc=4)
+  await waitMs(9000);             // quiet again after the tool call → one more
+  child.kill("SIGINT");
+  await new Promise((r) => child.on("exit", r));
+  delete process.env.RM_QUIET_SEC;
+  const childLines = err.split("\n").filter((l) => /· child running · \d+ tool calls/.test(l));
+  const quiet = childLines.filter((l) => /no new tool call for \d+s/.test(l));
+  report("R30 child lines: per tool call + every minute while quiet (v0.25.5)",
+    childLines.some((l) => /0 tool calls/.test(l))
+    && childLines.some((l) => /4 tool calls/.test(l))
+    && quiet.length >= 2 && quiet.length <= 3
+    && quiet.every((l) => /no new tool call for \d+s · last: bash/.test(l)),
+    `lines=${childLines.map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 320)}`);
 }
 
 // ================= RALPH.SH integration (v0.21.0 terminal design) =================
