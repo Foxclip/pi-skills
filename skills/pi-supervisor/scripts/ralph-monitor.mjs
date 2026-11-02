@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.25.7: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.25.8: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -172,11 +172,14 @@ const ask = (msg, bright = false) => tlog(`${C(2)}[${tsLocalShort(new Date())}]$
 // turn and sent the finalize prompt.
 // v0.25.7 (run13 screenshot): ONE family, ONE format per type — the phase
 // word is the only phase-dependent text. (A) BRIGHT: `· child <phase> ·
-// tool call N: X [· L left]` (N = latest index = total count). (B) GRAY
-// (\x1b[90m — the \x1b[2m faint attribute does not render in the user's
-// terminal, so it read as bright): `· child <phase> · N tool call(s)
-// [· no new tool call for D] [· last: X] [· L left]`. The launch baseline
-// line is back (v0.25.6 removed it).
+// tool call N: X [· L left]` (N = latest index = total count). (B) GRAY —
+// `· child <phase> · N tool call(s) [· no new tool call for D] [· last: X]
+// [· L left]`. The launch baseline line is back (v0.25.6 removed it).
+// v0.25.8 (run14 screenshot): (B) is C(2) dim — the SAME grey as the other
+// status lines (the monitor's ask/beat lines; ralph.sh prints its status
+// bodies normal, which reads as the same grey). \x1b[90m bright-black is
+// NOT it: it renders DARKER than those lines in the user's terminal. No
+// new colors — C(2) or none.
 const humanLeft = (ms) => {
   let s = Math.max(0, Math.round(ms / 1000));
   const h = Math.floor(s / 3600); s -= h * 3600;
@@ -202,7 +205,8 @@ const childToolLine = (s) => {
   const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
   tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${childPhase(s)} · tool call ${tc}${tool}${C(0)}${C(2)}${left}${C(0)}`);
 };
-// (B) liveness line — GRAY (\x1b[90m): a liveness proof, not an event.
+// (B) liveness line — GRAY (C(2), the same grey as the other status lines):
+// a liveness proof, not an event.
 // bright=true is the terminal EVENT variant (stopLoop): final status, no
 // countdown — the child is terminal.
 const childLiveLine = (s, { idleMs = null, bright = false, withLeft = true } = {}) => {
@@ -210,7 +214,7 @@ const childLiveLine = (s, { idleMs = null, bright = false, withLeft = true } = {
   const idle = idleMs !== null ? ` · no new tool call for ${humanLeft(idleMs)}` : "";
   const last = s.lastTool ? ` · last: ${s.lastTool}` : "";
   const left = withLeft && deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
-  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(bright ? 1 : 90)}child ${childPhase(s)} · ${tc} tool call${tc === 1 ? "" : "s"}${idle}${last}${C(0)}${C(2)}${left}${C(0)}`);
+  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(bright ? 1 : 2)}child ${childPhase(s)} · ${tc} tool call${tc === 1 ? "" : "s"}${idle}${last}${C(0)}${C(2)}${left}${C(0)}`);
 };
 // The first poll anchors the quiet timer to the child's own data when
 // available (attach: real idle, not 0) — and v0.25.7: PRINTS the launch
