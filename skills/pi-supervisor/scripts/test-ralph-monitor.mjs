@@ -456,9 +456,14 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
     }, 300);
   });
   const log = readLog(d);
-  report("R22 deadline + child finalizing → grace wait → true state completed-finalized → exit 0 + report",
+  // v0.25.4: the child's terminal state is announced as an EVENT before the
+  // STOP line that reacts to it (R22 status: toolCalls=3, lastTool=bash).
+  const evIdx = log.search(/child completed · 3 tool calls · last: bash/);
+  const stopIdx = log.search(/pre-check STOP: deadline: child-terminal \(completed-finalized\)/);
+  report("R22 deadline + child finalizing → grace wait → true state completed-finalized → exit 0 + report (event before STOP)",
     code === 0 && /deadline: child-terminal \(completed-finalized\)/.test(log) &&
-      /final-report: written/.test(log) && existsSync(path.join(d, "FINAL-REPORT.md")),
+      /final-report: written/.test(log) && existsSync(path.join(d, "FINAL-REPORT.md"))
+      && evIdx !== -1 && stopIdx !== -1 && evIdx < stopIdx,
     `exit=${code} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
 }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.25.3: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.25.4: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -470,8 +470,12 @@ const heartbeat = (label) => {
     const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
     // v0.25.3: the parent's wait and the child's state are SEPARATE messages —
     // they used to share one line (… parent judging · 60s · child running · …).
+    // v0.25.4: the child line only while the child is RUNNING — a terminal
+    // child's state is announced once, as an EVENT, in stopLoop before the
+    // STOP line; repeating it every tick read like a late event (run11:
+    // "child completed" printed 60s AFTER the lines that reacted to it).
     tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${label}${C(0)}${C(2)} · ${el}s${left}${C(0)}`);
-    if (s) tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${s.status}${C(0)}${C(2)}${tc}${last}${C(0)}`);
+    if (s && s.status === "running") tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${s.status}${C(0)}${C(2)}${tc}${last}${C(0)}`);
   }, HEARTBEAT_SEC * 1000);
   iv.unref?.();
   return () => clearInterval(iv);
@@ -482,6 +486,18 @@ let finalWaitAnnounced = false;   // v0.24.3: announce the finalization wait onc
 // the "what happened" answer, and the child is terminal here, so the model
 // slot is free for the report (a failed report never changes the exit code).
 async function stopLoop(pc) {
+  // v0.25.4: event ordering — when the stop IS the child going terminal,
+  // announce the child's state FIRST (same shape as the child beat line):
+  // cause before reaction. (run11: the terminal state was first visible in
+  // the STOP line, then re-printed by the heartbeat 60s later.)
+  if (/child-terminal/.test(pc.reason)) {
+    const s = readStatus();
+    if (s) {
+      const tc = Number.isFinite(Number(s.toolCalls)) ? ` · ${s.toolCalls} tool calls` : "";
+      const last = s.lastTool ? ` · last: ${s.lastTool}` : "";
+      glog("·", 2, `child ${s.status}${tc}${last}`);
+    }
+  }
   glog(pc.code === 0 ? "✓" : "✗", pc.code === 0 ? 32 : 31,
     `pre-check STOP: ${pc.reason} (cycle=${state.cycles} interventions=${state.interventions})`);
   saveState();
