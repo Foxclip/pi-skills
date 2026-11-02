@@ -145,6 +145,17 @@ RC=$?
 [ "$RC" -eq 1 ] && grep -q "both --deadline and --runtime" $T/L3.log \
   && ok "L3: both flags → warning + --deadline wins (then exit 1: no TASK.md here)" || bad "L3: rc=$RC $(cat $T/L3.log)"
 
+# ---- M: --child-thinking flag → forwarded to launch.mjs (v0.25.13) ------------
+mkproj $T/projM && cd $T/projM
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK \
+  ralph.sh --runtime 10m --child-thinking off > $T/M.log 2>&1 &
+sleep 4
+MARGS=$T/projM/.pi-supervisor/runs/run1/launch-args.txt
+grep -q -- "--thinking off" "$MARGS" 2>/dev/null \
+  && ok "M: --child-thinking off reached launch.mjs" || bad "M: launch-args ($(cat "$MARGS" 2>/dev/null))"
+grep -q "think: off" $T/M.log && ok "M: banner shows the thinking level" || bad "M: banner ($(grep -m1 'models' $T/M.log))"
+stoprun $T/projM
+
 # ---- G: stale child → exit 2 -------------------------------------------------
 mkproj $T/projG
 SD=$T/projG/.pi-supervisor/runs/run1; mkdir -p $SD

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.25.12: run a supervised child with zero arguments.
+# ralph.sh — v0.25.13: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -34,6 +34,11 @@
 #   MODEL/PROVIDER   for BOTH child and parent (default: pi's default model —
 #                the safe shared config on shared local model servers)
 #   CHILD_MODEL/CHILD_PROVIDER    override the CHILD's model only
+#   CHILD_THINKING   the CHILD's thinking level (off|minimal|low|medium|high)
+#                — CLI: --child-thinking <level>. A model-spec suffix works too
+#                (--child-model provider/id:off). Needed e.g. when a thinking
+#                model loops in first-turn thinking on a task: level off makes
+#                it act. (The PARENT's thinking level is not affected.)
 #   PARENT_MODEL/PARENT_PROVIDER  override the PARENT's (ralph's) model only
 #                (e.g. child on a big local model, parent on a fast/cloud one)
 #   DEADLINE       ISO | "HH:MM" | epoch     (default: now + MAX_HOURS)
@@ -146,7 +151,8 @@ banner() { # $1=mode: launch|attach — uses RUN_DIR, DEADLINE_EPOCH, PROJECT_DI
   printf '│ project   %s\n' "$( [ -n "$pd" ] && basename "$pd" || echo unknown )"
   printf '│ run       %s\n' "$runrel"
   printf '│ deadline  %s\n' "$(human_dl "${DEADLINE_EPOCH:-}")"
-  printf '│ models    child=%s · parent=%s\n' "${CHILD_MODEL_VAL:-pi-default}" "${PARENT_MODEL_VAL:-pi-default}"
+  local _ct=""; [ -n "${CHILD_THINKING:-}" ] && _ct=" (think: ${CHILD_THINKING})"
+  printf '│ models    child=%s%s · parent=%s\n' "${CHILD_MODEL_VAL:-pi-default}" "$_ct" "${PARENT_MODEL_VAL:-pi-default}"
   printf '│ %s\n' "$mon"
   printf '└%s\n' "$(rule)"
   } >&2; }
@@ -167,6 +173,8 @@ while [ $# -gt 0 ]; do
     --runtime=*)       RUNTIME=${1#*=}; shift ;;
     --child-model)     [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --child-model needs a value"; exit 2; }; CHILD_MODEL=$2; shift 2 ;;
     --child-model=*)   CHILD_MODEL=${1#*=}; shift ;;
+    --child-thinking)  [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --child-thinking needs a value"; exit 2; }; CHILD_THINKING=$2; shift 2 ;;
+    --child-thinking=*) CHILD_THINKING=${1#*=}; shift ;;
     --parent-model)    [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --parent-model needs a value"; exit 2; }; PARENT_MODEL=$2; shift 2 ;;
     --parent-model=*)  PARENT_MODEL=${1#*=}; shift ;;
     --task)            [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --task needs a value"; exit 2; }; TASK_FILE=$2; shift 2 ;;
@@ -184,10 +192,11 @@ ralph.sh — supervised pi child (ralph loop). Zero-arg pipeline:
 normal-mode flags (anywhere in the arg list): --deadline <ISO|HH:MM|epoch>
   --runtime <duration>    relative deadline: 90 = 90min, or 45s/90m/2h/1h30m
   --child-model <spec>  --parent-model <spec>    (--flag value and --flag=value)
+  --child-thinking <level>   the CHILD's thinking level (off|minimal|low|medium|high)
   --task <path>           task file to run (default TASK.md)
   --cycle <duration>      parent's judgment period: 45s/90m/2h/2h30m (default 20m)
 environment: PI TASK_FILE RUNS_DIR DEADLINE RUNTIME MAX_HOURS MODEL PROVIDER
-  CHILD_MODEL CHILD_PROVIDER PARENT_MODEL PARENT_PROVIDER PREAMBLE IDLE_TIMEOUT TURN_STALL_SEC FINALIZE
+  CHILD_MODEL CHILD_PROVIDER CHILD_THINKING PARENT_MODEL PARENT_PROVIDER PREAMBLE IDLE_TIMEOUT TURN_STALL_SEC FINALIZE
   CYCLE_SEC TIMEOUT_SEC MAX_INTERVENTIONS STUCK_SEC STALE_SEC LLM_FAIL_MAX
   PROMPT_FILE SESSION LOG_FILE
 See the header comment in ralph.sh for the full contract.
@@ -445,6 +454,7 @@ if [ "$ATTACHED" -eq 0 ]; then
                  --finalize "${FINALIZE:-10}")
     if [ -n "$CHILD_MODEL_VAL" ];    then launch_args+=(--model "$CHILD_MODEL_VAL"); fi
     if [ -n "$CHILD_PROVIDER_VAL" ]; then launch_args+=(--provider "$CHILD_PROVIDER_VAL"); fi
+    if [ -n "${CHILD_THINKING:-}" ]; then launch_args+=(--thinking "$CHILD_THINKING"); fi
 
     RALPH_MODE=launch
     banner launch

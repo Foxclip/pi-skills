@@ -172,6 +172,9 @@ Options:
   --name <name>         Session display name (default: the session ID)
   --provider <p>        Provider for the child (default: parent session's provider)
   --model <m>           Model for the child (default: parent session's model)
+  --thinking <level>    Thinking level for the child (off|minimal|low|medium|high;
+                        default: the model's own default). A thinking model stuck
+                        in first-turn thinking acts reliably at --thinking off.
   --loop-threshold <n>  Consecutive identical tool calls that count as a loop
                         (default: 4 — fires one before the host repetition
                         guard's default abort-at-5, so the steer lands first)
@@ -283,6 +286,7 @@ let sessionDir = "";
 let sessionName = "";
 let provider = "";
 let model = "";
+let thinking = ""; // v0.25.13: child thinking level (--thinking), empty = model default
 let loopThreshold = 4;
 let maxSteers = 3;
 let maxForks = 2;
@@ -319,7 +323,7 @@ let idleTimeoutSpecified = false;
 
 const VALID_FLAGS = [
   "--task", "--task-file", "--session-id", "--session", "--no-session", "--session-dir",
-  "--name", "--provider", "--model", "--loop-threshold", "--max-steers",
+  "--name", "--provider", "--model", "--thinking", "--loop-threshold", "--max-steers",
   "--max-forks", "--max-rewinds", "--turn-stall", "--steer-msg", "--rewind-note", "--fork-note", "--consult", "--consult-file",
   "--action", "--message", "--max-errors", "--heartbeat", "--max-text",
   "--idle-timeout", "--tool-timeout", "--timeout", "--finalize", "--stagnation", "--invariant", "--invariant-interval",
@@ -340,6 +344,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--name") sessionName = argv[++i];
   else if (a === "--provider") provider = argv[++i];
   else if (a === "--model") model = argv[++i];
+  else if (a === "--thinking") thinking = argv[++i];
   else if (a === "--loop-threshold") loopThreshold = Number(argv[++i]);
   else if (a === "--max-steers") maxSteers = Number(argv[++i]);
   else if (a === "--max-forks") maxForks = Number(argv[++i]);
@@ -505,6 +510,7 @@ for (const [flag, value] of [
   ["--name", sessionName],
   ["--provider", provider],
   ["--model", model],
+  ["--thinking", thinking],
   ["--loop-threshold", loopThreshold],
   ["--max-steers", maxSteers],
   ["--max-forks", maxForks],
@@ -660,6 +666,7 @@ if (sessionName && !resumePayload) args.push("--name", sessionName);
 else if (sessionId) args.push("--name", sessionId); // auto-name = findable by ID
 if (provider) args.push("--provider", provider);
 if (model) args.push("--model", model);
+if (thinking) args.push("--thinking", thinking);
 {
   const excluded = [];
   if (!keepQuestionTool) excluded.push("ask_user_question");
@@ -1421,6 +1428,7 @@ function relayArgs(briefPath) {
   const a = ["--task-file", briefPath];
   if (provider) a.push("--provider", provider);
   if (model) a.push("--model", model);
+  if (thinking) a.push("--thinking", thinking);
   if (hardTimeoutMs > 0) {
     const remainMin = Math.max(5, Math.ceil((hardTimeoutMs - (Date.now() - startTs)) / 60000));
     a.push("--timeout", String(remainMin));
@@ -1442,6 +1450,7 @@ function writePivotManifest() {
       cwd: process.cwd(),
       provider,
       model,
+      thinking,
       startedAt: new Date(startTs).toISOString(),
       finishedAt: new Date().toISOString(),
       note: "run pivoted to a fresh-session relay; this manifest is overwritten by the relay's final manifest",

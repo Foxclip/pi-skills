@@ -309,6 +309,17 @@ run({
   expectNot: ["L1 steer", "L2 fork", "degenerate"],
 });
 
+// 6b. v0.25.13: --thinking is forwarded to the child pi's command line
+run({
+  name: "--thinking off → forwarded to the child pi",
+  args: ["task with enough length to pass the short-task warning threshold for tests", "--thinking", "off"],
+  phases: [
+    [think("planning"), ...tool("bash", { cmd: "ls" }), ...done("All done. Report written.")],
+  ],
+  expect: ["starting supervised child", "--thinking off", "\"status\":\"completed\""],
+  expectNot: ["L1 steer", "L2 fork"],
+});
+
 // 7. Stray thinking-only tail AFTER a real answer → completed (regression:
 //    2026-10-15 live test — local models end turns with stray thinking tails;
 //    that must NOT trigger the degenerate ladder)
