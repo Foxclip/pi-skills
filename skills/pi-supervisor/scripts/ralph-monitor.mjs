@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.25.6: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.25.7: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -148,7 +148,9 @@ const tick = (n, verdict, detail, reasoning) => {
 };
 // "in progress" indicator (terminal only — the log file's format is unchanged):
 // a parent LLM call can take a while, and without this the terminal looks frozen
-const ask = (msg) => tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${msg}${C(0)}`);
+// v0.25.7: bright flag — the final-report ask line is the run's end, not a
+// routine wait, and reads bright like the event lines.
+const ask = (msg, bright = false) => tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${bright ? C(1) : C(2)}${msg}${C(0)}`);
 // v0.21.2: child heartbeat — one dim line with the CHILD's live state.
 // Without it the terminal only shows the parent's judgment lines and the run
 // reads as if the parent were doing all the work.
@@ -156,21 +158,25 @@ const ask = (msg) => tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}�
 // the 5s poll a new tool call shows up within ~5s — plus a 60s fallback so
 // the terminal still proves the child is alive between tool calls (thinking).
 // v0.25.5: TWO message types (was one line shape for both):
-//   (A) per tool call — toolCalls GREW since the last poll → line shows the
-//       tool (· last: X). The monitor only sees count snapshots at 5s
-//       granularity — two calls in one poll gap = one line, final count.
-//   (B) per minute AFTER the last tool call — child alive but quiet: fires
-//       QUIET_SEC (default 60s) after the last tool call, then every
-//       QUIET_SEC while still quiet, with the idle duration
-//       (· no new tool call for 1m 5s). The anchor is the last TOOL CALL,
-//       not the last line: an active child gets one line per tool call and
-//       nothing else; a quiet child gets exactly one line per minute.
-// v0.25.6: the two types are now visually distinct — (A) is BRIGHT and names
-// the tool (`tool call N: X`, N = latest call index = total count); (B) is
-// DIM (a liveness proof, not an event). There is NO baseline line at launch
-// — the first child line is the first tool call. And "child running" becomes
-// "child finalizing" once the child's own deadline (status.deadlineIso) has
-// passed: the guard has aborted the work turn and sent the finalize prompt.
+//   (A) per tool call — toolCalls GREW since the last poll → line names the
+//       tool. The monitor only sees count snapshots at 5s granularity — two
+//       calls in one poll gap = one line, final count.
+//   (B) liveness — child alive but quiet: every QUIET_SEC (default 60s)
+//       after the last tool call, with the idle duration (· no new tool call
+//       for 1m 5s). The anchor is the last TOOL CALL, not the last line: an
+//       active child gets one line per tool call and nothing else; a quiet
+//       child gets exactly one line per minute. The heartbeat child line
+//       (judgment/final-report waits) and the launch baseline are type (B).
+// v0.25.6: "child running" becomes "child finalizing" once the child's own
+// deadline (status.deadlineIso) has passed: the guard has aborted the work
+// turn and sent the finalize prompt.
+// v0.25.7 (run13 screenshot): ONE family, ONE format per type — the phase
+// word is the only phase-dependent text. (A) BRIGHT: `· child <phase> ·
+// tool call N: X [· L left]` (N = latest index = total count). (B) GRAY
+// (\x1b[90m — the \x1b[2m faint attribute does not render in the user's
+// terminal, so it read as bright): `· child <phase> · N tool call(s)
+// [· no new tool call for D] [· last: X] [· L left]`. The launch baseline
+// line is back (v0.25.6 removed it).
 const humanLeft = (ms) => {
   let s = Math.max(0, Math.round(ms / 1000));
   const h = Math.floor(s / 3600); s -= h * 3600;
@@ -190,22 +196,25 @@ const childPhase = (s) => {
 // (A) per tool call — BRIGHT, and the tool name IS the message: "tool call
 // N" is the latest call's index = the total count (5s snapshots: calls inside
 // one poll gap show as one line with the final count).
-const beat = (s) => {
+const childToolLine = (s) => {
   const tc = Number(s.toolCalls) || 0;
   const tool = s.lastTool ? `: ${s.lastTool}` : "";
   const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
   tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${childPhase(s)} · tool call ${tc}${tool}${C(0)}${C(2)}${left}${C(0)}`);
 };
-// (B) per minute while quiet — DIM: a liveness proof, not an event.
-const beatQuiet = (s, idleMs) => {
+// (B) liveness line — GRAY (\x1b[90m): a liveness proof, not an event.
+// bright=true is the terminal EVENT variant (stopLoop): final status, no
+// countdown — the child is terminal.
+const childLiveLine = (s, { idleMs = null, bright = false, withLeft = true } = {}) => {
   const tc = Number(s.toolCalls) || 0;
+  const idle = idleMs !== null ? ` · no new tool call for ${humanLeft(idleMs)}` : "";
   const last = s.lastTool ? ` · last: ${s.lastTool}` : "";
-  const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
-  tlog(`${C(2)}[${tsLocalShort(new Date())}] · child ${childPhase(s)} · ${tc} tool call${tc === 1 ? "" : "s"} · no new tool call for ${humanLeft(idleMs)}${last}${left}${C(0)}`);
+  const left = withLeft && deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
+  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(bright ? 1 : 90)}child ${childPhase(s)} · ${tc} tool call${tc === 1 ? "" : "s"}${idle}${last}${C(0)}${C(2)}${left}${C(0)}`);
 };
 // The first poll anchors the quiet timer to the child's own data when
-// available (attach: real idle, not 0) — v0.25.6: WITHOUT printing (no
-// baseline line; the first child line is the first tool call).
+// available (attach: real idle, not 0) — and v0.25.7: PRINTS the launch
+// baseline line (gray, count + last + left) right after "child launched".
 const QUIET_SEC = Math.max(1, Number(process.env.RM_QUIET_SEC) || 60);
 let seen = { tc: null, lastToolAt: 0, lastQuiet: 0 };
 const beatMaybe = (s) => {
@@ -217,18 +226,19 @@ const beatMaybe = (s) => {
     const lts = s.lastToolStartedAt ? Date.parse(s.lastToolStartedAt) : NaN;
     seen.lastToolAt = Number.isFinite(lts) ? lts : now;
     seen.lastQuiet = now;
+    childLiveLine(s);                       // launch baseline (gray)
     return;
   }
-  if (tc !== seen.tc) {                     // (A) a tool call happened
+  if (tc !== seen.tc) {                     // a tool call happened → bright
     seen.tc = tc;
     seen.lastToolAt = now;
     seen.lastQuiet = now;
-    beat(s);
+    childToolLine(s);
     return;
   }
-  if (now - seen.lastQuiet >= QUIET_SEC * 1000) {   // (B) quiet for a minute
+  if (now - seen.lastQuiet >= QUIET_SEC * 1000) {   // quiet for a minute → gray
     seen.lastQuiet = now;
-    beatQuiet(s, now - seen.lastToolAt);
+    childLiveLine(s, { idleMs: now - seen.lastToolAt });
   }
 };
 process.on("SIGINT", () => { glog("!", 33, "sigint: stopping"); saveState(); process.exit(130); });
@@ -450,7 +460,7 @@ Keep it under ~40 lines. Facts about the work only — no apologies, no
 meta-commentary about this report.`;
 
 async function writeFinalReport(reason) {
-  ask("final report — asking parent to summarize the run…");
+  ask("final report — asking parent to summarize the run…", true);   // v0.25.7: bright — the run's end
   const projectLine = A.projectDir
     ? `Project directory: ${A.projectDir}`
     : "Project directory: unknown (check pi-child-status.json / git in the run dir)";
@@ -517,8 +527,6 @@ const heartbeat = (label) => {
   const iv = setInterval(() => {
     const el = Math.round((Date.now() - startedAt) / 1000);
     const s = readStatus();
-    const tc = s && Number.isFinite(Number(s.toolCalls)) ? ` · ${s.toolCalls} tool calls` : "";
-    const last = s && s.lastTool ? ` · last: ${s.lastTool}` : "";
     const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
     // v0.25.3: the parent's wait and the child's state are SEPARATE messages —
     // they used to share one line (… parent judging · 60s · child running · …).
@@ -527,7 +535,14 @@ const heartbeat = (label) => {
     // STOP line; repeating it every tick read like a late event (run11:
     // "child completed" printed 60s AFTER the lines that reacted to it).
     tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${label}${C(0)}${C(2)} · ${el}s${left}${C(0)}`);
-    if (s && s.status === "running") tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${childPhase(s)}${C(0)}${C(2)}${tc}${last}${C(0)}`);
+    if (s && s.status === "running") {
+      // v0.25.7: the heartbeat child line is the SAME liveness line as the
+      // per-minute quiet line (gray, count + idle + last + left) — the old
+      // bright count-only line read as a different message (run13).
+      const lts = s.lastToolStartedAt ? Date.parse(s.lastToolStartedAt) : NaN;
+      const anchor = Number.isFinite(lts) ? lts : (seen.lastToolAt || 0);
+      childLiveLine(s, { idleMs: anchor ? Date.now() - anchor : null });
+    }
   }, HEARTBEAT_SEC * 1000);
   iv.unref?.();
   return () => clearInterval(iv);
@@ -548,10 +563,11 @@ async function stopLoop(pc) {
       const tc = Number.isFinite(Number(s.toolCalls)) ? ` · ${s.toolCalls} tool call${Number(s.toolCalls) === 1 ? "" : "s"}` : "";
       const last = s.lastTool ? ` · last: ${s.lastTool}` : "";
       // v0.25.6: glog's dim glyph attribute was leaking over the whole line,
-      // so the event read dim — the terminal text is bright now (same shape
-      // as the child lines); the FILE line is unchanged.
+      // so the event read dim. v0.25.7: the event IS the liveness line with
+      // the final status (bright, no countdown — the child is terminal);
+      // the FILE line is unchanged.
       flog(`child ${s.status}${tc}${last}`);
-      tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${s.status}${C(0)}${C(2)}${tc}${last}${C(0)}`);
+      childLiveLine(s, { bright: true, withLeft: false });
     }
   }
   glog(pc.code === 0 ? "✓" : "✗", pc.code === 0 ? 32 : 31,

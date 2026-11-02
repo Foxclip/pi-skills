@@ -21,7 +21,7 @@
 //   R13 llm-failed cycles (continuous)        → loop survives, retries, recovers
 //   R14 dry-run --once                        → no LLM call, exit 0
 //   R15 llm-down (llmFailMax hit, continuous) → exit 4
-//   R23 child heartbeat fires on every toolCalls CHANGE (5s poll; 60s fallback)
+//   R23 child lines: baseline + one per toolCalls CHANGE (5s poll, no dups)
 //   R24 heartbeat while a judgment is in flight (RM_HEARTBEAT_SEC knob;
 //       v0.25.3: child state = separate message after the parent-wait line)
 //   R25 stale-STOP veto: child progressed while judging → STOP vetoed → OK (v0.25.1)
@@ -29,8 +29,8 @@
 //   R27 child-deadline grace expiry → exit 4 + report, no judgments (v0.25.1)
 //   R28 LIVE view present in the rendered judgment prompt (v0.25.1)
 //   R29 child-deadline mid-judgment → judgment killed at child deadline (v0.25.2)
-//   R30 child line types: per tool call + every minute while quiet (v0.25.5/6)
-//   R31 child finalizing label once the child's own deadline passed (v0.25.6)
+//   R30 child lines: baseline + per tool call + per minute while quiet (v0.25.5/7)
+//   R31 child finalizing label once the child's own deadline passed (v0.25.6/7)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -299,21 +299,24 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   });
   let err = "";
   child.stderr.on("data", (x) => { err += x; });
-  await waitMs(2500);             // first poll anchors (no line, v0.25.6)
+  await waitMs(2500);             // baseline line printed (tc=0, v0.25.7)
   mkStatus(d, { toolCalls: 5 });  // "a tool call happened"
   await waitMs(6000);             // next poll (≤5s) → tool line for tc=5
   mkStatus(d, { toolCalls: 9 });  // one more
   await waitMs(6000);             // → tool line for tc=9
   child.kill("SIGINT");
   await new Promise((r) => child.on("exit", r));
-  // v0.25.6: no baseline line (tc=0 at start) — only the per-tool-call lines.
-  const beats = err.split("\n").filter((l) => /· child running · tool call \d+/.test(l));
-  report("R23 heartbeat on every toolCalls change (5s poll, no duplicates, no baseline)",
-    beats.some((l) => /tool call 5: bash/.test(l))
-    && beats.some((l) => /tool call 9: bash/.test(l))
-    && beats.length === 2
-    && !err.includes("child running · 0 tool calls"),
-    `beats=${beats.length} ${beats.map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 220)}`);
+  // v0.25.7: baseline line back (count + last + left) + one bright tool line
+  // per change. No quiet lines — the 60s window never elapses (the anchor
+  // resets on every tool line).
+  const lines = err.split("\n").filter((l) => /· child running ·/.test(l));
+  report("R23 child lines: baseline + one per toolCalls change (5s poll, no duplicates)",
+    lines.length === 3
+    && /· 0 tool calls · last: bash · \d+h \d+m left/.test(lines[0])
+    && /· tool call 5: bash · \d+h \d+m left/.test(lines[1])
+    && /· tool call 9: bash · \d+h \d+m left/.test(lines[2])
+    && !lines.some((l) => /no new tool call/.test(l)),
+    `lines=${lines.length} ${lines.map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 260)}`);
 }
 
 // ---- R24: heartbeat while a judgment is in flight (v0.24.3) — the loop
@@ -610,18 +613,20 @@ console.log("DECISION: OK");`);
   child.kill("SIGINT");
   await new Promise((r) => child.on("exit", r));
   delete process.env.RM_QUIET_SEC;
-  // v0.25.6 shapes: tool line = `· child running · tool call 4: bash`; quiet
-  // line = `· child running · N tool calls · no new tool call for …`; and the
-  // baseline line (tc=0 at start) is gone — assert its absence too.
-  const lines = err.split("\n");
-  const toolLines = lines.filter((l) => /· child running · tool call \d+: bash/.test(l));
-  const quiet = lines.filter((l) => /· child running · \d+ tool call\w* · no new tool call for \d+s/.test(l));
-  report("R30 child lines: per tool call + every minute while quiet (no baseline, v0.25.6)",
-    toolLines.length === 1 && /tool call 4: bash/.test(toolLines[0])
+  // v0.25.7 shapes: baseline = `· child running · 0 tool calls · last: bash · …left`;
+  // tool line = `· child running · tool call 4: bash · …left` (bright);
+  // quiet line = `· child running · N tool calls · no new tool call for … · last: bash · …left`.
+  const lines = err.split("\n").filter((l) => /· child running ·/.test(l));
+  const toolLines = lines.filter((l) => /· tool call 4: bash/.test(l));
+  const quiet = lines.filter((l) => /· no new tool call for \d+s/.test(l));
+  const baseline = lines.filter((l) => /· 0 tool calls · last: bash · \d+h/.test(l));
+  report("R30 child lines: baseline + per tool call + every minute while quiet (v0.25.7)",
+    baseline.length === 1 && toolLines.length === 1
     && quiet.length >= 2 && quiet.length <= 3
-    && quiet.every((l) => /no new tool call for \d+s · last: bash/.test(l))
-    && !lines.some((l) => /· child running · 0 tool calls · \d+h/.test(l)),
-    `lines=${lines.filter((l) => /child running/.test(l)).map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 320)}`);
+    && lines.length === 2 + quiet.length
+    && /0 tool calls · no new tool call for 10s · last: bash/.test(quiet[0])
+    && /4 tool calls · no new tool call for 10s · last: bash/.test(quiet[1]),
+    `lines=${lines.map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 340)}`);
 }
 
 // ---- R31: child finalizing label (v0.25.6) — the child's own deadline
@@ -644,9 +649,10 @@ console.log("DECISION: OK");`);
   child.kill("SIGINT");
   await new Promise((r) => child.on("exit", r));
   const lines = err.split("\n");
-  report("R31 child finalizing label (past deadlineIso + running) — no baseline line",
-    lines.some((l) => /· child finalizing · tool call 2: bash/.test(l))
-    && !lines.some((l) => /child running/.test(l)),
+  report("R31 child finalizing label (past deadlineIso + running) — baseline + tool line",
+    lines.some((l) => /· child running · 1 tool call · last: bash · \d+h/.test(l))
+    && lines.some((l) => /· child finalizing · tool call 2: bash · \d+h/.test(l))
+    && lines.filter((l) => /· child running ·/.test(l)).length === 1,
     `lines=${lines.filter((l) => /child (running|finalizing)/.test(l)).map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 260)}`);
 }
 
