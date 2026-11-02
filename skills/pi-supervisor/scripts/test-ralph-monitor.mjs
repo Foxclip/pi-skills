@@ -22,7 +22,8 @@
 //   R14 dry-run --once                        → no LLM call, exit 0
 //   R15 llm-down (llmFailMax hit, continuous) → exit 4
 //   R23 child heartbeat fires on every toolCalls CHANGE (5s poll; 60s fallback)
-//   R24 heartbeat while a judgment is in flight (RM_HEARTBEAT_SEC knob)
+//   R24 heartbeat while a judgment is in flight (RM_HEARTBEAT_SEC knob;
+//       v0.25.3: child state = separate message after the parent-wait line)
 //   R25 stale-STOP veto: child progressed while judging → STOP vetoed → OK (v0.25.1)
 //   R26 child past its OWN deadline, finalizing → no judgments, completed → exit 0 (v0.25.1)
 //   R27 child-deadline grace expiry → exit 4 + report, no judgments (v0.25.1)
@@ -326,10 +327,16 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   await waitMs(8000);               // stub judgment takes ~4s; ticks at ~2s, ~4s
   child.kill("SIGINT");
   await new Promise((r) => child.on("exit", r));
-  const hb = err.split("\n").filter((l) => /… cycle 1 — parent judging · \d+s/.test(l));
-  report("R24 heartbeat while a judgment is in flight (with child state)",
-    hb.length >= 1 && /· child running/.test(hb[0]),
-    `hb=${hb.length} ${hb.map((l) => l.trim().slice(0, 90)).join(" | ").slice(0, 220)}`);
+  // v0.25.3: the child state is NO LONGER on the parent-wait line — it is the
+  // SEPARATE message right after it.
+  const lines = err.split("\n");
+  const hb = lines.filter((l) => /… cycle 1 — parent judging · \d+s/.test(l));
+  let pairs = 0;
+  for (let i = 0; i < lines.length - 1; i++)
+    if (/… cycle 1 — parent judging · \d+s/.test(lines[i]) && /· child running · 3 tool calls/.test(lines[i + 1])) pairs++;
+  report("R24 heartbeat while a judgment is in flight (child state = separate message)",
+    hb.length >= 1 && pairs >= 1 && !hb.some((l) => /· child running/.test(l)),
+    `hb=${hb.length} pairs=${pairs} ${lines.filter((l) => /parent judging|· child running/.test(l)).map((l) => l.trim().slice(0, 70)).join(" | ").slice(0, 260)}`);
 }
 
 // ---- R13: llm-failed cycles in continuous mode → loop survives and recovers

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.25.2: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.25.3: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -467,9 +467,11 @@ const heartbeat = (label) => {
     const s = readStatus();
     const tc = s && Number.isFinite(Number(s.toolCalls)) ? ` · ${s.toolCalls} tool calls` : "";
     const last = s && s.lastTool ? ` · last: ${s.lastTool}` : "";
-    const child = s ? ` · child ${s.status}${tc}${last}` : "";
     const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
-    tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${label}${C(0)}${C(2)} · ${el}s${child}${left}${C(0)}`);
+    // v0.25.3: the parent's wait and the child's state are SEPARATE messages —
+    // they used to share one line (… parent judging · 60s · child running · …).
+    tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${label}${C(0)}${C(2)} · ${el}s${left}${C(0)}`);
+    if (s) tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${s.status}${C(0)}${C(2)}${tc}${last}${C(0)}`);
   }, HEARTBEAT_SEC * 1000);
   iv.unref?.();
   return () => clearInterval(iv);
