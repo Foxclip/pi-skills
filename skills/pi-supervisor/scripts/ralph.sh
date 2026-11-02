@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.25.8: run a supervised child with zero arguments.
+# ralph.sh — v0.25.9: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -54,6 +54,9 @@
 #   --runtime <duration>            = RUNTIME (relative: 90 = 90min, or 45s/90m/2h/1h30m)
 #   --child-model <spec>            = CHILD_MODEL   (the child's model)
 #   --parent-model <spec>           = PARENT_MODEL  (ralph's judgment model)
+#   --task <path>                   = TASK_FILE   (task file, any path; default TASK.md)
+#   --cycle <duration>              parent's judgment period (45s/90m/2h/1h30m/2h30m;
+#                                  default 20m; env CYCLE_SEC = bare seconds)
 # Both `--flag value` and `--flag=value` forms work.
 #
 # EVERY message this wrapper prints is timestamped `[YYYY-MM-DD HH:MM:SS.mmm]`
@@ -114,9 +117,9 @@ else C_B=""; C_D=""; C_G=""; C_Y=""; C_R=""; C_N=""; fi
 say()  { printf '[%s] %s\n' "$(ts)" "$*"; }
 saye() { printf '%s[%s]%s %s\n' "$C_D" "$(ts_s)" "$C_N" "$*" >&2; }
 sayc() { printf '%s[%s]%s     %s\n' "$C_D" "$(ts_s)" "$C_N" "$*" >&2; }   # continuation: dim, indented under the glyph column
-human_secs() { local s=${1:-0}; case "$s" in ''|*[!0-9]*) echo "${s}s"; return;; esac
-  if [ "$s" -ge 3600 ] && [ $((s % 3600)) -eq 0 ]; then echo "$((s / 3600))h";
-  elif [ "$s" -ge 60 ] && [ $((s % 60)) -eq 0 ]; then echo "$((s / 60))m";
+human_secs() { local s=${1:-0} h m r; case "$s" in ''|*[!0-9]*) echo "${s}s"; return;; esac
+  if [ "$s" -ge 3600 ]; then h=$((s / 3600)); m=$(( (s % 3600) / 60 )); [ "$m" -eq 0 ] && echo "${h}h" || echo "${h}h ${m}m";
+  elif [ "$s" -ge 60 ]; then m=$((s / 60)); r=$((s % 60)); [ "$r" -eq 0 ] && echo "${m}m" || echo "${m}m ${r}s";
   else echo "${s}s"; fi; }
 human_dl() { # $1 epoch|ISO|HH:MM → "YYYY-MM-DD HH:MM (in 11h 58m)"
   local sec now rel sign span
@@ -168,6 +171,10 @@ while [ $# -gt 0 ]; do
     --child-model=*)   CHILD_MODEL=${1#*=}; shift ;;
     --parent-model)    [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --parent-model needs a value"; exit 2; }; PARENT_MODEL=$2; shift 2 ;;
     --parent-model=*)  PARENT_MODEL=${1#*=}; shift ;;
+    --task)            [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --task needs a value"; exit 2; }; TASK_FILE=$2; shift 2 ;;
+    --task=*)          TASK_FILE=${1#*=}; shift ;;
+    --cycle)           [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --cycle needs a value"; exit 2; }; CYCLE_RAW=$2; shift 2 ;;
+    --cycle=*)         CYCLE_RAW=${1#*=}; shift ;;
     -h|--help)
       cat <<'USAGE'
 ralph.sh — supervised pi child (ralph loop). Zero-arg pipeline:
@@ -179,6 +186,8 @@ ralph.sh — supervised pi child (ralph loop). Zero-arg pipeline:
 normal-mode flags (anywhere in the arg list): --deadline <ISO|HH:MM|epoch>
   --runtime <duration>    relative deadline: 90 = 90min, or 45s/90m/2h/1h30m
   --child-model <spec>  --parent-model <spec>    (--flag value and --flag=value)
+  --task <path>           task file to run (default TASK.md)
+  --cycle <duration>      parent's judgment period: 45s/90m/2h/2h30m (default 20m)
 environment: PI TASK_FILE RUNS_DIR DEADLINE RUNTIME MAX_HOURS MODEL PROVIDER
   CHILD_MODEL CHILD_PROVIDER PARENT_MODEL PARENT_PROVIDER PREAMBLE IDLE_TIMEOUT TURN_STALL_SEC FINALIZE
   CYCLE_SEC TIMEOUT_SEC MAX_INTERVENTIONS STUCK_SEC STALE_SEC LLM_FAIL_MAX
@@ -216,6 +225,11 @@ elif [ -n "$RUNTIME_RAW" ]; then
   DEADLINE_EPOCH=$(( $(date +%s) + RUNTIME_SEC ))   # relative → absolute now; epoch is accepted everywhere downstream
 else
   DEADLINE_EPOCH=$(( $(date +%s) + ${MAX_HOURS:-12} * 3600 ))
+fi
+# --cycle: the parent's judgment period as a duration (2h30m) → CYCLE_SEC (sec)
+if [ -n "${CYCLE_RAW:-}" ]; then
+  CYCLE_SEC="$(dur_sec "$CYCLE_RAW")" \
+    || { saye "${C_R}✗${C_N} bad --cycle \"${CYCLE_RAW}\" — use a duration (45s/90m/2h/1h30m)"; exit 2; }
 fi
 
 # model selection: MODEL/PROVIDER set BOTH sides; CHILD_*/PARENT_* override one side

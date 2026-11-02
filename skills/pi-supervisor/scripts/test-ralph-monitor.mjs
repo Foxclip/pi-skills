@@ -31,6 +31,7 @@
 //   R29 child-deadline mid-judgment → judgment killed at child deadline (v0.25.2)
 //   R30 child lines: baseline + per tool call + per minute while quiet (v0.25.5/7)
 //   R31 child finalizing label once the child's own deadline passed (v0.25.6/7)
+//   R32 ralph.sh flags: --task <path> + --cycle <duration> (v0.25.9)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -670,7 +671,7 @@ import fs from "fs"; import path from "path"; import { spawn } from "child_proce
 const a = process.argv.slice(2);
 const get = (f) => { const i = a.indexOf(f); return i >= 0 ? a[i + 1] : null; };
 const out = get("--out-dir");
-fs.writeFileSync(path.join(out, "launch-args.txt"), JSON.stringify({ deadline: get("--deadline"), model: get("--model"), provider: get("--provider"), parentModel: process.env.PARENT_MODEL || null }, null, 2));
+fs.writeFileSync(path.join(out, "launch-args.txt"), JSON.stringify({ deadline: get("--deadline"), model: get("--model"), provider: get("--provider"), parentModel: process.env.PARENT_MODEL || null, taskFile: get("--task-file") }, null, 2));
 const s = spawn("sleep", ["600"], { detached: true, stdio: "ignore" }); s.unref();
 fs.writeFileSync(path.join(out, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "running", exitReason: null, guardPid: s.pid, childPid: s.pid, attempt: 1, rewinds: 0, toolCalls: 0, elapsedMs: 0, deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
 console.log(JSON.stringify({ launched: true, guardPid: s.pid }));
@@ -754,6 +755,36 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   report("R20 pty → colored banner + box + green success closer; NO_COLOR → plain",
     t.includes("\x1b[") && t.includes("┌ ralph") && greenDone && pl.includes("┌ ralph") && !pl.includes("\x1b["),
     `ttyEsc=${t.includes("\x1b[")} plainEsc=${pl.includes("\x1b[")} ttyBanner=${t.includes("┌ ralph")} plainBanner=${pl.includes("┌ ralph")} greenDone=${greenDone}`);
+}
+
+// R32 ralph.sh flags (v0.25.9): --task <path> points the child at a non-default
+// task file; --cycle <duration> sets the parent's judgment period (2h30m → --cycle-sec 9000)
+{
+  const proj = path.join(root, "p32"); mkdirSync(proj, { recursive: true });
+  writeFileSync(path.join(proj, "mytask.md"), "# T32 task");   // deliberately NOT TASK.md
+  const dl = String(Math.floor(Date.now() / 1000) + 7200);
+  const logf = path.join(root, "r32.log");
+  const child = spawn("bash", [SBX_RALPH, "--task", "mytask.md", "--cycle", "2h30m"], {
+    cwd: proj, stdio: ["ignore", "ignore", openSync(logf, "w")],
+    env: { ...process.env, PI: STUB_OK, DEADLINE: dl, CHILD_MODEL: "cm-e2e", PARENT_MODEL: "pm-e2e" } });
+  await sleepMs(4000);   // banner + launch + first cycle
+  const rd = path.join(proj, ".pi-supervisor", "runs", "run1");
+  // the monitor is in its first sleep (2h30m cycle) — its cmdline still carries the flag
+  const monCmd = spawnSync("pgrep", ["-af", `ralph-monitor\\.mjs --run-dir ${rd}`], { encoding: "utf8" }).stdout;
+  let st = { childPid: null };
+  try { st = JSON.parse(readFileSync(path.join(rd, "pi-child-status.json"), "utf8")); } catch {}
+  const monPids = spawnSync("pgrep", ["-f", `ralph-monitor\\.mjs --run-dir ${rd}`], { encoding: "utf8" }).stdout.trim();
+  for (const p of monPids.split("\n").filter(Boolean)) { try { process.kill(Number(p), "SIGTERM"); } catch {} }
+  const rc32 = await waitExit(child, 15000);
+  try { if (st.childPid) process.kill(st.childPid, "SIGKILL"); } catch {}
+  const out = readFileSync(logf, "utf8");
+  let la = null;
+  try { la = JSON.parse(readFileSync(path.join(rd, "launch-args.txt"), "utf8")); } catch {}
+  report("R32 ralph.sh flags: --task mytask.md → launch.mjs, --cycle 2h30m → --cycle-sec 9000",
+    la && la.taskFile === "mytask.md"
+    && /cycle every 2h 30m/.test(out)
+    && /--cycle-sec 9000/.test(monCmd),
+    `rc=${rc32} taskFile=${la ? la.taskFile : "n/a"} banner2h30m=${/cycle every 2h 30m/.test(out)} monitor9000=${/--cycle-sec 9000/.test(monCmd)} monCmd=${(monCmd.trim().split("\n")[0] || "").slice(0, 120)}`);
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);
