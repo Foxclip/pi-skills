@@ -167,6 +167,12 @@ out.guardPid = obj.guardPid;
 out.childPid = obj.childPid ?? null;
 
 const groupDead = () => !pidAlive(obj.guardPid) && (!obj.childPid || !pidAlive(obj.childPid));
+// v0.25.12: is the guard's process group EMPTY? groupDead() only probes pids
+// (just the guard's when childPid is null) — but a group signal is delivered
+// to every member, so an empty group proves the child (a member whose pid
+// the guard never records) is gone too.
+const groupGone = () => { try { process.kill(-obj.guardPid, 0); return false; } catch { return true; } };
+let groupSignalSent = false;
 
 if (!pidAlive(obj.guardPid)) {
   out.stopped = false;
@@ -181,6 +187,7 @@ if (!pidAlive(obj.guardPid)) {
 // --- The guard is alive. Signal its group. -----------------------------------
 if (!A.force) {
   const sent = signalGroup(obj.guardPid, A.signal);
+  if (sent === "sent-group") groupSignalSent = true;
   if (sent === "failed") process.stderr.write(`[stop] graceful group signal reported failure — will escalate\n`);
   // Poll for the group to die within the grace window.
   const gEnd = t0 + A.graceSec * 1000;
@@ -191,6 +198,7 @@ if (!A.force) {
   } else {
     // Escalate: force-kill the whole group.
     const k = signalGroup(obj.guardPid, "SIGKILL");
+    if (k === "sent-group") groupSignalSent = true;
     if (k === "failed") out.escalateNote = "SIGKILL group signal reported failure — verify manually";
     const kEnd = Date.now() + Math.min(5000, Math.max(1500, Math.round(A.graceSec * 1000 / 2)));
     while (!groupDead() && Date.now() < kEnd) await sleep(400);
@@ -199,6 +207,7 @@ if (!A.force) {
   }
 } else {
   const k = signalGroup(obj.guardPid, "SIGKILL");
+  if (k === "sent-group") groupSignalSent = true;
   if (k === "failed") out.escalateNote = "SIGKILL group signal reported failure — verify manually";
   const kEnd = Date.now() + 5000;
   while (!groupDead() && Date.now() < kEnd) await sleep(400);
@@ -214,6 +223,20 @@ out.confirmedDead = {
   guard: !pidAlive(obj.guardPid),
   child: obj.childPid ? !pidAlive(obj.childPid) : "unknown",
 };
+// v0.25.12: childPid is null because the guard cannot record it (RpcClient
+// does not expose the spawned child's pid) — but we signaled the child's own
+// process group, so confirm the child by the group being EMPTY rather than
+// reporting "unknown". (Only when a group signal actually went out: the
+// sent-proc fallback signals the guard process alone and says nothing about
+// the child.)
+if (out.confirmedDead.child === "unknown" && out.stopped && out.confirmedDead.guard && groupSignalSent) {
+  const gEnd2 = Date.now() + 2000;   // give group members a moment to exit
+  while (!groupGone() && Date.now() < gEnd2) await sleep(100);
+  if (groupGone()) {
+    out.confirmedDead.child = true;
+    out.childNote = "child pid not recorded (RpcClient does not expose it) — confirmed dead: the guard's process group is empty";
+  }
+}
 out.finalStatus = fs2;
 out.finalStatusStatus = fs2.status || null;
 out.finalStatusExitReason = fs2.exitReason || null;

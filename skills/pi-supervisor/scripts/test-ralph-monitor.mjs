@@ -34,6 +34,8 @@
 //   R32 ralph.sh flags: --task <path> + --cycle <duration> (v0.25.9)
 //   R33 Ctrl+C in the ralph terminal stops the WHOLE run (v0.25.10/11 —
 //       human stop digest line, no raw JSON)
+//   R34 stop.mjs: childPid null (real guards) + group kill → child confirmed
+//       dead via the empty process group, not "unknown" (v0.25.12)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -822,6 +824,51 @@ const waitExit = (p, ms) => new Promise((resolve) => {
     && /stopped in [\d.]+s via SIGTERM — guard: confirmed dead, child: confirmed dead/.test(out)
     && !out.includes('"guardPid"'),   // the raw stop.mjs JSON is gone (v0.25.11)
     `rc=${rc33} guard=${st.guardPid ?? "?"} guardDead=${guardDead} monitorLeft=${monLeft ? "YES" : "no"} report=${existsSync(path.join(rd, "RUN-REPORT.md"))} digest=${/stopped in [\d.]+s/.test(out)}`);
+}
+
+// R34 stop.mjs (v0.25.12): real guards write childPid: null (RpcClient does
+// not expose the child's pid). The child is a member of the guard's process
+// group, so after a group kill an EMPTY group confirms the child is dead —
+// the old code reported "unknown" for every real run. Fake guard = detached
+// bash (session + group leader, like a real guard) with sleep as a group
+// member (like the guard's pi child). Two deliberate choices:
+//  - ORPHANED: the fake is spawned by a short-lived node launcher that exits
+//    immediately (like launch.mjs does for the real guard), so a dying fake
+//    is reaped by init. If the suite's node (blocked in spawnSync on
+//    stop.mjs) were the parent, the fake would linger as a ZOMBIE — and a
+//    zombie still "exists", so pid-based death confirmation fails for a
+//    reason unrelated to the test.
+//  - SELF-EXITING (sleep 3): in a normal terminal stop.mjs's group TERM
+//    kills the fake instantly; in CI sandboxes where group signal delivery
+//    is flaky the group still empties within the 10s grace window — either
+//    way the point (empty-group child confirmation) is exercised.
+{
+  const rd = path.join(root, "r34"); mkdirSync(rd, { recursive: true });
+  const pidfile = path.join(rd, "fake.pid");
+  const launcher = spawn("node", ["-e", `import { spawn } from "node:child_process"; import { writeFileSync } from "node:fs";
+    const f = spawn("bash", ["-c", "sleep 3 & wait"], { detached: true, stdio: "ignore" }); f.unref();
+    writeFileSync(${JSON.stringify(pidfile)}, String(f.pid));`], { stdio: "ignore" });
+  launcher.unref();
+  let fakePid = 0;
+  for (let i = 0; i < 40 && !fakePid; i++) {   // wait for the launcher's pidfile
+    await sleepMs(50);
+    try { fakePid = Number(readFileSync(pidfile, "utf8")); } catch {}
+  }
+  if (!fakePid) { report("R34 stop.mjs: childPid null + group kill → child confirmed dead (group empty)", false, "launcher did not write the fake pid"); }
+  else {
+  writeFileSync(path.join(rd, "pi-child-status.json"), JSON.stringify({
+    v: 2, at: new Date().toISOString(), status: "running",
+    guardPid: fakePid, childPid: null, toolCalls: 0, elapsedMs: 0,
+  }, null, 2));
+  const r = spawnSync("node", [path.join(HERE, "stop.mjs"), "--out-dir", rd], { encoding: "utf8" });
+  let j = {};
+  try { j = JSON.parse(r.stdout); } catch {}
+  report("R34 stop.mjs: childPid null + group kill → child confirmed dead (group empty)",
+    r.status === 0 && j.stopped === true
+    && j.confirmedDead && j.confirmedDead.guard === true && j.confirmedDead.child === true
+    && /process group/.test(j.childNote || ""),
+    `rc=${r.status} stopped=${j.stopped} via=${j.stoppedVia} guard=${j.confirmedDead && j.confirmedDead.guard} child=${j.confirmedDead && j.confirmedDead.child} note=${(j.childNote || "").slice(0, 90)}`);
+  }
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);
