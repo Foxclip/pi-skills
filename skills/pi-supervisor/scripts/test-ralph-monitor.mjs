@@ -29,7 +29,8 @@
 //   R27 child-deadline grace expiry → exit 4 + report, no judgments (v0.25.1)
 //   R28 LIVE view present in the rendered judgment prompt (v0.25.1)
 //   R29 child-deadline mid-judgment → judgment killed at child deadline (v0.25.2)
-//   R30 child line types: per tool call + every minute while quiet (v0.25.5)
+//   R30 child line types: per tool call + every minute while quiet (v0.25.5/6)
+//   R31 child finalizing label once the child's own deadline passed (v0.25.6)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -298,19 +299,20 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   });
   let err = "";
   child.stderr.on("data", (x) => { err += x; });
-  await waitMs(2500);             // first beat (tc=0) printed
+  await waitMs(2500);             // first poll anchors (no line, v0.25.6)
   mkStatus(d, { toolCalls: 5 });  // "a tool call happened"
-  await waitMs(6000);             // next poll (≤5s) → beat for tc=5
+  await waitMs(6000);             // next poll (≤5s) → tool line for tc=5
   mkStatus(d, { toolCalls: 9 });  // one more
-  await waitMs(6000);             // → beat for tc=9
+  await waitMs(6000);             // → tool line for tc=9
   child.kill("SIGINT");
   await new Promise((r) => child.on("exit", r));
-  const beats = err.split("\n").filter((l) => /· child running · \d+ tool calls/.test(l));
-  report("R23 heartbeat on every toolCalls change (5s poll, no duplicates)",
-    beats.some((l) => /0 tool calls/.test(l))
-    && beats.some((l) => /5 tool calls/.test(l))
-    && beats.some((l) => /9 tool calls/.test(l))
-    && beats.length <= 3,
+  // v0.25.6: no baseline line (tc=0 at start) — only the per-tool-call lines.
+  const beats = err.split("\n").filter((l) => /· child running · tool call \d+/.test(l));
+  report("R23 heartbeat on every toolCalls change (5s poll, no duplicates, no baseline)",
+    beats.some((l) => /tool call 5: bash/.test(l))
+    && beats.some((l) => /tool call 9: bash/.test(l))
+    && beats.length === 2
+    && !err.includes("child running · 0 tool calls"),
     `beats=${beats.length} ${beats.map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 220)}`);
 }
 
@@ -415,7 +417,9 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
 {
   const d = runDir("r21");
   mkStatus(d, { status: "running" });
-  const dl = Math.floor(Date.now() / 1000) + 1; // 1s: lands inside the 12s judgment
+  // +5s (not +1s): it must land INSIDE the 12s judgment, but +1s could already
+  // be in the past before the monitor spawns + first poll (floored epoch).
+  const dl = Math.floor(Date.now() / 1000) + 5; // 5s: lands inside the 12s judgment
   const child = spawn(NODE, rmArgs(d, STUB_SLOWER, ["--deadline", String(dl), "--finalize-grace-sec", "2"]), {
     stdio: ["ignore", "ignore", "ignore"],
   });
@@ -606,14 +610,44 @@ console.log("DECISION: OK");`);
   child.kill("SIGINT");
   await new Promise((r) => child.on("exit", r));
   delete process.env.RM_QUIET_SEC;
-  const childLines = err.split("\n").filter((l) => /· child running · \d+ tool calls/.test(l));
-  const quiet = childLines.filter((l) => /no new tool call for \d+s/.test(l));
-  report("R30 child lines: per tool call + every minute while quiet (v0.25.5)",
-    childLines.some((l) => /0 tool calls/.test(l))
-    && childLines.some((l) => /4 tool calls/.test(l))
+  // v0.25.6 shapes: tool line = `· child running · tool call 4: bash`; quiet
+  // line = `· child running · N tool calls · no new tool call for …`; and the
+  // baseline line (tc=0 at start) is gone — assert its absence too.
+  const lines = err.split("\n");
+  const toolLines = lines.filter((l) => /· child running · tool call \d+: bash/.test(l));
+  const quiet = lines.filter((l) => /· child running · \d+ tool call\w* · no new tool call for \d+s/.test(l));
+  report("R30 child lines: per tool call + every minute while quiet (no baseline, v0.25.6)",
+    toolLines.length === 1 && /tool call 4: bash/.test(toolLines[0])
     && quiet.length >= 2 && quiet.length <= 3
-    && quiet.every((l) => /no new tool call for \d+s · last: bash/.test(l)),
-    `lines=${childLines.map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 320)}`);
+    && quiet.every((l) => /no new tool call for \d+s · last: bash/.test(l))
+    && !lines.some((l) => /· child running · 0 tool calls · \d+h/.test(l)),
+    `lines=${lines.filter((l) => /child running/.test(l)).map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 320)}`);
+}
+
+// ---- R31: child finalizing label (v0.25.6) — the child's own deadline
+// (status.deadlineIso, guard-written) has passed and the child is still
+// running: the guard aborted the work turn and sent the finalize prompt, so
+// the child lines say "child finalizing" instead of "child running".
+{
+  const d = runDir("r31");
+  const cd = new Date(Date.now() + 2000).toISOString();
+  mkStatus(d, { toolCalls: 1, deadlineIso: cd });
+  const child = spawn(NODE, rmArgs(d, STUB_OK, ["--cycle-sec", "1000"]), {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let err = "";
+  child.stderr.on("data", (x) => { err += x; });
+  await waitMs(4000);             // deadline passes; no tool call → no line yet
+  // deadlineIso must be passed AGAIN — mkStatus rewrites the whole file.
+  mkStatus(d, { toolCalls: 2, deadlineIso: cd });  // a tool call inside the finalize window
+  await waitMs(4000);             // → "child finalizing · tool call 2: bash"
+  child.kill("SIGINT");
+  await new Promise((r) => child.on("exit", r));
+  const lines = err.split("\n");
+  report("R31 child finalizing label (past deadlineIso + running) — no baseline line",
+    lines.some((l) => /· child finalizing · tool call 2: bash/.test(l))
+    && !lines.some((l) => /child running/.test(l)),
+    `lines=${lines.filter((l) => /child (running|finalizing)/.test(l)).map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 260)}`);
 }
 
 // ================= RALPH.SH integration (v0.21.0 terminal design) =================
@@ -673,17 +707,17 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   const shortTsOk = /\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] /.test(out);
   const epochLeak = /deadline=\d+/.test(out);
   const fileFmtOk = /\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] cycle=1/.test(mlog);
-  // v0.21.2: child heartbeat line visible; v0.24.0: harvest lines are glyphed
-  // (✓/✗/·/!) with the short ts — no more `harvest:` source prefix
-  const beatOk = /· child running · 0 tool calls · \d+h \d+m left/.test(out);
+  // v0.24.0: harvest lines are glyphed (✓/✗/·/!) with the short ts — no more
+  // `harvest:` source prefix. (v0.25.6: no beat line expected here — the stub
+  // child makes no tool calls and the baseline line is gone.)
   const hlines = out.split("\n").filter((l) => /— status=.*RUN-REPORT\.md/.test(l));
   const harvestShortOk = hlines.length > 0 && hlines.every((l) => /^\[\d{2}:\d{2}:\d{2}\] .*— status=/.test(l));
-  report("R18 ralph.sh: banner + human deadline + short-ts lines + flags→launch.mjs + ISO file format + heartbeat",
+  report("R18 ralph.sh: banner + human deadline + short-ts lines + flags→launch.mjs + ISO file format",
     out.includes("┌ ralph") && out.includes("│ project") && relDlOk
     && shortTsOk && !epochLeak && /done · exit/.test(out)
     && la && la.deadline === dl && la.model === "cm-e2e" && la.parentModel === "pm-e2e"
-    && fileFmtOk && beatOk && harvestShortOk,
-    `rc=${rc18} banner=${out.includes("┌ ralph")} relDl=${relDlOk} shortTs=${shortTsOk} epochLeak=${epochLeak} closer=${/done · exit/.test(out)} launch=${JSON.stringify(la)} fileFmt=${fileFmtOk} beat=${beatOk} harvest=${harvestShortOk}(${hlines.length})`);
+    && fileFmtOk && harvestShortOk,
+    `rc=${rc18} banner=${out.includes("┌ ralph")} relDl=${relDlOk} shortTs=${shortTsOk} epochLeak=${epochLeak} closer=${/done · exit/.test(out)} launch=${JSON.stringify(la)} fileFmt=${fileFmtOk} harvest=${harvestShortOk}(${hlines.length})`);
 }
 
 // R19 power-user attach: pre-check completed → exit 0, parent writes FINAL-REPORT.md,
