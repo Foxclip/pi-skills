@@ -452,10 +452,11 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   const shortTsOk = /\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] /.test(out);
   const epochLeak = /deadline=\d+/.test(out);
   const fileFmtOk = /\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\] cycle=1/.test(mlog);
-  // v0.21.2: child heartbeat line visible; harvest lines use the short ts too
+  // v0.21.2: child heartbeat line visible; v0.24.0: harvest lines are glyphed
+  // (✓/✗/·/!) with the short ts — no more `harvest:` source prefix
   const beatOk = /· child running · 0 tool calls · \d+h \d+m left/.test(out);
-  const hlines = out.split("\n").filter((l) => l.includes("harvest:"));
-  const harvestShortOk = hlines.length > 0 && hlines.every((l) => /^\[\d{2}:\d{2}:\d{2}\] harvest:/.test(l));
+  const hlines = out.split("\n").filter((l) => /— status=.*RUN-REPORT\.md/.test(l));
+  const harvestShortOk = hlines.length > 0 && hlines.every((l) => /^\[\d{2}:\d{2}:\d{2}\] .*— status=/.test(l));
   report("R18 ralph.sh: banner + human deadline + short-ts lines + flags→launch.mjs + ISO file format + heartbeat",
     out.includes("┌ ralph") && out.includes("│ project") && relDlOk
     && shortTsOk && !epochLeak && /done · exit/.test(out)

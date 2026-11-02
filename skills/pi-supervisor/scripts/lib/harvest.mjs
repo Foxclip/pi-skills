@@ -23,16 +23,19 @@ import path from "path";
 // matches ralph.sh's ts() — the log files keep ISO-8601 UTC)
 // terminal-facing: short local [HH:MM:SS] like the rest of the ralph terminal
 // (files stay ISO-8601 UTC); ts dimmed like the monitor's lines (same tty/NO_COLOR guard)
+// v0.24.0: glyphed status lines (· info, ! warn, ✓ success, ✗ failure) — the
+// `harvest:` source prefix is gone (the glyph language is shared with
+// ralph.sh/ralph-monitor, so the tag was redundant)
 const tty = Boolean(process.stderr.isTTY) && !process.env.NO_COLOR;
 const C = (code) => (tty ? `\x1b[${code}m` : "");
-const say = (msg) => {
+const sayG = (glyph, color, msg) => {
   const d = new Date(); const p = (n) => String(n).padStart(2, "0");
-  console.error(`${C(2)}[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]${C(0)} ${msg}`);
+  console.error(`${C(2)}[${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}]${C(0)} ${C(color)}${glyph} ${msg}${C(0)}`);
 };
 
 const [runDir, interruptedRaw = "0", rcRaw = "0"] = process.argv.slice(2);
 if (!runDir || !fs.existsSync(runDir)) {
-  say(`harvest: run dir not found: ${runDir ?? "(none)"}`);
+  sayG("✗", 31, `run dir not found: ${runDir ?? "(none)"}`);
   process.exit(0);
 }
 const interrupted = interruptedRaw === "1";
@@ -146,7 +149,7 @@ L.push("- `ralph-monitor.log` lines: `[iso] cycle=N decision=OK|NUDGE|STOP ...` 
 L.push("- `FINAL-REPORT.md` (if present) — the parent's final report: what was requested, what was done, outcome, remaining. Also printed to the terminal by ralph.sh when the run ends.");
 L.push("- The pointer file `ralph-run-dir` in the runs root and `INDEX.json` point here.");
 L.push("");
-try { fs.writeFileSync(path.join(runDir, "RUN-REPORT.md"), L.join("\n")); } catch (e) { say(`harvest: RUN-REPORT.md failed: ${e.message}`); }
+try { fs.writeFileSync(path.join(runDir, "RUN-REPORT.md"), L.join("\n")); } catch (e) { sayG("✗", 31, `RUN-REPORT.md failed: ${e.message}`); }
 
 // ---- 3. run-summary.json ----------------------------------------------------
 const summary = {
@@ -162,7 +165,7 @@ const summary = {
   files,
   pointer: path.join(runsRoot, "ralph-run-dir"),
 };
-try { fs.writeFileSync(path.join(runDir, "run-summary.json"), JSON.stringify(summary, null, 2)); } catch (e) { say(`harvest: run-summary.json failed: ${e.message}`); }
+try { fs.writeFileSync(path.join(runDir, "run-summary.json"), JSON.stringify(summary, null, 2)); } catch (e) { sayG("✗", 31, `run-summary.json failed: ${e.message}`); }
 
 // ---- 4. INDEX.json in the runs root ----------------------------------------
 let indexUpdated = false;
@@ -182,7 +185,7 @@ try {
   index.runs.sort((a, b) => a.run.localeCompare(b.run, undefined, { numeric: true }));
   fs.writeFileSync(indexPath, JSON.stringify(index, null, 2));
   indexUpdated = true;
-} catch (e) { say(`harvest: INDEX.json failed: ${e.message}`); }
+} catch (e) { sayG("✗", 31, `INDEX.json failed: ${e.message}`); }
 
-say(`harvest: ${runName} — status=${finalStatus} transcript=${transcript.copied ? transcript.lines + " lines" : "n/a"} index=${indexUpdated ? "updated" : "failed"} → ${path.join(runDir, "RUN-REPORT.md")}`);
+sayG("✓", 32, `${runName} — status=${finalStatus} transcript=${transcript.copied ? transcript.lines + " lines" : "n/a"} index=${indexUpdated ? "updated" : "failed"} → ${path.join(runDir, "RUN-REPORT.md")}`);
 process.exit(0);

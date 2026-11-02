@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.23.0: run a supervised child with zero arguments.
+# ralph.sh — v0.24.0: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -93,10 +93,14 @@ HARVEST_TARGET=""   # set once RUN_DIR is known; the EXIT trap harvests it
 
 # every wrapper message is timestamped in LOCAL time (terminal = human-facing;
 # the log files keep ISO-8601 UTC — see ts() format vs the monitor's log())
-# ------------------------------------------------------------- terminal (v0.21.0)
+# ------------------------------------------------------------- terminal (v0.21.0, glyphs v0.24.0)
 # human-facing terminal: short local ts [HH:MM:SS] (full precision lives in
 # the log FILES, whose formats are unchanged), ANSI colors only when stderr is
 # a tty and NO_COLOR is unset, a context banner at start, boxed final report.
+# v0.24.0: EVERY terminal line starts with a status glyph (the same language
+# ralph-monitor and harvest use): · info (dim)  … in progress (cyan)  ! warn
+# (yellow)  ✓ success (green)  ✗ failure (red). No source prefixes (`ralph:`,
+# `harvest:`) — the glyph language is shared, so they were redundant.
 ts()   { date +"%Y-%m-%d %H:%M:%S.%3N"; }
 ts_s() { date +"%H:%M:%S"; }
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
@@ -105,6 +109,7 @@ if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
 else C_B=""; C_D=""; C_G=""; C_Y=""; C_R=""; C_N=""; fi
 say()  { printf '[%s] %s\n' "$(ts)" "$*"; }
 saye() { printf '%s[%s]%s %s\n' "$C_D" "$(ts_s)" "$C_N" "$*" >&2; }
+sayc() { printf '%s[%s]%s     %s\n' "$C_D" "$(ts_s)" "$C_N" "$*" >&2; }   # continuation: dim, indented under the glyph column
 human_secs() { local s=${1:-0}; case "$s" in ''|*[!0-9]*) echo "${s}s"; return;; esac
   if [ "$s" -ge 3600 ] && [ $((s % 3600)) -eq 0 ]; then echo "$((s / 3600))h";
   elif [ "$s" -ge 60 ] && [ $((s % 60)) -eq 0 ]; then echo "$((s / 60))m";
@@ -151,11 +156,11 @@ banner() { # $1=mode: launch|attach — uses RUN_DIR, DEADLINE_EPOCH, PROJECT_DI
 _cli_pos=()
 while [ $# -gt 0 ]; do
   case "$1" in
-    --deadline)        [ $# -ge 2 ] || { saye "ralph: --deadline needs a value"; exit 2; }; DEADLINE=$2; shift 2 ;;
+    --deadline)        [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --deadline needs a value"; exit 2; }; DEADLINE=$2; shift 2 ;;
     --deadline=*)      DEADLINE=${1#*=}; shift ;;
-    --child-model)     [ $# -ge 2 ] || { saye "ralph: --child-model needs a value"; exit 2; }; CHILD_MODEL=$2; shift 2 ;;
+    --child-model)     [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --child-model needs a value"; exit 2; }; CHILD_MODEL=$2; shift 2 ;;
     --child-model=*)   CHILD_MODEL=${1#*=}; shift ;;
-    --parent-model)    [ $# -ge 2 ] || { saye "ralph: --parent-model needs a value"; exit 2; }; PARENT_MODEL=$2; shift 2 ;;
+    --parent-model)    [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --parent-model needs a value"; exit 2; }; PARENT_MODEL=$2; shift 2 ;;
     --parent-model=*)  PARENT_MODEL=${1#*=}; shift ;;
     -h|--help)
       cat <<'USAGE'
@@ -231,10 +236,10 @@ if [ "${1:-}" = "--harvest" ]; then
   fi
   TARGET="$SRC"
   if [ -n "$DEST" ]; then
-    if [ -e "$DEST" ]; then saye "ralph: dest $DEST exists — refusing to overwrite"; exit 1; fi
+    if [ -e "$DEST" ]; then saye "${C_R}✗${C_N} dest $DEST exists — refusing to overwrite"; exit 1; fi
     mkdir -p "$(dirname "$DEST")"
     cp -a "$SRC" "$DEST"
-    saye "ralph: copied $SRC → $DEST"
+    saye "${C_D}·${C_N} copied $SRC → $DEST"
     TARGET="$DEST"
   fi
   node "$HERE/lib/harvest.mjs" "$TARGET" 0 0
@@ -249,8 +254,8 @@ if [ "${1:-}" = "stop" ]; then
     case "$1" in
       --all)   STOP_ALL=1 ;;
       --force) STOP_ARGS+=(--force) ;;
-      -*)      saye "ralph: stop: unknown flag: $1"; exit 2 ;;
-      *)       if [ -n "$STOP_TARGET" ]; then saye "ralph: stop: one run dir at a time (or --all)"; exit 2; fi
+      -*)      saye "${C_R}✗${C_N} stop: unknown flag: $1"; exit 2 ;;
+      *)       if [ -n "$STOP_TARGET" ]; then saye "${C_R}✗${C_N} stop: one run dir at a time (or --all)"; exit 2; fi
                STOP_TARGET=$1 ;;
     esac
     shift
@@ -261,19 +266,19 @@ if [ "${1:-}" = "stop" ]; then
   stop_one() { # $1=run-dir
     local d="$1" rc=0
     if [ ! -f "$d/pi-child-status.json" ]; then
-      saye "ralph: stop: no status file in $d — nothing to stop"
+      saye "${C_D}·${C_N} no status file in $d — nothing to stop"
       return 0
     fi
-    saye "ralph: stopping $d"
+    saye "${C_D}·${C_N} stopping $d"
     node "$HERE/stop.mjs" --out-dir "$d" "${STOP_ARGS[@]}" || rc=$?
     node "$HERE/lib/harvest.mjs" "$d" 0 "$rc" 2>/dev/null || true
-    saye "ralph: preserved — report: $d/RUN-REPORT.md"
+    saye "${C_G}✓${C_N} preserved — report: $d/RUN-REPORT.md"
     return $rc
   }
 
   if [ "$STOP_ALL" -eq 1 ]; then
     if [ ! -d "$STOP_ROOT" ]; then
-      saye "ralph: stop --all: no run dirs ($STOP_ROOT missing)"
+      saye "${C_Y}!${C_N} stop --all: no run dirs ($STOP_ROOT missing)"
     else
       found=0
       for d in "$STOP_ROOT"/*/; do
@@ -281,7 +286,7 @@ if [ "${1:-}" = "stop" ]; then
         found=1
         stop_one "${d%/}" || STOP_RC=1
       done
-      [ "$found" -eq 1 ] || saye "ralph: stop --all: no run dirs in $STOP_ROOT"
+      [ "$found" -eq 1 ] || saye "${C_Y}!${C_N} stop --all: no run dirs in $STOP_ROOT"
     fi
   elif [ -n "$STOP_TARGET" ]; then
     stop_one "$STOP_TARGET" || STOP_RC=1
@@ -293,13 +298,13 @@ if [ "${1:-}" = "stop" ]; then
     elif [ -d "$STOP_ROOT" ]; then
       newest="$(for d in "$STOP_ROOT"/*/; do [ -f "$d/pi-child-status.json" ] && printf '%s\n' "${d%/}"; done | xargs -r ls -1t 2>/dev/null | head -1)"
       if [ -n "$newest" ]; then
-        saye "ralph: stop: no pointer — using newest run with a status file: $newest"
+        saye "${C_Y}!${C_N} stop: no pointer — using newest run with a status file: $newest"
         stop_one "$newest" || STOP_RC=1
       else
-        saye "ralph: stop: no run with a status file found (looked in $STOP_ROOT)"
+        saye "${C_Y}!${C_N} stop: no run with a status file found (looked in $STOP_ROOT)"
       fi
     else
-      saye "ralph: stop: no runs found (no pointer, $STOP_ROOT missing)"
+      saye "${C_Y}!${C_N} stop: no runs found (no pointer, $STOP_ROOT missing)"
     fi
   fi
   exit $STOP_RC
@@ -326,9 +331,9 @@ fi
 if [ "$ATTACHED" -eq 0 ]; then
   TASK_FILE="${TASK_FILE:-TASK.md}"
   if [ ! -f "$TASK_FILE" ]; then
-    saye "ralph: no $TASK_FILE in $(pwd)"
-    saye "Zero-arg mode: write the task in ./$TASK_FILE, then run ralph.sh (or set TASK_FILE=<name> to point elsewhere)."
-    saye "To attach to an existing run instead: ralph.sh <run-dir> [ralph args...]"
+    saye "${C_R}✗${C_N} no $TASK_FILE in $(pwd)"
+    sayc "${C_D}zero-arg mode: write the task in ./$TASK_FILE, then run ralph.sh (or set TASK_FILE=<name> to point elsewhere).${C_N}"
+    sayc "${C_D}to attach to an existing run instead: ralph.sh <run-dir> [ralph args...]${C_N}"
     exit 1
   fi
 
@@ -344,7 +349,7 @@ if [ "$ATTACHED" -eq 0 ]; then
     elif [ -n "$cand" ] && [ -d "$cand" ] && [ ! -f "$cand/run-summary.json" ]; then
       # dead run without a summary — reboot or crash mid-run: post-mortem it
       # now so it becomes permanent evidence, then start a fresh run below
-      saye "ralph: previous run $cand is dead (reboot/crash?) — harvesting post-mortem"
+      saye "${C_Y}!${C_N} previous run $cand is dead (reboot/crash?) — harvesting post-mortem"
       harvest "$cand" 1 0
     fi
   fi
@@ -381,11 +386,11 @@ if [ "$ATTACHED" -eq 0 ]; then
     case "$launch_out" in
       *'"launched":true'*)
         guard_pid=$(status_field "$RUN_DIR/pi-child-status.json" guardPid)
-        saye "ralph: child launched (guardPid=$guard_pid)" ;;
+        saye "${C_D}·${C_N} child launched (guardPid=$guard_pid)" ;;
       *'"launched":"unknown"'*)
-        saye "ralph: WARNING launch.mjs reported 'unknown' (alive but silent) — proceeding, the pre-checks will catch a dead child" ;;
+        saye "${C_Y}!${C_N} launch.mjs reported 'unknown' (alive but silent) — proceeding, the pre-checks will catch a dead child" ;;
       *)
-        saye "ralph: LAUNCH FAILED — output from launch.mjs:"
+        saye "${C_R}✗${C_N} launch failed — output from launch.mjs:"
         echo "$launch_out" | tail -20 >&2
         exit 1 ;;
     esac
@@ -395,7 +400,7 @@ if [ "$ATTACHED" -eq 0 ]; then
     # keep run artifacts out of git's way (idempotent — the line is added once)
     if [ -d "$PROJECT_DIR/.git" ] && ! grep -qxF '.pi-supervisor/' "$PROJECT_DIR/.gitignore" 2>/dev/null; then
       { printf '\n# pi-supervisor run artifacts\n.pi-supervisor/\n' >> "$PROJECT_DIR/.gitignore"; } 2>/dev/null \
-        && saye "ralph: added .pi-supervisor/ to .gitignore" || true
+        && saye "${C_D}·${C_N} added .pi-supervisor/ to .gitignore" || true
     fi
   else
     # attach to a live run: honor the run's own deadline unless the user overrode it
@@ -417,8 +422,8 @@ on_exit() {
   if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then interrupted=1; fi
   if [ -n "$HARVEST_TARGET" ] && [ -d "$HARVEST_TARGET" ]; then
     harvest "$HARVEST_TARGET" "$interrupted" "$rc"
-    if [ "$rc" -eq 0 ]; then saye "${C_B}done · exit 0${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"
-    else saye "${C_R}done · exit $rc${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"; fi
+    if [ "$rc" -eq 0 ]; then saye "${C_B}✓ done · exit 0${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"
+    else saye "${C_R}✗ done · exit $rc${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"; fi
   fi
 }
 trap on_exit EXIT

@@ -169,8 +169,9 @@ grep -q "## Final report (written by the parent)" $T/projH/.pi-supervisor/runs/r
   && ok "J: RUN-REPORT.md embeds FINAL-REPORT.md" || bad "J: $(tail -2 $T/J.log)"
 
 # ---- K: terminal timestamps local; log files keep ISO UTC ---------------------
-grep -qE '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] ralph: child launched' $T/C.log \
-  && ok "K: terminal timestamps short local [HH:MM:SS]" || bad "K: $(grep 'child launched' $T/C.log | head -1)"
+# v0.24.0: every terminal line is glyphed — `ralph: child launched` became `· child launched`
+grep -qE '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] · child launched' $T/C.log \
+  && ok "K: terminal timestamps short local [HH:MM:SS] + glyphed lines" || bad "K: $(grep 'child launched' $T/C.log | head -1)"
 grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}\.[0-9]{3}Z\] cycle=' $T/projC/.pi-supervisor/runs/run1/ralph-monitor.log 2>/dev/null \
   && ok "K: ralph-monitor.log keeps ISO UTC" || bad "K: log file format"
 

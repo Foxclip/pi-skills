@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.23.0: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.24.0: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -133,6 +133,14 @@ const tty = Boolean(process.stderr.isTTY) && !process.env.NO_COLOR;
 const C = (code) => (tty ? `\x1b[${code}m` : "");
 const tlog = (line) => process.stderr.write(line + "\n");
 const log = (line) => { flog(line); tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${line}`); };
+// v0.24.0: glyphed terminal line — the FILE line stays plain (the log's format
+// contract: `[iso] ...`), the terminal line carries the shared status glyph
+// (· info dim, ! warn yellow, ✓ success green, ✗ failure red), matching the
+// tick/ask/beat lines and ralph.sh/harvest terminal lines
+const glog = (glyph, color, line) => {
+  flog(line);
+  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(color)}${glyph} ${line}${C(0)}`);
+};
 const tick = (n, verdict, detail, reasoning) => {
   const sym = verdict === "OK" ? `${C(32)}✓${C(0)}` : verdict === "NUDGE" ? `${C(33)}→${C(0)}` : `${C(31)}✗${C(0)}`;
   tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${sym} ${C(1)}cycle ${n} · ${verdict}${C(0)}${detail ? " — " + detail : ""}`);
@@ -156,7 +164,7 @@ const beat = (s) => {
   const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
   tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${s.status}${C(0)}${C(2)} · ${tc} tool call${tc === 1 ? "" : "s"}${last}${left}${C(0)}`);
 };
-process.on("SIGINT", () => { log("sigint: stopping"); saveState(); process.exit(130); });
+process.on("SIGINT", () => { glog("!", 33, "sigint: stopping"); saveState(); process.exit(130); });
 
 // ---- helpers
 const pidAlive = (pid) => {
@@ -353,21 +361,21 @@ async function writeFinalReport(reason) {
   try {
     r = await runCmd(A.pi, args, A.timeoutSec * 1000);
   } catch (e) {
-    log(`final-report: FAILED (${e.message}) — skipping`);
+    glog("✗", 31, `final-report: FAILED (${e.message}) — skipping`);
     return null;
   }
   const text = (r.stdout || "").trim();
   if (r.status !== 0 || !text) {
-    log(`final-report: FAILED (exit=${r.status ?? r.signal}) — skipping`);
+    glog("✗", 31, `final-report: FAILED (exit=${r.status ?? r.signal}) — skipping`);
     return null;
   }
   const p = path.join(A.runDir, "FINAL-REPORT.md");
   try {
     writeFileSync(p, text + "\n");
-    log(`final-report: written (${text.length} chars) → ${p}`);
+    glog("✓", 32, `final-report: written (${text.length} chars) → ${p}`);
     return p;
   } catch (e) {
-    log(`final-report: write failed (${e.message})`);
+    glog("✗", 31, `final-report: write failed (${e.message})`);
     return null;
   }
 }
@@ -396,7 +404,8 @@ let lastJudgment = 0; // 0 = judgment due immediately
 // the "what happened" answer, and the child is terminal here, so the model
 // slot is free for the report (a failed report never changes the exit code).
 async function stopLoop(pc) {
-  log(`pre-check STOP: ${pc.reason} (cycle=${state.cycles} interventions=${state.interventions})`);
+  glog(pc.code === 0 ? "✓" : "✗", pc.code === 0 ? 32 : 31,
+    `pre-check STOP: ${pc.reason} (cycle=${state.cycles} interventions=${state.interventions})`);
   saveState();
   if (pc.code === 0 || pc.code === 4) await writeFinalReport(pc.reason);
   process.exit(pc.code);
@@ -417,7 +426,7 @@ for (;;) {
   lastJudgment = nowMs;
 
   if (A.dryRun) {
-    log(`cycle=${state.cycles} dry-run: status=${status ? status.status : "absent"} toolCalls=${status ? status.toolCalls : "?"} — no LLM call`);
+    glog("·", 2, `cycle=${state.cycles} dry-run: status=${status ? status.status : "absent"} toolCalls=${status ? status.toolCalls : "?"} — no LLM call`);
     saveState();
     if (A.once) process.exit(0);
   } else {
@@ -435,7 +444,7 @@ for (;;) {
     watcherDone = true;
     if (raced === "deadline") {
       if (judgmentProc) { try { judgmentProc.kill("SIGKILL"); } catch { /* best effort */ } }
-      log(`cycle=${state.cycles} deadline passed while asking parent — judgment killed, handing off to the pre-checks`);
+      glog("!", 33, `cycle=${state.cycles} deadline passed while asking parent — judgment killed, handing off to the pre-checks`);
       saveState();
       continue;
     }
@@ -445,21 +454,21 @@ for (;;) {
       // RETRY next cycle — the loop never dies on one bad LLM call
       // (the anti-BlockGame6 behavior)
       state.llmFailStreak += 1;
-      log(`cycle=${state.cycles} llm-failed (exit=${d.exitStatus} streak=${state.llmFailStreak}): ${(d.tail[d.tail.length - 1] || "").slice(0, 200)}`);
+      glog("!", 33, `cycle=${state.cycles} llm-failed (exit=${d.exitStatus} streak=${state.llmFailStreak}): ${(d.tail[d.tail.length - 1] || "").slice(0, 200)}`);
       saveState();
       if (A.once) process.exit(4);
       if (state.llmFailStreak >= A.llmFailMax) {
-        log(`llm-down: ${state.llmFailStreak} consecutive failed cycles — giving up`);
+        glog("✗", 31, `llm-down: ${state.llmFailStreak} consecutive failed cycles — giving up`);
         process.exit(4);
       }
     } else if (d.raw === "") {
       // pi exited 0 but printed nothing: suspicious — count as a failed cycle
       state.llmFailStreak += 1;
-      log(`cycle=${state.cycles} llm-empty (streak=${state.llmFailStreak}) — no output at all`);
+      glog("!", 33, `cycle=${state.cycles} llm-empty (streak=${state.llmFailStreak}) — no output at all`);
       saveState();
       if (A.once) process.exit(4);
       if (state.llmFailStreak >= A.llmFailMax) {
-        log(`llm-down: ${state.llmFailStreak} consecutive empty cycles — giving up`);
+        glog("✗", 31, `llm-down: ${state.llmFailStreak} consecutive empty cycles — giving up`);
         process.exit(4);
       }
     } else {
@@ -485,7 +494,7 @@ for (;;) {
         // truly dead child next cycle; the budget slot is burned either way
         tlog(`${C(2)}    nudge ${nr.ok ? "delivered" : `NOT delivered${nr.why ? ` (${nr.why})` : ""}`}${C(0)}`);
         if (state.interventions >= A.maxInterventions) {
-          log(`budget exhausted (${state.interventions}/${A.maxInterventions}) — stopping loop`);
+          glog("✗", 31, `budget exhausted (${state.interventions}/${A.maxInterventions}) — stopping loop`);
           await writeFinalReport(`parent stop: intervention budget exhausted (${state.interventions}/${A.maxInterventions})`);
           saveState();
           process.exit(4);
