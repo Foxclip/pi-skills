@@ -23,6 +23,10 @@
 //   R15 llm-down (llmFailMax hit, continuous) → exit 4
 //   R23 child heartbeat fires on every toolCalls CHANGE (5s poll; 60s fallback)
 //   R24 heartbeat while a judgment is in flight (RM_HEARTBEAT_SEC knob)
+//   R25 stale-STOP veto: child progressed while judging → STOP vetoed → OK (v0.25.1)
+//   R26 child past its OWN deadline, finalizing → no judgments, completed → exit 0 (v0.25.1)
+//   R27 child-deadline grace expiry → exit 4 + report, no judgments (v0.25.1)
+//   R28 LIVE view present in the rendered judgment prompt (v0.25.1)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -90,6 +94,14 @@ console.log("DECISION: OK");`);
 const STUB_SLOWER = mkStub("pi-slower.mjs", `
 import { spawnSync } from "node:child_process";
 spawnSync("sleep", ["12"]);
+console.log("DECISION: OK");`);
+// R26/R27: marker stub — records whether the call was a JUDGMENT or the final
+// REPORT (by prompt content), so a test can prove NO judgment happened.
+const STUB_INV = mkStub("pi-inv.mjs", `
+import { appendFileSync } from "node:fs";
+const p = process.argv[process.argv.length - 1];
+appendFileSync(process.env.RM_INV_LOG || "/dev/null", (p.includes("final report writer") ? "REPORT" : "JUDGE") + "\\n");
+console.log("thinking about the child's progress...");
 console.log("DECISION: OK");`);
 const runDir = (name) => { const d = path.join(root, name); mkdirSync(d, { recursive: true }); return d; };
 const rmArgs = (d, stub, extra = []) => [
@@ -440,6 +452,98 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
     code === 0 && /deadline: child-terminal \(completed-finalized\)/.test(log) &&
       /final-report: written/.test(log) && existsSync(path.join(d, "FINAL-REPORT.md")),
     `exit=${code} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
+}
+
+// ---- R25: stale-STOP veto (v0.25.1, run9 shape) — the child makes tool
+// calls WHILE the parent is deciding (the stub bumps toolCalls mid-judgment,
+// exactly what the child's finalize turn did in run9); the STOP verdict is
+// stale → vetoed → treated as OK → exit 0 (--once)
+{
+  const d = runDir("r25");
+  mkStatus(d, { toolCalls: 0 });
+  const stub = mkStub("pi-stop-progress.mjs", `
+import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+spawnSync("sleep", ["3"]);   // the parent is "thinking"…
+const p = ${JSON.stringify(path.join(d, "pi-child-status.json"))};
+const s = JSON.parse(readFileSync(p, "utf8"));
+s.toolCalls = 5; s.at = new Date().toISOString();   // …and the child works
+writeFileSync(p, JSON.stringify(s, null, 2));
+console.log("DECISION: STOP: looks stuck");`);
+  const r = runRm(d, stub, ["--once"]);
+  const log = readLog(d);
+  report("R25 stale-STOP veto: child progressed while judging → STOP vetoed → OK → exit 0",
+    r.status === 0 && /decision=STOP-VETOED/.test(log)
+      && /decision=OK \(after stale-STOP veto: toolCalls 0→5\)/.test(log),
+    `exit=${r.status} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
+}
+
+// ---- R26: child past its OWN deadline (status.deadlineIso — the monitor's
+// deadline is 12h away, like run9), still finalizing (v0.25.1): NO judgment
+// may happen; the pre-checks wait out the window and exit with the TRUE
+// terminal state (completed-finalized → exit 0) + final report
+{
+  const d = runDir("r26");
+  const inv = path.join(root, "inv-r26.log");
+  writeFileSync(inv, "");
+  const dlPast = new Date(Date.now() - 5000).toISOString();
+  mkStatus(d, { toolCalls: 7, deadlineIso: dlPast });
+  const child = spawn(NODE, rmArgs(d, STUB_INV, ["--finalize-grace-sec", "60"]), {
+    stdio: ["ignore", "ignore", "ignore"], env: { ...process.env, RM_INV_LOG: inv } });
+  await waitMs(1500);   // the monitor is in the finalize wait; nothing may judge
+  mkStatus(d, { toolCalls: 9, deadlineIso: dlPast, status: "completed", exitReason: "completed-finalized" });
+  const code = await new Promise((resolve) => {   // waitExit is defined below — inline here
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (child.exitCode !== null) { clearInterval(iv); resolve(child.exitCode); }
+      else if (Date.now() - t0 > 30_000) { child.kill("SIGKILL"); resolve("timeout"); }
+    }, 300);
+  });
+  const log = readLog(d);
+  const invs = readFileSync(inv, "utf8");
+  report("R26 child-finalizing: judgments skipped, completed → exit 0 + report (no JUDGE)",
+    code === 0 && /deadline: child-terminal \(completed-finalized\)/.test(log)
+      && !/JUDGE/.test(invs) && /REPORT/.test(invs) && existsSync(path.join(d, "FINAL-REPORT.md")),
+    `exit=${code} inv=${JSON.stringify(invs)} log=${log.trim().split("\n").map((l) => l.slice(0, 70)).join(" | ")}`);
+}
+
+// ---- R27: child past its OWN deadline, grace expires while it is still
+// running (v0.25.1) → exit 4 + final report, and NO judgment happened
+// (mirrors R11 for the child's deadline, which R11's --deadline can't express)
+{
+  const d = runDir("r27");
+  const inv = path.join(root, "inv-r27.log");
+  writeFileSync(inv, "");
+  mkStatus(d, { toolCalls: 7, deadlineIso: new Date(Date.now() - 60_000).toISOString() });
+  process.env.RM_INV_LOG = inv;
+  const r = runRm(d, STUB_INV, ["--finalize-grace-sec", "2"]);
+  process.env.RM_INV_LOG = "";
+  const log = readLog(d);
+  report("R27 child-deadline grace expiry → exit 4 + report, no judgment",
+    r.status === 4 && /child still running after 2s grace/.test(log)
+      && readFileSync(inv, "utf8") === "REPORT\n" && existsSync(path.join(d, "FINAL-REPORT.md")),
+    `exit=${r.status} log=${log.trim().split("\n").map((l) => l.slice(0, 70)).join(" | ")}`);
+}
+
+// ---- R28: LIVE view in the rendered judgment prompt (v0.25.1) — the
+// monitor-observed block (status/toolCalls/lastTool + deadline state) is
+// present and fresh (read at prompt-build time)
+{
+  const d = runDir("r28");
+  const pf = path.join(root, "r28-prompt.txt");
+  const stub = mkStub("pi-capture.mjs", `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(pf)}, process.argv[process.argv.length - 1]);
+console.log("DECISION: OK");`);
+  mkStatus(d, { toolCalls: 4, lastTool: "bash", lastToolStartedAt: new Date().toISOString(),
+    deadlineIso: new Date(Date.now() + 2 * 3600e3).toISOString() });
+  const r = runRm(d, stub, ["--once"]);
+  const prompt = existsSync(pf) ? readFileSync(pf, "utf8") : "";
+  report("R28 LIVE view in judgment prompt (status/toolCalls/lastTool/deadline state)",
+    r.status === 0 && prompt.includes("LIVE (monitor-observed at")
+      && prompt.includes("toolCalls=4") && prompt.includes("lastTool=bash@")
+      && /child deadline .* in 2h/.test(prompt),
+    `exit=${r.status} live=${/LIVE \(monitor-observed/.test(prompt)} toolCalls=${prompt.includes("toolCalls=4")}`);
 }
 
 // ================= RALPH.SH integration (v0.21.0 terminal design) =================

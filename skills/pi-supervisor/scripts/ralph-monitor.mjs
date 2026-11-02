@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.24.3: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.25.1: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -118,7 +118,7 @@ try { state = JSON.parse(readFileSync(statePath, "utf8")); } catch { /* first cy
 state = state || {
   startedAt: new Date().toISOString(), cycles: 0, interventions: 0,
   lastToolCalls: -1, lastProgressAt: new Date().toISOString(),
-  lastDecision: null, llmFailStreak: 0,
+  lastDecision: null, llmFailStreak: 0, lastJudgeToolCalls: null,
 };
 const saveState = () => writeFileSync(statePath, JSON.stringify(state, null, 2));
 // v0.21.0 terminal design (terminal is human-facing, files are machine-facing —
@@ -227,7 +227,14 @@ async function runCmdTracked(cmd, args, timeoutMs) {
 // ---- deterministic pre-checks (run before any LLM call)
 function preCheck(status) {
   const now = Date.now();
-  if (deadlineMs !== null && now >= deadlineMs) {
+  // v0.25.1: the finalization trigger is the SOONEST of the monitor's own
+  // deadline and the child's own deadline (status.deadlineIso, written by the
+  // guard at launch). run9: the child's 4-min budget expired while the
+  // monitor's deadline was 26 min away — the loop kept judging on stale
+  // settle snapshots during the child's finalize window.
+  const cd = status && status.deadlineIso ? Date.parse(status.deadlineIso) : NaN;
+  const effDl = Math.min(deadlineMs ?? Infinity, Number.isFinite(cd) ? cd : Infinity);
+  if (effDl !== Infinity && now >= effDl) {
     // v0.23.0: the deadline is the CHILD's wall clock — the guard enforces it
     // (finalization window). If the child is still running, wait it out
     // (bounded by the grace cap) so the monitor exits with the run's TRUE
@@ -242,7 +249,7 @@ function preCheck(status) {
     if (s0 === "stuck" || s0 === "failed" || s0 === "aborted")
       return { stop: true, code: 4, reason: `deadline: child-terminal (${s0})` };
     if (s0 === "running" || s0 === "starting") {
-      if (now >= deadlineMs + A.finalizeGraceSec * 1000)
+      if (now >= effDl + A.finalizeGraceSec * 1000)
         return { stop: true, code: 4, reason: `deadline (child still running after ${A.finalizeGraceSec}s grace)` };
       return { stop: false, waiting: "child-finalizing" };
     }
@@ -280,6 +287,28 @@ function preCheck(status) {
   return { stop: false };
 }
 
+// v0.25.1: machine-generated LIVE view for the judgment prompt — read at
+// prompt-build time, so it is always fresher than anything the judge
+// re-reads from disk (run9: the judge's one-shot file reads raced the child's
+// finalize window and it judged a 3-min-stale tools=0 settle snapshot).
+function buildLiveView() {
+  const now = Date.now();
+  const s = readStatus();
+  if (!s) return "(pi-child-status.json unreadable at prompt-build time)";
+  const tc = Number(s.toolCalls);
+  const last = s.lastTool ? `; lastTool=${s.lastTool}@${s.lastToolStartedAt || "?"}` : "";
+  const delta = Number.isFinite(tc) && Number.isFinite(state.lastJudgeToolCalls)
+    ? `; since last judgment: ${tc - state.lastJudgeToolCalls >= 0 ? "+" : ""}${tc - state.lastJudgeToolCalls} tool call(s)`
+    : "";
+  const lines = [`LIVE (monitor-observed at ${new Date(now).toISOString()}): status=${s.status || "?"} toolCalls=${Number.isFinite(tc) ? tc : "?"}${last}${delta}`];
+  const dl = [];
+  const cdl = s.deadlineIso ? Date.parse(s.deadlineIso) : NaN;
+  if (Number.isFinite(cdl)) dl.push(`child deadline ${s.deadlineIso} ${now >= cdl ? "PASSED — child in finalize window" : `in ${humanLeft(cdl - now)}`}`);
+  if (deadlineMs !== null) dl.push(`monitor deadline ${new Date(deadlineMs).toISOString()} ${now >= deadlineMs ? "PASSED" : `in ${humanLeft(deadlineMs - now)}`}`);
+  if (dl.length) lines.push(dl.join(" | "));
+  return lines.join("\n");
+}
+
 // ---- the LLM turn (one fresh cycle)
 const DEFAULT_PROMPT = `You are one cycle of a ralph-loop supervisor for a pi child agent run.
 You are STATELESS: your only context is what you read from disk right now. Do not assume anything from a previous cycle — the loop keeps its memory in files, not in you.
@@ -299,6 +328,13 @@ stall, intervention budget) and would have stopped itself if any failed. Being
 asked means: the child is alive, fresh, and within budget. Judge the WORK, not the plumbing:
 is the child making real progress on the task? Stuck repeating itself? Off-track?
 
+<live-view>
+
+The LIVE block above was read by the monitor at prompt-build time — it is
+fresher than anything in the logs. If the child is active (tool calls after
+the newest [settle] line in the progress log), that settle is stale: judge
+the live state, and never STOP a child that is actively working.
+
 Output format (STRICT): your final line must be exactly one of:
 DECISION: OK
 DECISION: NUDGE: <one-line message, specific, actionable, referencing what you saw>
@@ -312,7 +348,8 @@ async function llmDecide() {
   let prompt = A.promptFile ? readFileSync(A.promptFile, "utf8") : DEFAULT_PROMPT;
   prompt = prompt.replaceAll("<run-dir>", A.runDir)
     .replaceAll("<project-dir-line>", projectLine)
-    .replaceAll("<cycle>", String(state.cycles + 1));
+    .replaceAll("<cycle>", String(state.cycles + 1))
+    .replaceAll("<live-view>", buildLiveView());
   const args = ["--print"];
   if (A.session) args.push("--session", A.session);
   else args.push("--no-session");
@@ -462,6 +499,16 @@ for (;;) {
     glog("…", 36, `deadline reached — waiting for the child to finalize (grace ${A.finalizeGraceSec}s)`);
   }
   if (status && status.status === "running") beatMaybe(status);
+  // v0.25.1: no LLM judgment inside the finalize window — the parent has no
+  // meaningful action there: NUDGE can't reach a mid-finalize turn, STOP
+  // can't kill the detached child (run9: a STOP on a stale settle snapshot
+  // ended the loop with a false "gave up" code while the child completed
+  // fine). The pre-checks own this wait: terminal → 0/5, grace cap → 4 +
+  // final report.
+  if (pc.waiting === "child-finalizing") {
+    await sleep(POLL_SEC * 1000);
+    continue;
+  }
   const nowMs = Date.now();
   if (nowMs - lastJudgment < A.cycleSec * 1000 - 500) {
     await sleep(Math.min(POLL_SEC * 1000, Math.max(5000, A.cycleSec * 1000 - (nowMs - lastJudgment))));
@@ -477,6 +524,11 @@ for (;;) {
     if (A.once) process.exit(0);
   } else {
     ask(`cycle ${state.cycles} — asking parent for judgment…`);
+    // v0.25.1: toolCalls baseline at judgment start — the stale-STOP veto
+    // and the log audit compare against it when the verdict returns.
+    const sJs = readStatus();
+    const toolsAtJudgeStart = sJs ? Number(sJs.toolCalls) : NaN;
+    if (Number.isFinite(toolsAtJudgeStart)) state.lastJudgeToolCalls = toolsAtJudgeStart;
     const stopHb = heartbeat(`cycle ${state.cycles} — parent judging`);   // v0.24.3
     // v0.23.0: race the judgment against the deadline — see runCmdTracked.
     let watcherDone = false;
@@ -521,6 +573,21 @@ for (;;) {
       }
     } else {
       state.llmFailStreak = 0;
+      // v0.25.1: stale-STOP veto — a verdict is a point-in-time observation;
+      // if the child made tool calls while the parent was deciding, the disk
+      // has already invalidated it (run9: STOP on a 3-min-stale tools=0
+      // settle while the child was 7 tool calls deep in its finalize).
+      // Same safe default as "unknown line → OK": the disk can invalidate a
+      // verdict, a verdict can't invalidate the disk.
+      const sNow = readStatus();
+      const tcNow = sNow ? Number(sNow.toolCalls) : NaN;
+      let stopVetoed = null;
+      if (d.decision === "STOP" && Number.isFinite(tcNow) && Number.isFinite(toolsAtJudgeStart) && tcNow > toolsAtJudgeStart) {
+        stopVetoed = { from: toolsAtJudgeStart, to: tcNow };
+        d.decision = "OK";
+        glog("!", 33, `cycle=${state.cycles} STOP vetoed — child progressed while judging (toolCalls ${toolsAtJudgeStart}→${tcNow}) — stale verdict, treated as OK`);
+        flog(`cycle=${state.cycles} decision=STOP-VETOED reason=${JSON.stringify(d.detail)}`);
+      }
       // v0.21.0: the FULL reasoning goes to ralph-monitor.log (the permanent
       // record — format unchanged); the terminal gets a scannable tick line
       // plus the reasoning in dim type.
@@ -529,9 +596,9 @@ for (;;) {
       const wasBadLine = !/^DECISION:\s*(OK|NUDGE|STOP)\b/i.test(d.raw || "");
       const reasoning = (d.text || "").replace(/\n*DECISION:[^\n]*\s*$/i, "").trimEnd();
       if (d.decision === "OK") {
-        state.lastDecision = "OK";
-        flog(`cycle=${state.cycles} decision=OK${wasBadLine ? " (note: final line was not DECISION:, treated as OK)" : ""}`);
-        tick(state.cycles, "OK", wasBadLine ? "final line was not DECISION: — treated as OK" : undefined, reasoning);
+        state.lastDecision = stopVetoed ? `OK (stale-STOP veto: toolCalls ${stopVetoed.from}→${stopVetoed.to})` : "OK";
+        flog(`cycle=${state.cycles} decision=OK${stopVetoed ? ` (after stale-STOP veto: toolCalls ${stopVetoed.from}→${stopVetoed.to})` : ""}${wasBadLine ? " (note: final line was not DECISION:, treated as OK)" : ""}`);
+        tick(state.cycles, "OK", stopVetoed ? `STOP vetoed — child progressed while judging (tools ${stopVetoed.from}→${stopVetoed.to})` : wasBadLine ? "final line was not DECISION: — treated as OK" : undefined, reasoning);
       } else if (d.decision === "NUDGE") {
         state.lastDecision = `NUDGE: ${d.detail}`;
         state.interventions += 1;
@@ -549,7 +616,7 @@ for (;;) {
         }
       } else if (d.decision === "STOP") {
         state.lastDecision = `STOP: ${d.detail}`;
-        flog(`cycle=${state.cycles} decision=STOP reason=${JSON.stringify(d.detail)}`);
+        flog(`cycle=${state.cycles} decision=STOP reason=${JSON.stringify(d.detail)}${Number.isFinite(toolsAtJudgeStart) ? ` (toolCalls ${toolsAtJudgeStart} at judgment start)` : ""}`);
         tick(state.cycles, "STOP", d.detail || "no reason given", reasoning);
         await writeFinalReport(`parent stop: ${d.detail || "no reason given"}`);
         saveState();
