@@ -27,6 +27,7 @@
 //   R26 child past its OWN deadline, finalizing → no judgments, completed → exit 0 (v0.25.1)
 //   R27 child-deadline grace expiry → exit 4 + report, no judgments (v0.25.1)
 //   R28 LIVE view present in the rendered judgment prompt (v0.25.1)
+//   R29 child-deadline mid-judgment → judgment killed at child deadline (v0.25.2)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -544,6 +545,33 @@ console.log("DECISION: OK");`);
       && prompt.includes("toolCalls=4") && prompt.includes("lastTool=bash@")
       && /child deadline .* in 2h/.test(prompt),
     `exit=${r.status} live=${/LIVE \(monitor-observed/.test(prompt)} toolCalls=${prompt.includes("toolCalls=4")}`);
+}
+
+// ---- R29: the child's OWN deadline passes mid-judgment (v0.25.2, run10
+// shape) — the judgment hangs (12s stub) PAST the child's 4s deadline; the
+// watcher must kill it at the CHILD's deadline (not the monitor's 12h
+// default, not the 600s --timeout-sec), then the pre-checks own the wait:
+// child → completed-finalized → exit 0 + final report
+{
+  const d = runDir("r29");
+  const cdIso = new Date(Date.now() + 4000).toISOString();
+  mkStatus(d, { toolCalls: 0, deadlineIso: cdIso });
+  const child = spawn(NODE, rmArgs(d, STUB_SLOWER, []), { stdio: ["ignore", "ignore", "ignore"] });
+  await waitMs(9000);   // child deadline (4s) + watcher poll (5s) → judgment killed by ~9s
+  mkStatus(d, { toolCalls: 0, deadlineIso: cdIso, status: "completed", exitReason: "completed-finalized" });
+  const code = await new Promise((resolve) => {
+    const t0 = Date.now();
+    const iv = setInterval(() => {
+      if (child.exitCode !== null) { clearInterval(iv); resolve(child.exitCode); }
+      else if (Date.now() - t0 > 45_000) { child.kill("SIGKILL"); resolve("timeout"); }
+    }, 300);
+  });
+  const log = readLog(d);
+  report("R29 child-deadline mid-judgment → judgment killed at child deadline → completed → exit 0 + report",
+    code === 0 && /child deadline passed while asking parent — judgment killed/.test(log)
+      && /deadline: child-terminal \(completed-finalized\)/.test(log)
+      && /final-report: written/.test(log) && existsSync(path.join(d, "FINAL-REPORT.md")),
+    `exit=${code} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
 }
 
 // ================= RALPH.SH integration (v0.21.0 terminal design) =================

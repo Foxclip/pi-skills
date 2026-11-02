@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.25.1: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.25.2: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -531,10 +531,20 @@ for (;;) {
     if (Number.isFinite(toolsAtJudgeStart)) state.lastJudgeToolCalls = toolsAtJudgeStart;
     const stopHb = heartbeat(`cycle ${state.cycles} — parent judging`);   // v0.24.3
     // v0.23.0: race the judgment against the deadline — see runCmdTracked.
+    // v0.25.2: AND against the CHILD's own deadline (status.deadlineIso, written
+    // by the guard at launch). Once it has passed the loop has no useful
+    // verdict to act on — NUDGE can't reach a mid-finalize turn, STOP can't
+    // kill the detached child (the v0.25.1 principle). run10: a judgment
+    // hung on a stalled model until its own 600s --timeout-sec, 6 min past
+    // the child's deadline, with the loop blind the whole time.
     let watcherDone = false;
     const watcher = (async () => {
       while (!watcherDone) {
-        if (deadlineMs !== null && Date.now() >= deadlineMs) return "deadline";
+        const now = Date.now();
+        if (deadlineMs !== null && now >= deadlineMs) return "deadline";
+        const st = readStatus();
+        const cd = st && st.deadlineIso ? Date.parse(st.deadlineIso) : NaN;
+        if (Number.isFinite(cd) && now >= cd) return "child-deadline";
         await sleep(5000);
       }
       return null;
@@ -542,9 +552,9 @@ for (;;) {
     const raced = await Promise.race([llmDecide(), watcher]);
     watcherDone = true;
     stopHb();
-    if (raced === "deadline") {
+    if (raced === "deadline" || raced === "child-deadline") {
       if (judgmentProc) { try { judgmentProc.kill("SIGKILL"); } catch { /* best effort */ } }
-      glog("!", 33, `cycle=${state.cycles} deadline passed while asking parent — judgment killed, handing off to the pre-checks`);
+      glog("!", 33, `cycle=${state.cycles} ${raced === "child-deadline" ? "child deadline" : "deadline"} passed while asking parent — judgment killed, handing off to the pre-checks`);
       saveState();
       continue;
     }
