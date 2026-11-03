@@ -73,6 +73,8 @@ CPID=$!; sleep 35
 RD=$T/projC/.pi-supervisor/runs/run1
 [ -f $RD/pi-child-status.json ] && [ -f $T/projC/.pi-supervisor/ralph-run-dir ] \
   && ok "C: run dir + guard status + pointer created" || bad "C: run dir/status/pointer"
+[ -f $RD/TASK.md ] && grep -q "Test task" $RD/TASK.md \
+  && ok "C: task file copied into the run dir (v0.25.16)" || bad "C: TASK.md missing from run dir"
 grep -q "cycle=1" $RD/ralph-monitor.log 2>/dev/null && grep -q "decision=OK" $RD/ralph-monitor.log \
   && ok "C: monitor ran cycle 1 with decision=OK" || bad "C: monitor log $(tail -2 $RD/ralph-monitor.log 2>/dev/null)"
 kill $CPID 2>/dev/null; pkill -f "sleep 600" 2>/dev/null; true

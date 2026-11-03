@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.25.15: run a supervised child with zero arguments.
+# ralph.sh — v0.25.16: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
 #   2. ./ralph.sh
 #   that's it — the script finds TASK.md, allocates a run dir IN THE PROJECT
 #   (<project>/.pi-supervisor/runs/run-N — permanent: nothing lives in /tmp,
-#   a reboot mid-run leaves every artifact on disk), launches the guarded
-#   child via launch.mjs, then runs the ralph monitor loop IN THE FOREGROUND.
+#   a reboot mid-run leaves every artifact on disk), copies TASK.md into it,
+#   launches the guarded child via launch.mjs, then runs the ralph monitor loop
+#   IN THE FOREGROUND.
 #
 #   Your terminal is the view: every ralph cycle is printed as it happens,
 #   and Ctrl+C stops the WHOLE run — monitor + guard + child (graceful
@@ -456,6 +457,17 @@ if [ "$ATTACHED" -eq 0 ]; then
     n=$((n + 1))
     RUN_DIR="$RUNROOT/run$n"
     mkdir -p "$RUN_DIR"
+
+    # v0.25.16: the task file is the run's input artifact — copy it into the
+    # run dir so the evidence folder is self-contained. The project's TASK.md
+    # may be edited or lost after the run, and the transcript's task message
+    # carries the preamble + cycle notes, not the clean original text.
+    if cp -p "$TASK_FILE" "$RUN_DIR/$(basename "$TASK_FILE")" 2>/dev/null; then
+      rlog "task file copied: $(basename "$TASK_FILE") → $RUN_DIR/$(basename "$TASK_FILE")"
+    else
+      rlog "WARNING: task file copy FAILED — $(basename "$TASK_FILE") is not in $RUN_DIR (the run continues from the original)"
+      saye "${C_Y}!${C_N} could not copy $(basename "$TASK_FILE") into $RUN_DIR — the run continues from the original"
+    fi
 
     launch_args=(--task-file "$TASK_FILE" --out-dir "$RUN_DIR"
                  --deadline "$DEADLINE_EPOCH"
