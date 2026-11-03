@@ -365,10 +365,9 @@ async function reentry(parentPath, projectDir, childPath, childWindowDir, cfg, l
   // the child's final window (its report is the re-entry's input)
   const childNodeDir = nodeDir(projectDir, childPath);
   const childFinalDir = path.join(childNodeDir, newestWindow(childNodeDir) || "run-1");
-  // the spawn decision lives in the child's window that carries it (the window
-  // that wrote the request is the child node's own window 1 — but a re-spawned
-  // node may have later decisions; newest-first scan)
-  const decision = findChildDecision(childNodeDir);
+  // the decision that launched THIS child lives in the PARENT's window that
+  // carried the request (newest-first: a re-spawned child takes its latest)
+  const decision = findSpawnDecision(projectDir, parentPath, childPath);
   void childWindowDir; // kept in the signature for the log trail
   const b = windowBudget({ nodeDeadline: pnj?.deadline ?? null, runtimeMin: cfg.launch?.runtimeMin ?? 90, now: new Date() });
   if (!b.ok) return haltBlocked(projectDir, parentPath, childWindowDir, log, `cannot size the re-entry budget for ${parentPath}: ${b.why}`, done);
@@ -389,14 +388,15 @@ async function reentry(parentPath, projectDir, childPath, childWindowDir, cfg, l
   return done({ next: "reentry", node_path: parentPath, window: opened.window, run_dir: opened.dir, deadline: new Date(b.deadlineMs).toISOString(), child: childPath });
 }
 
-function findChildDecision(childNodeDir) {
+function findSpawnDecision(projectDir, parentPath, childPath) {
+  const pdir = nodeDir(projectDir, parentPath);
   let ents = [];
-  try { ents = fs.readdirSync(childNodeDir, { withFileTypes: true }); } catch { return null; }
+  try { ents = fs.readdirSync(pdir, { withFileTypes: true }); } catch { return null; }
   const wins = ents.filter((e) => e.isDirectory() && /^run-\d+$/.test(e.name))
     .map((e) => e.name).sort((a, b) => Number(b.slice(4)) - Number(a.slice(4)));
   for (const w of wins) {
-    const d = readJson(path.join(childNodeDir, w, "spawn-decision.json"));
-    if (d) return d;
+    const d = readJson(path.join(pdir, w, "spawn-decision.json"));
+    if (d && d.node_path === childPath) return d;
   }
   return null;
 }
