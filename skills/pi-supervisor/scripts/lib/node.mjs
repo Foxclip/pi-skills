@@ -23,6 +23,7 @@
 
 import fs from "fs";
 import path from "path";
+import { pathToFileURL } from "node:url";
 import { parseDeadline } from "./deadline.mjs";
 
 export const ROOT = "(root)";
@@ -362,4 +363,66 @@ function staleLock(lf, staleMs) {
   if (Date.now() - st.mtimeMs > staleMs) return true;
   const j = readJson(lf);
   return j?.pid != null && !pidAlive(j.pid);
+}
+
+// ---------- terminal banner -------------------------------------------------
+const humanDur = (ms) => {
+  const s = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${r}s` : `${r}s`;
+};
+const shortIso = (iso) => (iso ? String(iso).slice(5, 16).replace("T", " ") : null);
+
+/**
+ * The sub-runs tree as a boxed, append-only banner (plan §5.5) — printed on
+ * attach and every handoff. Plain text, no ANSI (the caller colors the whole
+ * block dim if it wants). One line per node, depth-indented:
+ *   state (live windows name their window + age; paused names the child it
+ *   waits on; every node shows its deadline when it has one).
+ */
+export function renderTree(projectDir, { now = new Date() } = {}) {
+  const tree = deriveTree(projectDir);
+  const rows = [];
+  const walk = (n, depth) => {
+    const prefix = depth === 0 ? "" : "  ".repeat(depth - 1) + "  ";
+    const name = `${prefix}${depth === 0 ? "" : "└ "}${n.name}`.padEnd(24);
+    const bits = [];
+    let st = n.state;
+    const wait = String(st).match(/^paused\(waiting:([^)]+)\)$/);
+    st = wait ? `PAUSED waiting ${wait[1]}` : st.toUpperCase();
+    bits.push(st);
+    const dl = n.deadline ? shortIso(n.deadline) : null;
+    if (n.live) {
+      const age = n.live.at ? humanDur(now - new Date(n.live.at).getTime()) : null;
+      let s = n.live.window;
+      if (age) s += `, ${age} in`;
+      if (dl) s += `, deadline ${dl}`;
+      bits.push(s);
+    } else {
+      if (n.windows > 1) bits.push(`${n.windows} windows`);
+      if (dl) bits.push(`deadline ${dl}`);
+    }
+    rows.push(`${name} ${bits.join("  ")}`);
+    for (const c of n.children) walk(c, depth + 1);
+  };
+  walk(tree, 0);
+  const title = `${path.basename(path.resolve(projectDir))} · sub-runs`;
+  const lines = [title, ...rows];
+  const w = Math.max(...lines.map((l) => l.length)) + 1;
+  const top = `╭ ${title}`.padEnd(w + 1, " ") + "╮";
+  const body = lines.map((l) => `│ ${l}`.padEnd(w + 1, " ") + "│");
+  return [top, ...body, `╰${"─".repeat(w)}╯`].join("\n");
+}
+
+// ---------- CLI ----------
+// node node.mjs tree <project-dir> — the sub-runs tree banner (ralph.sh / the
+// monitor print it on attach + every handoff; plan §5.5).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const [cmd, projectDir] = process.argv.slice(2);
+  if (cmd === "tree" && projectDir && fs.existsSync(projectDir)) {
+    process.stdout.write(renderTree(projectDir) + "\n");
+  } else {
+    console.error("usage: node node.mjs tree <project-dir>");
+    process.exit(cmd === "tree" ? 1 : 2);
+  }
 }

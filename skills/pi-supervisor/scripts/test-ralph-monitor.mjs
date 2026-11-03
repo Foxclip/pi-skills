@@ -902,6 +902,34 @@ const waitExit = (p, ms) => new Promise((resolve) => {
     `exit=${r.status} log=${log.trim().split("\n").slice(-3).join(" | ").slice(0, 220)}`);
 }
 
+// ---- R36: v0.26.0 — follow-the-slot (plan §5.5): when active.json points at
+// a DIFFERENT window, the terminal re-points to it — the state path moves with
+// it, and the handoff line + tree banner are appended to the NEW window's log.
+// Legacy projects (no active.json) never re-point — R1–R35 above prove the
+// baseline is unchanged.
+{
+  const proj = path.join(root, "r36-proj");
+  const dA = runDir("r36-a");
+  const dB = runDir("r36-b");
+  mkStatus(dA, { status: "running" });
+  mkStatus(dB, { status: "running" });
+  mkdirSync(path.join(proj, ".pi-supervisor"), { recursive: true });
+  writeFileSync(path.join(proj, ".pi-supervisor", "active.json"), JSON.stringify({
+    run_dir: dB, node: "auth", guard_pid: process.pid, window: "run-1",
+    started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+  }));
+  const r = runRm(dA, STUB_OK, ["--project-dir", proj, "--once"]);
+  const logB = readLog(dB);
+  const term = r.stderr || "";   // the tree banner goes to the terminal (stderr), not the log
+  report("R36 follow-the-slot: re-point to the slot's window (state + log + handoff line + tree on terminal)",
+    r.status === 0
+    && existsSync(path.join(dB, "ralph-monitor-state.json"))
+    && !existsSync(path.join(dA, "ralph-monitor-state.json"))
+    && /handoff: r36-a → r36-b \(node auth · run-1\)/.test(logB)
+    && /sub-runs/.test(term) && /│/.test(term),
+    `exit=${r.status} dB-state=${existsSync(path.join(dB, "ralph-monitor-state.json"))} handoff=${logB.trim().split("\n").slice(0, 3).join(" | ").slice(0, 160)} tree=${/sub-runs/.test(term)}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);

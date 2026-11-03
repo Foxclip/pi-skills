@@ -59,6 +59,7 @@ import { writeFileSync, readFileSync, existsSync, appendFileSync, mkdirSync } fr
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseDeadline } from "./lib/deadline.mjs";
+import { renderTree } from "./lib/node.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NODE = process.execPath;
@@ -113,8 +114,8 @@ if (A.deadline !== null) {
 }
 
 // ---- state + log
-const statePath = path.join(A.runDir, "ralph-monitor-state.json");
-const logPath = A.logFile || path.join(A.runDir, "ralph-monitor.log");
+let statePath = path.join(A.runDir, "ralph-monitor-state.json");   // let: follow-the-slot re-points on handoff (v0.26.0)
+let logPath = A.logFile || path.join(A.runDir, "ralph-monitor.log");
 let state = null;
 try { state = JSON.parse(readFileSync(statePath, "utf8")); } catch { /* first cycle */ }
 state = state || {
@@ -615,8 +616,47 @@ async function stopLoop(pc) {
   if (pc.code === 0 || pc.code === 4) await writeFinalReport(pc.reason);
   process.exit(pc.code);
 }
+// ---- follow-the-slot (v0.26.0, plan §5.5) ----------------------------------
+// active.json is the project's active-window pointer: launch.mjs writes it at
+// window start, the chain step clears it at window end. When it points at a
+// DIFFERENT run dir than the one this terminal is on, the chain has handed
+// off — re-point all status reads, the judgment and the live view at the new
+// window, with a divider + tree banner (append-only, no redraw). The terminal
+// only FOLLOWS — it never drives (several terminals may attach, all read-only;
+// steering stays in ralph.sh stop/spawn). Projects without an active.json:
+// no-op, so legacy runs are unchanged.
+const slotPath = A.projectDir ? path.join(A.projectDir, ".pi-supervisor", "active.json") : null;
+function followSlot() {
+  if (!slotPath) return;
+  let p;
+  try { p = JSON.parse(readFileSync(slotPath, "utf8")); } catch { return; }
+  const rd = p && p.run_dir;
+  if (!rd || !existsSync(rd) || rd === A.runDir) return;
+  const from = path.basename(A.runDir);
+  const to = path.basename(rd);
+  A.runDir = rd;
+  statePath = path.join(rd, "ralph-monitor-state.json");
+  if (!A.logFile) logPath = path.join(rd, "ralph-monitor.log");
+  try { state = JSON.parse(readFileSync(statePath, "utf8")); } catch { /* first cycle on this window */ }
+  state = state || {
+    startedAt: new Date().toISOString(), cycles: 0, interventions: 0,
+    lastToolCalls: -1, lastProgressAt: new Date().toISOString(),
+    lastDecision: null, llmFailStreak: 0, lastJudgeToolCalls: null,
+  };
+  if (p.deadline) {
+    const d = parseDeadline(String(p.deadline));
+    if (d.ok) deadlineMs = d.ts.getTime();
+  }
+  glog("→", 36, `handoff: ${from} → ${to} (node ${p.node || "?"} · ${p.window || "?"})`);
+  try {
+    for (const line of renderTree(A.projectDir).split("\n")) glog("", 2, line);
+  } catch { /* the tree is decoration — the re-point is the substance */ }
+  flog(`handoff: ${from} → ${to} (node ${p.node || "?"} · ${p.window || "?"})`);
+}
+
 (async () => {
 for (;;) {
+  followSlot();   // v0.26.0: re-point if the chain handed off to another window
   const status = readStatus();
   const pc = preCheck(status);
   if (pc.stop) await stopLoop(pc);

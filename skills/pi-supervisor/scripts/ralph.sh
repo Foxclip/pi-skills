@@ -485,6 +485,7 @@ ATTACHED=0
 if [ $# -ge 1 ]; then
   ATTACHED=1
   RUN_DIR=$1; shift
+  PROJECT_DIR="${PROJECT_DIR:-$PWD}"   # follow-the-slot: the monitor needs the project (active.json lives there)
   # display: adopt the run's own deadline from its status file if the user gave
   # neither --deadline nor --runtime (so the banner shows it AND the monitor is
   # told the run's real deadline). DEADLINE_EPOCH can't be the test — it is
@@ -498,6 +499,9 @@ if [ $# -ge 1 ]; then
   EXTRA=("$@")
   RALPH_MODE=attach   # the banner prints before the monitor starts
   MONITOR_ARGS=(--run-dir "$RUN_DIR" "${ralph_flags[@]}" "${EXTRA[@]}")
+  if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
+    SUBRUNS_ATTACH_TREE=1   # v0.26.0: sub-runs project → the tree banner is the view
+  fi
 fi
 
 # ------------------------------------------------------------- zero-arg mode
@@ -524,7 +528,35 @@ if [ "$ATTACHED" -eq 0 ]; then
   RUNROOT="${RUNS_DIR:-$PROJECT_DIR/.pi-supervisor/runs}"
   PTR="$PROJECT_DIR/.pi-supervisor/ralph-run-dir"
 
+  # v0.26.0 (plan §5.5): the sub-runs active slot. active.json is written by
+  # launch.mjs at window start and cleared by the chain step at window end, so
+  # it either names a LIVE window (attach to it — follow-the-slot) or a window
+  # that ended WITHOUT its chain step (reboot/crash mid-finalize — repair: run
+  # the missing step() once, then follow its result).
   RUN_DIR=""
+  AJ_REPAIRED=0; AJ_OUTCOME=""
+  ACTIVE_JSON="$PROJECT_DIR/.pi-supervisor/active.json"
+  if [ -f "$ACTIVE_JSON" ]; then
+    aj_dir="$(status_field "$ACTIVE_JSON" run_dir)"
+    aj_pid="$(status_field "$ACTIVE_JSON" guard_pid)"
+    if [ -n "$aj_dir" ] && [ -d "$aj_dir" ] && [ -n "$aj_pid" ] && kill -0 "$aj_pid" 2>/dev/null; then
+      RUN_DIR="$aj_dir"
+    elif [ -n "$aj_dir" ] && [ -d "$aj_dir" ] && [ -f "$aj_dir/pi-child-status.json" ] && [ ! -f "$aj_dir/chain-done.json" ]; then
+      saye "${C_Y}!${C_N} $(basename "$aj_dir") ended without its chain step (reboot/crash?) — running the missing step"
+      AJ_REPAIRED=1
+      node --input-type=module -e 'const { step } = await import(process.argv[1]); await step(process.argv[2], process.argv[3]);' "file://$HERE/lib/chain.mjs" "$PROJECT_DIR" "$aj_dir" \
+        || saye "${C_Y}!${C_N} repair step failed — the window is preserved; re-run to retry"
+      if [ -f "$aj_dir/chain-done.json" ]; then
+        AJ_OUTCOME="$(status_field "$aj_dir/chain-done.json" next 2>/dev/null || true)"
+      fi
+      aj_dir2="$(status_field "$ACTIVE_JSON" run_dir 2>/dev/null || true)"
+      aj_pid2="$(status_field "$ACTIVE_JSON" guard_pid 2>/dev/null || true)"
+      if [ -n "$aj_dir2" ] && [ -d "$aj_dir2" ] && [ -n "$aj_pid2" ] && kill -0 "$aj_pid2" 2>/dev/null; then
+        RUN_DIR="$aj_dir2"
+      fi
+    fi
+  fi
+
   if [ -f "$PTR" ]; then
     cand="$(cat "$PTR" 2>/dev/null || true)"
     if [ -n "$cand" ] && [ -f "$cand/pi-child-status.json" ] && guard_alive "$cand"; then
@@ -538,6 +570,13 @@ if [ "$ATTACHED" -eq 0 ]; then
   fi
 
   if [ -z "$RUN_DIR" ]; then
+    if [ "$AJ_REPAIRED" -eq 1 ]; then
+      node "$HERE/lib/node.mjs" tree "$PROJECT_DIR"
+      case "$AJ_OUTCOME" in
+        idle) saye "${C_G}✓${C_N} the chain finished — root node done (windows under .pi-supervisor/runs/)"; exit 0 ;;
+        *)    saye "${C_R}✗${C_N} the chain is not running — last step: ${AJ_OUTCOME:-no outcome recorded} (inspect .pi-supervisor/runs/)"; exit 1 ;;
+      esac
+    fi
     mkdir -p "$RUNROOT"
     n=0
     for d in "$RUNROOT"/run*; do
@@ -591,6 +630,13 @@ if [ "$ATTACHED" -eq 0 ]; then
         exit 1 ;;
     esac
 
+    # v0.26.0 (plan §5.5): the tree is the view — show it at launch too (the
+    # root node was just materialized by launch.mjs via --node; active.json
+    # names the window, so this is also the follow-the-slot entry point).
+    if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ]; then
+      node "$HERE/lib/node.mjs" tree "$PROJECT_DIR"
+    fi
+
     mkdir -p "$PROJECT_DIR/.pi-supervisor"
     echo "$RUN_DIR" > "$PTR"
     # keep run artifacts out of git's way (idempotent — the line is added once)
@@ -605,6 +651,9 @@ if [ "$ATTACHED" -eq 0 ]; then
       [ -n "$iso" ] && DEADLINE_EPOCH="$iso"
     fi
     RALPH_MODE=attach
+    if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
+      SUBRUNS_ATTACH_TREE=1   # v0.26.0: sub-runs project → the tree banner is the view
+    fi
   fi
 
   MONITOR_ARGS=(--run-dir "$RUN_DIR" --project-dir "$PROJECT_DIR" --deadline "$DEADLINE_EPOCH" "${ralph_flags[@]}")
@@ -679,6 +728,11 @@ trap 'stop_for_signal 143' TERM
 if [ "${RALPH_MODE:-launch}" = "attach" ]; then
   [ -n "$DEADLINE_EPOCH" ] || DEADLINE_EPOCH=$(status_field "$RUN_DIR/pi-child-status.json" deadlineIso 2>/dev/null)
   banner attach
+  if [ "${SUBRUNS_ATTACH_TREE:-0}" = "1" ]; then
+    echo
+    node "$HERE/lib/node.mjs" tree "$PROJECT_DIR"
+    echo
+  fi
 fi
 rc=0
 # the monitor runs in the background and ralph.sh waits on it: a trapped
