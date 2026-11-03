@@ -2160,6 +2160,33 @@ try {
     } catch { /* best effort — the stdout RESULT line still carries everything */ }
     plog(`[result] ${new Date().toISOString()} status=${result.status} exitReason=${outcome} attempts=${attempt} manifest=${manifestPath}\n`);
     writeStatus(result.status, outcome);
+    // v0.26.0 sub-runs: the chain step — the deterministic next-window
+    // transition (spawn / continuation / re-entry / halt). Runs AFTER the
+    // final status is durable and BEFORE exit; a chain failure must NEVER
+    // change this window's own exit code (plan §5.4). Only for windows
+    // launched with a project (PI_SUP_PROJECT set by launch.mjs).
+    try {
+      if (process.env.PI_SUP_PROJECT) {
+        const { step: chainStep } = await import("./lib/chain.mjs");
+        await chainStep(process.env.PI_SUP_PROJECT, outDir, {
+          repair: false,
+          launch: {
+            provider: provider || undefined,
+            model: model || undefined,
+            thinking: thinking || undefined,
+            preamble: "standard",
+            idleTimeoutSec: Math.round(idleTimeoutMs / 1000),
+            turnStallSec,
+            finalizeMin,
+            runtimeMin: 90,
+          },
+          log: (line) => logSup(`[chain] ${line}`),
+        });
+      }
+    } catch (e) {
+      logSup(`[chain] step failed (window outcome unchanged): ${e.message}`);
+      try { writeFileSync(join(outDir, "chain-error.json"), JSON.stringify({ at: new Date().toISOString(), error: e.message }, null, 2)); } catch { /* best effort */ }
+    }
     process.stdout.write(`\n=== RESULT === ${JSON.stringify(result)}\n`);
     exitCode = isCompleted ? 0 : isConsult ? 4 : 3;
   }
