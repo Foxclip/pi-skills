@@ -55,6 +55,12 @@ function report(name, ok, detail) {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  [" + detail + "]" : ""}`);
   if (!ok) failures++;
 }
+// v0.25.14: the monitor records its own exit code in <run-dir>/monitor-exit.json
+// (ralph.sh trusts it when the shell-side `wait` lost the status — bash 127).
+const exitFile = (d, code) => {
+  try { return JSON.parse(readFileSync(path.join(d, "monitor-exit.json"), "utf8")).code === code; }
+  catch { return false; }
+};
 const mkStatus = (dir, over = {}) => {
   const s = {
     v: 2, at: new Date().toISOString(), status: "running", guardPid: process.pid,
@@ -227,7 +233,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   mkStatus(d);
   const r = runRm(d, STUB_STOP, ["--once"]);
   report("R8 LLM STOP → exit 4",
-    r.status === 4 && /decision=STOP/.test(readLog(d)),
+    r.status === 4 && /decision=STOP/.test(readLog(d)) && exitFile(d, 4),
     `exit=${r.status}`);
 }
 
@@ -399,7 +405,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
     }, 300);
   });
   report("R16 SIGINT mid-loop → exit 130, sigint logged",
-    code === 130 && /sigint/.test(readLog(d)),
+    code === 130 && /sigint/.test(readLog(d)) && exitFile(d, 130),
     `exit=${code} log=${readLog(d).trim().split("\\n").map(l => l.slice(0, 60)).join(" | ")}`);
 }
 
@@ -481,6 +487,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   report("R22 deadline + child finalizing → grace wait → true state completed-finalized → exit 0 + report (event before STOP)",
     code === 0 && /deadline: child-terminal \(completed-finalized\)/.test(log) &&
       /final-report: written/.test(log) && existsSync(path.join(d, "FINAL-REPORT.md"))
+      && exitFile(d, 0)
       && evIdx !== -1 && stopIdx !== -1 && evIdx < stopIdx,
     `exit=${code} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.25.13: run a supervised child with zero arguments.
+# ralph.sh — v0.25.14: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -492,10 +492,24 @@ fi
 
 # ------------------------------------- foreground monitor + harvest on exit
 HARVEST_TARGET="$RUN_DIR"
+# v0.25.14: bash's `wait $MON_PID` can LOSE the monitor's exit status — rc 127
+# means "pid not a child of this shell", which can happen even when the monitor
+# exited cleanly (observed 2026-11-02: a completed run printed `✗ done · exit
+# 127`). The monitor records its own code in monitor-exit.json before it dies;
+# trust it when the wait's status was lost. Only rc 127 is resolved — a real 0/4/
+# 130/143 from wait is never touched, and a 127 with no file (e.g. `node` not
+# found) stays 127: that one is a real failure.
+resolve_monitor_rc() {
+  [ "$rc" -eq 127 ] && [ -n "$HARVEST_TARGET" ] && [ -f "$HARVEST_TARGET/monitor-exit.json" ] || return 0
+  local mon_rc
+  mon_rc=$(sed -n 's/.*"code"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' "$HARVEST_TARGET/monitor-exit.json" | head -n1)
+  case "$mon_rc" in ''|*[!0-9-]*) : ;; *) rc=$mon_rc ;; esac
+}
 on_exit() {
   local rc=$?
   local interrupted=0
   if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then interrupted=1; fi
+  resolve_monitor_rc
   if [ -n "$HARVEST_TARGET" ] && [ -d "$HARVEST_TARGET" ]; then
     harvest "$HARVEST_TARGET" "$interrupted" "$rc"
     if [ "$rc" -eq 0 ]; then saye "${C_G}✓ done · exit 0${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"

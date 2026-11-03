@@ -129,6 +129,19 @@ const saveState = () => writeFileSync(statePath, JSON.stringify(state, null, 2))
 const tsLocalShort = (d) => { const p = (n) => String(n).padStart(2, "0");
   return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`; };
 const flog = (line) => appendFileSync(logPath, `[${new Date().toISOString()}] ${line}\n`);
+// v0.25.14: the monitor's own record of its exit code. ralf.sh's `wait $MON_PID`
+// can LOSE the status (bash 5.2 nojobs: `wait <pid>` → 127 = "pid not a child
+// of this shell") even when the monitor exited cleanly — observed 2026-11-02:
+// a completed run printed `✗ done · exit 127`. ralf.sh trusts this file when
+// the wait reported 127. Written on every JS exit path (process.exit, crash,
+// natural end); NOT written on SIGKILL (no JS runs) — then ralf.sh keeps wait's rc.
+process.on("exit", (code) => {
+  try {
+    if (!A.runDir || !existsSync(A.runDir)) return;
+    writeFileSync(path.join(A.runDir, "monitor-exit.json"), `${JSON.stringify({ at: new Date().toISOString(), code })}\n`);
+    flog(`monitor-exit: code=${code}`);
+  } catch { /* best-effort — never mask the real exit code */ }
+});
 const tty = Boolean(process.stderr.isTTY) && !process.env.NO_COLOR;
 const C = (code) => (tty ? `\x1b[${code}m` : "");
 const tlog = (line) => process.stderr.write(line + "\n");

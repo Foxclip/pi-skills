@@ -156,6 +156,22 @@ grep -q -- "--thinking off" "$MARGS" 2>/dev/null \
 grep -q "think: off" $T/M.log && ok "M: banner shows the thinking level" || bad "M: banner ($(grep -m1 'models' $T/M.log))"
 stoprun $T/projM
 
+# ---- N: rc=127 (bash lost the monitor's status) → resolved from monitor-exit.json (v0.25.14)
+# the resolver is EXTRACTED from the shipped ralph.sh so the test tracks real code
+NDEF=$(sed -n '/^resolve_monitor_rc() {/,/^}/p' "$S/ralph.sh")
+[ -n "$NDEF" ] && ok "N: resolve_monitor_rc present in ralph.sh" || bad "N: resolver missing from ralph.sh"
+eval "$NDEF"
+mkdir -p $T/projN
+printf '{"at":"t","code":0}\n' > $T/projN/monitor-exit.json
+HARVEST_TARGET=$T/projN; rc=127; resolve_monitor_rc
+[ "$rc" -eq 0 ] && ok "N: rc=127 + monitor-exit.json code=0 → rc=0 (a completed run prints ✓)" || bad "N: rc=$rc (want 0)"
+rm -f $T/projN/monitor-exit.json
+HARVEST_TARGET=$T/projN; rc=127; resolve_monitor_rc
+[ "$rc" -eq 127 ] && ok "N: rc=127 + no file → rc stays 127 (a real failure stays red)" || bad "N: rc=$rc (want 127)"
+printf '{"at":"t","code":4}\n' > $T/projN/monitor-exit.json
+HARVEST_TARGET=$T/projN; rc=4; resolve_monitor_rc
+[ "$rc" -eq 4 ] && ok "N: rc=4 untouched (only the lost-status 127 is resolved)" || bad "N: rc=$rc (want 4)"
+
 # ---- G: stale child → exit 2 -------------------------------------------------
 mkproj $T/projG
 SD=$T/projG/.pi-supervisor/runs/run1; mkdir -p $SD
@@ -183,6 +199,7 @@ RC=$?
 [ "$RC" -eq 0 ] && [ -f $SD/FINAL-REPORT.md ] && grep -q "E2E stub" $SD/FINAL-REPORT.md \
   && ok "H: completed → FINAL-REPORT.md written, exit 0" || bad "H: rc=$RC $(tail -3 $T/H.log)"
 grep -q "final report" $T/H.log && ok "H: ralph.sh printed the final report to the terminal" || bad "H: report not printed"
+grep -q '"code":0' $SD/monitor-exit.json 2>/dev/null && ok "H: monitor-exit.json records the monitor's own code=0 (v0.25.14)" || bad "H: monitor-exit.json missing: $(cat $SD/monitor-exit.json 2>/dev/null)"
 
 # ---- I: v0.20.0 — parent STOP → FINAL-REPORT.md + exit 4 ----------------------
 # (30s pre-check sleep first — status is fresh so pre-checks pass, then the
