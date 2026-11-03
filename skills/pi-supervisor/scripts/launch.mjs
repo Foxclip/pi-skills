@@ -25,6 +25,14 @@
 //     --verify-sec <n>   stage-1 verification window (default 8)
 //     --grace-sec <n>    stage-2 grace if the status file is slow but the guard
 //                        process is alive (default 60)
+//     --project <dir>    the project dir (default: cwd) — the window is recorded
+//                        in <project>/.pi-supervisor/active.json, and the guard
+//                        (and hence the child) gets PI_SUP_CHILD/RUN_DIR/NODE/
+//                        PROJECT in its env: the sub-runs identity (v0.26.0 gate —
+//                        a child session's own env carries PI_SUP_CHILD, so
+//                        ralph.sh can refuse its direct launches)
+//     --node <path>      the node path this window belongs to (default: "(root)";
+//                        "auth" | "auth/deeper" for sub-project nodes)
 //
 // Behavior:
 //   - spawns guard.mjs with detached + hidden window (Windows) + unref — the
@@ -59,6 +67,7 @@ import { existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseDeadline, sizeDeadline, fmtLocal } from "./lib/deadline.mjs";
+import { activePath, writeJson } from "./lib/node.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -107,6 +116,8 @@ const VALUELESS = new Set([
 let guardPath = join(HERE, "guard.mjs");
 let verifySec = 8;
 let graceSec = 60;
+let projectDir = process.cwd(); // --project: home of .pi-supervisor/ (active.json)
+let nodePath = "(root)";        // --node: the node this window belongs to
 let deadlineRaw = null; // --deadline <time>: size --timeout so finalize lands on this wall clock
 let task = null;
 let taskFromFlag = false; // --task/--task-file values stay in passthrough; only a positional task is prepended
@@ -123,6 +134,8 @@ for (let i = 0; i < argv.length; i++) {
   if (x === "--guard") { guardPath = argv[++i]; pendingValueFor = null; continue; }
   if (x === "--verify-sec") { verifySec = Number(argv[++i]); pendingValueFor = null; continue; }
   if (x === "--grace-sec") { graceSec = Number(argv[++i]); pendingValueFor = null; continue; }
+  if (x === "--project") { projectDir = argv[++i]; pendingValueFor = null; continue; }
+  if (x === "--node") { nodePath = argv[++i]; pendingValueFor = null; continue; }
   if (x === "--deadline") { deadlineRaw = argv[++i]; pendingValueFor = null; continue; }
   if (x === "--") { passthrough.push(x); pendingValueFor = null; continue; }
   if (x.startsWith("--")) {
@@ -212,7 +225,18 @@ if (deadlineRaw !== null) {
 
 // Launch: detached + unref → survives the caller's timeout. Hidden window on
 // Windows (detached implies CREATE_NEW_CONSOLE; windowsHide suppresses it).
+// The guard's env carries the sub-runs identity (v0.26.0): RpcClient spawns the
+// child pi with {...process.env, ...}, so PI_SUP_* reaches the child's shell
+// tools — ralph.sh reads PI_SUP_CHILD to refuse a child's direct launches, and
+// the guard keeps PI_SUP_RUN_DIR for the chain hook.
 const guardArgs = taskFromFlag ? [guardPath, ...passthrough] : [guardPath, task, ...passthrough];
+const guardEnv = {
+  ...process.env,
+  PI_SUP_CHILD: "1",
+  PI_SUP_RUN_DIR: outDir,
+  PI_SUP_NODE: nodePath,
+  PI_SUP_PROJECT: projectDir,
+};
 try {
   const outFd = openSync(join(outDir, "launch.out"), "a");
   const errFd = openSync(join(outDir, "launch.err"), "a");
@@ -220,11 +244,32 @@ try {
     detached: true,
     windowsHide: true,
     stdio: ["ignore", outFd, errFd],
+    env: guardEnv,
   });
 } catch (e) {
   fail(`spawn failed: ${e.message}`);
 }
 child.unref();
+
+// active.json — the active-slot pointer (single-writer: launch.mjs at window
+// START, the chain step at window END). Readers must liveness-check guard_pid;
+// a stale pointer after a crash is harmless (the chain step / ralph.sh repair
+// re-derive the truth from the run tree).
+try {
+  const base = outDir.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || null;
+  writeJson(activePath(projectDir), {
+    run_dir: outDir,
+    node: nodePath,
+    guard_pid: child.pid,
+    window: /^run-\d+$/.test(base || "") ? base : null,
+    started_at: new Date().toISOString(),
+    deadline: deadlineInfo ? deadlineInfo.deadline : null,
+  });
+} catch (e) {
+  // the pointer is a convenience for the terminal's follow-the-slot — a write
+  // failure must not kill the launch (the run tree is the source of truth)
+  process.stderr.write(`[launch] active.json write failed (ignored): ${e.message}\n`);
+}
 
 // Verify (two stages). Stage 1 (--verify-sec): wait for the status file.
 // Stage 2 (--grace-sec): file still missing but the guard PROCESS is alive →

@@ -93,6 +93,16 @@
 #                                  A still-running ralph.sh monitor notices the
 #                                  dead child on its next pre-check (≤5s) and
 #                                  exits by itself — no need to kill it.
+#   ralph.sh spawn --name <node> --task <file> [--deadline <t>] [--runtime <m>]
+#                                  [--reason <text>]     (v0.26.0 — THE CHILD'S
+#                                  API, run from inside a supervised window:
+#                                  writes spawn-request.json into this window's
+#                                  run dir and prints a receipt. It NEVER
+#                                  launches — the chain step launches the child
+#                                  node when this window ends. A child's direct
+#                                  launches (zero-arg ralph.sh) are DENIED via
+#                                  the PI_SUP_CHILD gate; see SKILL.md
+#                                  "Sub-runs (nodes, spawn requests, the chain)").
 #
 set -euo pipefail
 
@@ -169,6 +179,88 @@ banner() { # $1=mode: launch|attach — uses RUN_DIR, DEADLINE_EPOCH, PROJECT_DI
   printf '└%s\n' "$(rule)"
   } >&2; }
 
+dur_sec() { # $1: 90 | 45s | 90m | 2h | 1d | 1h30m → seconds (a bare number = minutes)
+  local s="$1" total
+  if [[ "$s" =~ ^[0-9]+$ ]]; then [ "$s" -gt 0 ] || return 1; echo $(( s * 60 )); return 0; fi
+  [[ "$s" =~ ^([0-9]+d)?([0-9]+h)?([0-9]+m)?([0-9]+s)?$ ]] || return 1
+  local d="${BASH_REMATCH[1]%%d*}" h="${BASH_REMATCH[2]%%h*}" m="${BASH_REMATCH[3]%%m*}" sec="${BASH_REMATCH[4]%%s*}"
+  total=$(( ${d:-0} * 86400 + ${h:-0} * 3600 + ${m:-0} * 60 + ${sec:-0} ))
+  [ "$total" -gt 0 ] || return 1
+  echo "$total"
+}
+
+# ------------------------------------------------------------- spawn (v0.26.0)
+# THE CHILD'S API — dispatched BEFORE the global CLI flag parser: spawn's own
+# flags (--task / --runtime / --deadline) share names with the wrapper's launch
+# knobs and must not be eaten as those. The child writes a request file; the
+# chain step (supervisor side) does the launching. The child's env carries
+# PI_SUP_RUN_DIR (set by launch.mjs) — without it, this is not a child.
+if [ "${1:-}" = "spawn" ]; then
+  shift
+  SP_NAME=""; SP_TASK=""; SP_DEADLINE=""; SP_RUNTIME=""; SP_REASON=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)      [ $# -ge 2 ] || { saye "${C_R}✗${C_N} spawn: --name needs a value"; exit 2; }; SP_NAME=$2; shift 2 ;;
+      --name=*)    SP_NAME=${1#*=}; shift ;;
+      --task)      [ $# -ge 2 ] || { saye "${C_R}✗${C_N} spawn: --task needs a value"; exit 2; }; SP_TASK=$2; shift 2 ;;
+      --task=*)    SP_TASK=${1#*=}; shift ;;
+      --deadline)  [ $# -ge 2 ] || { saye "${C_R}✗${C_N} spawn: --deadline needs a value"; exit 2; }; SP_DEADLINE=$2; shift 2 ;;
+      --deadline=*) SP_DEADLINE=${1#*=}; shift ;;
+      --runtime)   [ $# -ge 2 ] || { saye "${C_R}✗${C_N} spawn: --runtime needs a value"; exit 2; }; SP_RUNTIME=$2; shift 2 ;;
+      --runtime=*) SP_RUNTIME=${1#*=}; shift ;;
+      --reason)    [ $# -ge 2 ] || { saye "${C_R}✗${C_N} spawn: --reason needs a value"; exit 2; }; SP_REASON=$2; shift 2 ;;
+      --reason=*)  SP_REASON=${1#*=}; shift ;;
+      -h|--help)
+        cat <<'USAGE'
+ralph.sh spawn — request a sub-run (a sub-project node) from inside a window
+  ralph.sh spawn --name <node> --task <file> [--deadline <ISO|HH:MM|epoch>]
+                 [--runtime <duration>] [--reason <text>]
+Writes spawn-request.json into this window's run dir and prints a receipt.
+It NEVER launches: the chain step launches the child node when this window
+ends, and re-enters this node afterwards. END YOUR TURN after spawning —
+direct launches are denied for child sessions (the PI_SUP_CHILD gate).
+USAGE
+        exit 0 ;;
+      *) saye "${C_R}✗${C_N} spawn: unknown argument: $1"; exit 2 ;;
+    esac
+  done
+  if [ -z "${PI_SUP_RUN_DIR:-}" ] || [ ! -d "${PI_SUP_RUN_DIR:-}" ]; then
+    saye "${C_R}✗${C_N} spawn: not inside a supervised window (PI_SUP_RUN_DIR is missing)"
+    sayc "${C_D}spawn is the CHILD's API — meant to run inside a ralph window. To start a project the normal way: write TASK.md and run ralph.sh.${C_N}"
+    exit 1
+  fi
+  [ -n "$SP_NAME" ] || { saye "${C_R}✗${C_N} spawn: --name is required (the sub-project node name)"; exit 2; }
+  [[ "$SP_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { saye "${C_R}✗${C_N} spawn: bad node name \"${SP_NAME}\" — [A-Za-z0-9][A-Za-z0-9._-]* (no slashes, spaces, or leading dots)"; exit 2; }
+  [[ "$SP_NAME" =~ ^run-[0-9]+$ ]] && { saye "${C_R}✗${C_N} spawn: node name \"${SP_NAME}\" collides with the window names (run-N)"; exit 2; }
+  [ -n "$SP_TASK" ] || { saye "${C_R}✗${C_N} spawn: --task <file> is required (write the sub-project's task file first)"; exit 2; }
+  case "$SP_TASK" in /*) SP_TASK_ABS=$SP_TASK ;; *) SP_TASK_ABS="$PWD/$SP_TASK" ;; esac
+  [ -f "$SP_TASK_ABS" ] || { saye "${C_R}✗${C_N} spawn: task file not found: $SP_TASK_ABS"; exit 2; }
+  [ -s "$SP_TASK_ABS" ] || { saye "${C_R}✗${C_N} spawn: task file is empty: $SP_TASK_ABS"; exit 2; }
+  SP_RUNTIME_MIN=""
+  if [ -n "$SP_RUNTIME" ]; then
+    SP_RUNTIME_SEC="$(dur_sec "$SP_RUNTIME")" \
+      || { saye "${C_R}✗${C_N} spawn: bad --runtime \"${SP_RUNTIME}\" — use bare minutes (90) or a duration (45s/90m/2h/1h30m)"; exit 2; }
+    SP_RUNTIME_MIN=$(( (SP_RUNTIME_SEC + 59) / 60 ))
+  fi
+  SP_REQ="${PI_SUP_RUN_DIR}/spawn-request.json"
+  SP_REQ_JSON="$(SP_NAME="$SP_NAME" SP_TASK_ABS="$SP_TASK_ABS" SP_DEADLINE="$SP_DEADLINE" SP_RUNTIME_MIN="$SP_RUNTIME_MIN" SP_REASON="$SP_REASON" SP_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" node -e '
+const j = {
+  kind: "spawn",
+  node: process.env.SP_NAME,
+  task: process.env.SP_TASK_ABS,
+  deadline: process.env.SP_DEADLINE || null,
+  runtime_min: process.env.SP_RUNTIME_MIN ? Number(process.env.SP_RUNTIME_MIN) : null,
+  reason: process.env.SP_REASON || null,
+  at: process.env.SP_AT,
+};
+process.stdout.write(JSON.stringify(j, null, 2) + "\n");')" \
+    || { saye "${C_R}✗${C_N} spawn: failed to build the request JSON"; exit 1; }
+  printf '%s\n' "$SP_REQ_JSON" > "$SP_REQ" || { saye "${C_R}✗${C_N} spawn: cannot write $SP_REQ"; exit 1; }
+  saye "${C_G}✓${C_N} spawn request written: $SP_REQ"
+  saye "${C_D}·${C_N} node=${SP_NAME} task=${SP_TASK_ABS}${SP_DEADLINE:+ deadline=${SP_DEADLINE}}${SP_RUNTIME_MIN:+ runtime=${SP_RUNTIME_MIN}m} — the chain step launches it when this window ends; this node will be re-entered afterwards. END THE TURN now (do not launch anything yourself).${C_N}"
+  exit 0
+fi
+
 # ------------------------------------------------------------- CLI flags
 # The four most-used knobs as flags, parseable BEFORE mode dispatch so they
 # work in normal (zero-arg) mode: --deadline / --runtime / --child-model /
@@ -200,6 +292,9 @@ ralph.sh — supervised pi child (ralph loop). Zero-arg pipeline:
   ralph.sh <run-dir> [flags]   attach to an existing run (power-user)
   ralph.sh stop [--all | <run-dir>] [--force]   stop a run's processes + harvest it
   ralph.sh --harvest <run-dir> [dest-dir]       harvest (re-runnable)
+  ralph.sh spawn --name <node> --task <file> [--deadline <t>] [--runtime <m>]
+                       [--reason <text>]   THE CHILD'S API (inside a window):
+                       writes spawn-request.json; the chain step launches it
   ralph.sh -h | --help         this help
 normal-mode flags (anywhere in the arg list): --deadline <ISO|HH:MM|epoch>
   --runtime <duration>    relative deadline: 90 = 90min, or 45s/90m/2h/1h30m
@@ -219,15 +314,6 @@ USAGE
 done
 if [ ${#_cli_pos[@]} -gt 0 ]; then set -- "${_cli_pos[@]}"; else set --; fi
 
-dur_sec() { # $1: 90 | 45s | 90m | 2h | 1d | 1h30m → seconds (a bare number = minutes)
-  local s="$1" total
-  if [[ "$s" =~ ^[0-9]+$ ]]; then [ "$s" -gt 0 ] || return 1; echo $(( s * 60 )); return 0; fi
-  [[ "$s" =~ ^([0-9]+d)?([0-9]+h)?([0-9]+m)?([0-9]+s)?$ ]] || return 1
-  local d="${BASH_REMATCH[1]%%d*}" h="${BASH_REMATCH[2]%%h*}" m="${BASH_REMATCH[3]%%m*}" sec="${BASH_REMATCH[4]%%s*}"
-  total=$(( ${d:-0} * 86400 + ${h:-0} * 3600 + ${m:-0} * 60 + ${sec:-0} ))
-  [ "$total" -gt 0 ] || return 1
-  echo "$total"
-}
 DEADLINE_RAW="${DEADLINE:-}"
 RUNTIME_RAW="${RUNTIME:-}"
 DEADLINE_USER_SET=0   # --deadline or --runtime given (env or flag) → do NOT adopt a run's stored deadline
@@ -416,6 +502,16 @@ fi
 
 # ------------------------------------------------------------- zero-arg mode
 if [ "$ATTACHED" -eq 0 ]; then
+  # v0.26.0 gate — pure caller identity: this process was launched by
+  # launch.mjs inside a supervised window (PI_SUP_CHILD set in its env), so it
+  # is a CHILD session, and child sessions never launch ("agents propose,
+  # supervisor disposes"): the only project-mutating API is `ralph.sh spawn`
+  # (request file — it launches nothing). Monitor scripts and users are never
+  # marked, so they are never blocked (warnings only, per the gate contract).
+  if [ -n "${PI_SUP_CHILD:-}" ]; then
+    saye "${C_R}✗${C_N} denied: direct launches by child sessions are unauthorized — spawn a sub-run with 'ralph.sh spawn --name <node> --task <file>' (it never launches; the chain step does, when your window ends), then end your turn."
+    exit 1
+  fi
   TASK_FILE="${TASK_FILE:-TASK.md}"
   if [ ! -f "$TASK_FILE" ]; then
     saye "${C_R}✗${C_N} no $TASK_FILE in $(pwd)"
@@ -470,6 +566,7 @@ if [ "$ATTACHED" -eq 0 ]; then
     fi
 
     launch_args=(--task-file "$TASK_FILE" --out-dir "$RUN_DIR"
+                 --project "$PROJECT_DIR" --node "(root)"
                  --deadline "$DEADLINE_EPOCH"
                  --preamble "${PREAMBLE:-standard}"
                  --idle-timeout "${IDLE_TIMEOUT:-300}"

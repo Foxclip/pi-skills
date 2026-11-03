@@ -246,6 +246,93 @@ grep -qE '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] · child launched' $T/C.log \
 grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}\.[0-9]{3}Z\] cycle=' $T/projC/.pi-supervisor/runs/run1/ralph-monitor.log 2>/dev/null \
   && ok "K: ralph-monitor.log keeps ISO UTC" || bad "K: log file format"
 
+# ---- S: v0.26.0 sub-runs — the PI_SUP_CHILD gate + the spawn API --------------
+# S1: a CHILD session (PI_SUP_CHILD set in env — launch.mjs always does for
+# children) may never launch: zero-arg mode must refuse BEFORE launch.mjs.
+mkdir -p $T/projS1 && cd $T/projS1
+echo "# task" > TASK.md
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK DEADLINE=$DEADLINE PI_SUP_CHILD=1 ralph.sh > $T/S1.log 2>&1
+RC=$?
+[ "$RC" -eq 1 ] && grep -q "unauthorized" $T/S1.log && [ ! -d .pi-supervisor ] \
+  && ok "S1: PI_SUP_CHILD=1 → zero-arg launch denied (exit 1, no run dir)" \
+  || bad "S1: rc=$RC $(head -3 $T/S1.log)"
+
+# S2: spawn outside a window (no PI_SUP_RUN_DIR) → exit 1, clear message
+cd $T/projS1
+PATH="$T/sandbox/scripts:$PATH" ralph.sh spawn --name sub-a --task TASK.md > $T/S2.log 2>&1
+RC=$?
+[ "$RC" -eq 1 ] && grep -q "not inside a supervised window" $T/S2.log \
+  && ok "S2: spawn without PI_SUP_RUN_DIR → exit 1" || bad "S2: rc=$RC $(head -3 $T/S2.log)"
+
+# S3: spawn inside a window → exit 0 + a well-formed request file
+SRD=$T/projS1/.pi-supervisor/runs/run1; mkdir -p $SRD
+echo "# Sub-project task" > $T/spawn-task.md
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$SRD ralph.sh spawn --name sub-a \
+  --task $T/spawn-task.md --runtime 90 --reason "split the work" > $T/S3.log 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && [ -f $SRD/spawn-request.json ] \
+  && ok "S3: spawn → exit 0 + spawn-request.json" || bad "S3: rc=$RC $(head -3 $T/S3.log)"
+S3JSON=$(cat $SRD/spawn-request.json 2>/dev/null)
+echo "$S3JSON" | node -e '
+const r = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const okJ = r.kind === "spawn" && r.node === "sub-a"
+  && r.task === process.argv[1] && r.runtime_min === 90 && r.deadline === null
+  && r.reason === "split the work" && /Z$/.test(r.at);
+process.exit(okJ ? 0 : 1);' "$T/spawn-task.md" \
+  && ok "S3: request JSON fields (kind/node/task/runtime_min/deadline/reason/at)" \
+  || bad "S3: bad JSON: $S3JSON"
+
+# S4: --deadline passthrough + = form + relative task path resolved against $PWD
+cd $T
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$SRD ralph.sh spawn \
+  --name=sub-b --task=spawn-task.md --deadline="2026-12-01T00:00:00Z" > $T/S4.log 2>&1
+RC=$?
+S4JSON=$(cat $SRD/spawn-request.json 2>/dev/null)
+[ "$RC" -eq 0 ] && echo "$S4JSON" | grep -q '"node": "sub-b"' \
+  && echo "$S4JSON" | grep -q "\"deadline\": \"2026-12-01T00:00:00Z\"" \
+  && echo "$S4JSON" | grep -q "\"task\": \"$T/spawn-task.md\"" \
+  && echo "$S4JSON" | grep -q '"runtime_min": null' \
+  && ok "S4: = form + --deadline passthrough + relative task → abs" \
+  || bad "S4: rc=$RC $S4JSON"
+
+# S5: bad node names → exit 2 (run-N collision; spaces)
+cd $T/projS1
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$SRD ralph.sh spawn --name run-5 --task $T/spawn-task.md > $T/S5a.log 2>&1
+RC1=$?
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$SRD ralph.sh spawn --name "bad name" --task $T/spawn-task.md > $T/S5b.log 2>&1
+RC2=$?
+[ "$RC1" -eq 2 ] && [ "$RC2" -eq 2 ] && grep -q "collides" $T/S5a.log && grep -q "bad node name" $T/S5b.log \
+  && ok "S5: bad node names rejected (run-N collision, spaces)" \
+  || bad "S5: rc1=$RC1 rc2=$RC2 $(head -2 $T/S5a.log) $(head -2 $T/S5b.log)"
+
+# S6: missing / empty task file → exit 2; missing required flags → exit 2
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$SRD ralph.sh spawn --name sub-c --task $T/nope.md > $T/S6a.log 2>&1
+RC1=$?
+: > $T/empty-task.md
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$SRD ralph.sh spawn --name sub-c --task $T/empty-task.md > $T/S6b.log 2>&1
+RC2=$?
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$SRD ralph.sh spawn > $T/S6c.log 2>&1
+RC3=$?
+[ "$RC1" -eq 2 ] && [ "$RC2" -eq 2 ] && [ "$RC3" -eq 2 ] && grep -q "task file not found" $T/S6a.log && grep -q "task file is empty" $T/S6b.log \
+  && ok "S6: missing/empty task + missing flags → exit 2" \
+  || bad "S6: rc1=$RC1 rc2=$RC2 rc3=$RC3"
+
+# S7: spawn --help → exit 0 even outside a window (help is not a spawn)
+PATH="$T/sandbox/scripts:$PATH" ralph.sh spawn --help > $T/S7.log 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && grep -q "request a sub-run" $T/S7.log && grep -q "NEVER launches" $T/S7.log \
+  && ok "S7: spawn --help works outside a window" || bad "S7: rc=$RC $(head -3 $T/S7.log)"
+
+# S8: zero-arg launch forwards --project/--node to launch.mjs (case C's args file)
+grep -q -- "--project $T/projC --node (root)" $T/projC/.pi-supervisor/runs/run1/launch-args.txt 2>/dev/null \
+  && ok "S8: launch.mjs got --project + --node (root)" \
+  || bad "S8: $(cat $T/projC/.pi-supervisor/runs/run1/launch-args.txt 2>/dev/null)"
+
+# S9: --help lists the spawn API
+cd $T/projS1
+PATH="$T/sandbox/scripts:$PATH" ralph.sh --help > $T/S9.log 2>&1
+grep -q "ralph.sh spawn" $T/S9.log && ok "S9: --help documents spawn" || bad "S9: $(grep -c spawn $T/S9.log)"
+
 echo ""
 echo "=== $PASS passed, $FAIL failed (sandbox: $T) ==="
 pkill -f "sleep 600" 2>/dev/null
