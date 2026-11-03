@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.25.16: run a supervised child with zero arguments.
+# ralph.sh — v0.26.0: run a supervised child with zero arguments.
+# (v0.26.0 = sub-runs: spawn requests + the guard-driven chain step; see SKILL.md)
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)

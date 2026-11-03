@@ -80,9 +80,12 @@ const report = (name, ok, detail = "") => {
 };
 
 async function runLaunch(outDir, extra = []) {
+  // --project: keep launch.mjs's .pi-supervisor/ (active.json) in the sandbox
+  // root, never the caller's cwd (launch.mjs defaults projectDir to cwd).
   const r = spawnSync(node, [
     path.join(HERE, "launch.mjs"), "--guard", FAKE_GUARD, "fake task",
     "--out-dir", outDir, ...extra, "--verify-sec", "6",
+    "--project", root,
   ], { encoding: "utf8", timeout: 30000 });
   let j = null;
   try { j = JSON.parse(r.stdout.trim().split("\n").pop()); } catch {}
@@ -204,6 +207,7 @@ function killTree(pid) {
   const r = spawnSync(node, [
     path.join(HERE, "launch.mjs"), "--guard", FAKE_GUARD, "fake task",
     "--state-dir", d, "--tag", "v1name", "--mode", "idle", "--verify-sec", "6",
+    "--project", root,
   ], { encoding: "utf8", timeout: 30000 });
   let j = null; try { j = JSON.parse(r.stdout.trim().split("\n").pop()); } catch {}
   const stExists = existsSync0(path.join(d, "pi-child-status.json"));

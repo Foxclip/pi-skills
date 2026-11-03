@@ -65,6 +65,11 @@ function launch(outDir, extra = []) {
   const r = spawnSync(node, [
     path.join(HERE, "launch.mjs"), "--guard", FAKE, "fake task",
     "--out-dir", outDir, ...extra, "--verify-sec", "4",
+    // --project: keep launch.mjs's .pi-supervisor/ (active.json) in the
+    // sandbox root, never the caller's cwd (launch.mjs resolves the project
+    // from cwd by default, NOT from PI_SUP_PROJECT — that env var is what
+    // launch.mjs hands to the GUARD, not what it reads itself).
+    "--project", root,
   ], { encoding: "utf8", timeout: 40000 });
   let j = null;
   try { j = JSON.parse(r.stdout.trim().split("\n").pop()); } catch {}
