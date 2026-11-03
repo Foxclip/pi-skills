@@ -122,7 +122,8 @@ function resolveCampaignFile() {
   const dir = path.join(process.cwd(), ".pi-supervisor");
   if (A.values.name) return path.join(dir, `${A.values.name}.json`);
   try {
-    const files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+    // active.json is the sub-runs slot pointer (v0.26.0) — infra, not a campaign
+    const files = readdirSync(dir).filter((f) => f.endsWith(".json") && f !== "active.json");
     if (files.length === 1) return path.join(dir, files[0]);
   } catch { /* no .pi-supervisor in cwd */ }
   return null;
