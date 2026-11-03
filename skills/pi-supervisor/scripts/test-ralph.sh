@@ -160,6 +160,7 @@ stoprun $T/projM
 # the resolver is EXTRACTED from the shipped ralph.sh so the test tracks real code
 NDEF=$(sed -n '/^resolve_monitor_rc() {/,/^}/p' "$S/ralph.sh")
 [ -n "$NDEF" ] && ok "N: resolve_monitor_rc present in ralph.sh" || bad "N: resolver missing from ralph.sh"
+rlog() { :; }   # v0.25.15: the resolver now rlogs its decision — stub for the suite shell
 eval "$NDEF"
 mkdir -p $T/projN
 printf '{"at":"t","code":0}\n' > $T/projN/monitor-exit.json
@@ -200,6 +201,18 @@ RC=$?
   && ok "H: completed → FINAL-REPORT.md written, exit 0" || bad "H: rc=$RC $(tail -3 $T/H.log)"
 grep -q "final report" $T/H.log && ok "H: ralph.sh printed the final report to the terminal" || bad "H: report not printed"
 grep -q '"code":0' $SD/monitor-exit.json 2>/dev/null && ok "H: monitor-exit.json records the monitor's own code=0 (v0.25.14)" || bad "H: monitor-exit.json missing: $(cat $SD/monitor-exit.json 2>/dev/null)"
+
+# ---- O: v0.25.15 — ralph.log: the wrapper's own on-disk record -------------
+# case H's attach run went through the full tail (monitor launch, wait,
+# on_exit + harvest), so ralph.log must carry the whole lifecycle — this is
+# what was missing on 2026-11-02 (the `exit 127` run left nothing on disk)
+RL=$SD/ralph.log
+grep -q "ralph.sh start" $RL 2>/dev/null && grep -q "monitor launched (mon_pid=" $RL 2>/dev/null \
+  && ok "O: ralph.log has start + monitor launched (mon_pid)" || bad "O: ralph.log start/launch missing: $(head -5 $RL 2>/dev/null)"
+grep -qE "monitor wait rc=0 \(mon_pid=[0-9]+, waited [0-9]+s\)" $RL 2>/dev/null \
+  && ok "O: ralph.log has wait bookends (rc + waited Ns)" || bad "O: ralph.log wait line: $(grep 'monitor wait' $RL 2>/dev/null)"
+grep -q "exit rc=0 interrupted=0" $RL 2>/dev/null && grep -q "final: .*done · exit 0" $RL 2>/dev/null \
+  && ok "O: ralph.log has exit + final lines" || bad "O: ralph.log exit/final: $(tail -3 $RL 2>/dev/null)"
 
 # ---- I: v0.20.0 — parent STOP → FINAL-REPORT.md + exit 4 ----------------------
 # (30s pre-check sleep first — status is fresh so pre-checks pass, then the

@@ -36,6 +36,8 @@
 //       human stop digest line, no raw JSON)
 //   R34 stop.mjs: childPid null (real guards) + group kill → child confirmed
 //       dead via the empty process group, not "unknown" (v0.25.12)
+//   R35 judgment calls fully on disk: llm/<tag>.{out,err} + judgment-start/end
+//       flog lines with child state + durations (v0.25.15)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
 import { spawn, spawnSync } from "node:child_process";
@@ -763,7 +765,11 @@ const waitExit = (p, ms) => new Promise((resolve) => {
 
   // R20 pty → ANSI colors; NO_COLOR → plain
   const ttyLog = path.join(root, "r20.tty"), plainLog = path.join(root, "r20.plain");
-  spawnSync("bash", ["-c", `cd ${proj} && PI=${STUB_OK} script -qec "bash ${SBX_RALPH} ${rd}" /dev/null > ${ttyLog} 2>&1 || true`], { timeout: 60000 });
+  // v0.25.15: hermetic env — a surrounding shell that exports NO_COLOR (CI,
+  // some terminal profiles) would silently strip the colors and fail this
+  // assertion; drop it here (the plain run sets NO_COLOR=1 explicitly).
+  const { NO_COLOR: _nc, ...r20Env } = process.env;
+  spawnSync("bash", ["-c", `cd ${proj} && PI=${STUB_OK} script -qec "bash ${SBX_RALPH} ${rd}" /dev/null > ${ttyLog} 2>&1 || true`], { env: { ...r20Env, PI: STUB_OK }, timeout: 60000 });
   spawnSync("bash", ["-c", `cd ${proj} && PI=${STUB_OK} NO_COLOR=1 script -qec "bash ${SBX_RALPH} ${rd}" /dev/null > ${plainLog} 2>&1 || true`], { timeout: 60000 });
   const t = readFileSync(ttyLog, "utf8"), pl = readFileSync(plainLog, "utf8");
   // v0.24.1: success closer is GREEN (was bold white); failure closer is red
@@ -876,6 +882,24 @@ const waitExit = (p, ms) => new Promise((resolve) => {
     && /process group/.test(j.childNote || ""),
     `rc=${r.status} stopped=${j.stopped} via=${j.stoppedVia} guard=${j.confirmedDead && j.confirmedDead.guard} child=${j.confirmedDead && j.confirmedDead.child} note=${(j.childNote || "").slice(0, 90)}`);
   }
+}
+
+// ---- R35: v0.25.15 — the judgment call is fully observable on disk
+// (before: only the last stderr line survived — a startup auth failure was
+//  unpinnable to its exact variant, a 600s-hung call left zero evidence)
+{
+  const d = runDir("r35");
+  mkStatus(d);
+  const r = runRm(d, STUB_OK, ["--once"]);
+  const log = readLog(d);
+  const jout = path.join(d, "llm", "cycle-1-judgment.out");
+  report("R35 judgment: llm/ call dump + judgment-start/end lines (v0.25.15)",
+    r.status === 0
+    && existsSync(jout) && readFileSync(jout, "utf8").includes("DECISION: OK")
+    && existsSync(path.join(d, "llm", "cycle-1-judgment.err"))
+    && /cycle=1 judgment-start .*child status=running toolCalls=3 last=bash/.test(log)
+    && /cycle=1 judgment-end dur=\d+s exit=0 io=llm\/cycle-1-judgment\.\{out,err\}/.test(log),
+    `exit=${r.status} log=${log.trim().split("\n").slice(-3).join(" | ").slice(0, 220)}`);
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);

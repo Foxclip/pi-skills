@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.25.14: run a supervised child with zero arguments.
+# ralph.sh — v0.25.15: run a supervised child with zero arguments.
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -123,6 +123,17 @@ else C_B=""; C_D=""; C_G=""; C_Y=""; C_R=""; C_N=""; fi
 say()  { printf '[%s] %s\n' "$(ts)" "$*"; }
 saye() { printf '%s[%s]%s %s\n' "$C_D" "$(ts_s)" "$C_N" "$*" >&2; }
 sayc() { printf '%s[%s]%s     %s\n' "$C_D" "$(ts_s)" "$C_N" "$*" >&2; }   # continuation: dim, indented under the glyph column
+# v0.25.15: the wrapper's own on-disk record — <run-dir>/ralph.log. Before this,
+# everything ralph.sh said lived only in terminal scrollback: the 2026-11-02 run
+# that printed `✗ done · exit 127` left no trace of which shell waited on which
+# monitor pid for how long, and the mechanism had to be proved from the bash
+# source instead of read from a log. No-op until RUN_DIR is set; never fails.
+rlog() {
+  local rd="${RUN_DIR:-}"
+  [ -n "$rd" ] && [ -d "$rd" ] || return 0
+  printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)" "$*" >> "$rd/ralph.log" 2>/dev/null || true
+  return 0
+}
 human_secs() { local s=${1:-0} h m r; case "$s" in ''|*[!0-9]*) echo "${s}s"; return;; esac
   if [ "$s" -ge 3600 ]; then h=$((s / 3600)); m=$(( (s % 3600) / 60 )); [ "$m" -eq 0 ] && echo "${h}h" || echo "${h}h ${m}m";
   elif [ "$s" -ge 60 ]; then m=$((s / 60)); r=$((s % 60)); [ "$r" -eq 0 ] && echo "${m}m" || echo "${m}m ${r}s";
@@ -492,6 +503,13 @@ fi
 
 # ------------------------------------- foreground monitor + harvest on exit
 HARVEST_TARGET="$RUN_DIR"
+# v0.25.15: ralph.log — the wrapper's own on-disk record (see rlog): the
+# invocation, the config snapshot, the monitor pid, the wait bookends, the exit.
+SCRIPT_SHA_AT_START="$(sha256sum "$HERE/ralph.sh" 2>/dev/null | cut -d' ' -f1 || true)"
+rlog "ralph.sh start mode=${RALPH_MODE:-launch} pid=$$ ppid=$PPID bash=$BASH_VERSION run_dir=$RUN_DIR"
+rlog "script sha256=${SCRIPT_SHA_AT_START:-?} mtime=$(stat -c %Y "$HERE/ralph.sh" 2>/dev/null || echo ?)"
+rlog "config child_model=${CHILD_MODEL_VAL:-pi-default} child_thinking=${CHILD_THINKING:--} parent_model=${PARENT_MODEL_VAL:-pi-default} deadline_epoch=${DEADLINE_EPOCH:-?} cycle_sec=${CYCLE_SEC:-1200}"
+rlog "monitor command: node $HERE/ralph-monitor.mjs ${MONITOR_ARGS[*]}"
 # v0.25.14: bash's `wait $MON_PID` can LOSE the monitor's exit status — rc 127
 # means "pid not a child of this shell", which can happen even when the monitor
 # exited cleanly (observed 2026-11-02: a completed run printed `✗ done · exit
@@ -504,6 +522,7 @@ resolve_monitor_rc() {
   local mon_rc
   mon_rc=$(sed -n 's/.*"code"[[:space:]]*:[[:space:]]*\(-\{0,1\}[0-9]\{1,\}\).*/\1/p' "$HARVEST_TARGET/monitor-exit.json" | head -n1)
   case "$mon_rc" in ''|*[!0-9-]*) : ;; *) rc=$mon_rc ;; esac
+  rlog "rc resolution: wait reported 127 (status lost) — monitor-exit.json code=${mon_rc:-?} → rc=$rc"
 }
 on_exit() {
   local rc=$?
@@ -511,9 +530,19 @@ on_exit() {
   if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then interrupted=1; fi
   resolve_monitor_rc
   if [ -n "$HARVEST_TARGET" ] && [ -d "$HARVEST_TARGET" ]; then
+    # v0.25.15: was the script edited on disk mid-run? (2026-11-02 run: the
+    # skills repo was committed at 22:09Z INSIDE a 3h run — forensics had to
+    # prove by hand that the tail region was byte-identical.)
+    local sha_now
+    sha_now="$(sha256sum "$HERE/ralph.sh" 2>/dev/null | cut -d' ' -f1 || true)"
+    if [ -n "${SCRIPT_SHA_AT_START:-}" ] && [ -n "$sha_now" ] && [ "$sha_now" != "$SCRIPT_SHA_AT_START" ]; then
+      rlog "WARNING: ralph.sh changed on disk mid-run (sha ${SCRIPT_SHA_AT_START:0:12}… → ${sha_now:0:12}…)"
+    fi
+    rlog "exit rc=$rc interrupted=$interrupted"
     harvest "$HARVEST_TARGET" "$interrupted" "$rc"
     if [ "$rc" -eq 0 ]; then saye "${C_G}✓ done · exit 0${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"
     else saye "${C_R}✗ done · exit $rc${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"; fi
+    rlog "final: $(if [ "$rc" -eq 0 ]; then printf '✓ done · exit 0'; else printf '✗ done · exit %s' "$rc"; fi) · report: $HARVEST_TARGET/RUN-REPORT.md"
   fi
 }
 trap on_exit EXIT
@@ -550,7 +579,14 @@ rc=0
 # the trap until the monitor exited on its own.)
 node "$HERE/ralph-monitor.mjs" "${MONITOR_ARGS[@]}" &
 MON_PID=$!
-wait "$MON_PID" 2>/dev/null || rc=$?
+rlog "monitor launched (mon_pid=$MON_PID)"
+# v0.25.15: bookend the wait and stop swallowing the BUILTIN's stderr — a lost
+# status prints `wait: pid N is not a child of this shell` straight into
+# ralph.log (that one line is the whole diagnosis of a 127). The monitor's own
+# stderr is unaffected: the redirect belongs to the wait builtin, not the child.
+wait_start=$(date +%s)
+wait "$MON_PID" 2>>"$RUN_DIR/ralph.log" || rc=$?
+rlog "monitor wait rc=$rc (mon_pid=$MON_PID, waited $(( $(date +%s) - wait_start ))s)"
 # the parent's final report (v0.20.0 — written by the monitor on completion or
 # parent-stop; absent otherwise, e.g. Ctrl+C — the child is stopped before the
 # parent can summarize)

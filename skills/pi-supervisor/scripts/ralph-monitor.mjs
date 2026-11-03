@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// ralph-monitor.mjs — v0.25.8: the parent as a ralph loop.
+// ralph-monitor.mjs — v0.25.15: the parent as a ralph loop.
 //
 // A long-lived goal-mode parent session is fragile: one 400 "model not
 // running" (shared local model pool) or one context overflow wedges the whole
@@ -34,6 +34,8 @@
 //   ralph-monitor-state.json  loop-owned: cycles, interventions, lastToolCalls,
 //                             lastProgressAt, lastDecision, llmFailStreak
 //   ralph-monitor.log         one line per cycle + pre-check exits
+//   llm/                      v0.25.15: full stdout/stderr of every `pi --print`
+//                             call (cycle-N-judgment.{out,err}, final-report)
 //
 // Exit codes:
 //   0 child completed (exitReason=completed)
@@ -53,7 +55,7 @@
 //   --dry-run pre-checks + state update only; no LLM call (prints the view).
 
 import { spawn, spawnSync } from "node:child_process";
-import { writeFileSync, readFileSync, existsSync, appendFileSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync, appendFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseDeadline } from "./lib/deadline.mjs";
@@ -274,10 +276,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 // Async command runner: the event loop stays alive while the child runs, so
 // SIGINT is handled promptly even mid-LLM-turn (a synchronous spawnSync would
 // swallow signals arriving during the call — verified empirically in testing).
-function runCmd(cmd, args, timeoutMs) {
+// v0.25.15: full LLM call output is persisted — <run-dir>/llm/<tag>.{out,err}.
+// Before this only the LAST stderr line survived (the llm-failed log line),
+// which left a startup auth failure unpinnable to its exact variant and a
+// 600s-timed-out call with zero evidence of what the model was doing.
+const dumpIO = (tag, stdout, stderr) => {
+  if (!tag) return;
+  try {
+    const dir = path.join(A.runDir, "llm");
+    if (!existsSync(dir)) mkdirSync(dir);
+    writeFileSync(path.join(dir, `${tag}.out`), stdout || "");
+    writeFileSync(path.join(dir, `${tag}.err`), stderr || "");
+  } catch { /* diagnostics must never change the exit code */ }
+};
+function runCmd(cmd, args, timeoutMs, tag) {
   return new Promise((resolve) => {
     let stdout = "", stderr = "", done = false;
-    const finish = (extra) => { if (!done) { done = true; resolve({ ...extra }); } };
+    const finish = (extra) => { if (!done) { done = true; dumpIO(tag, stdout, stderr); resolve({ ...extra }); } };
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs, killSignal: "SIGKILL" });
     p.stdout.on("data", (d) => { stdout += d; if (stdout.length > 16 * 1024 * 1024) p.kill("SIGKILL"); });
     p.stderr.on("data", (d) => { stderr += d; if (stderr.length > 16 * 1024 * 1024) p.kill("SIGKILL"); });
@@ -290,12 +305,12 @@ function runCmd(cmd, args, timeoutMs) {
 // --timeout-sec budget behind the degenerate child while the loop — pre-checks
 // included — was blind for the entire wait).
 let judgmentProc = null;
-async function runCmdTracked(cmd, args, timeoutMs) {
+async function runCmdTracked(cmd, args, timeoutMs, tag) {
   return new Promise((resolve) => {
     let stdout = "", stderr = "", done = false;
     const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs, killSignal: "SIGKILL" });
     judgmentProc = p;
-    const finish = (extra) => { if (!done) { done = true; if (judgmentProc === p) judgmentProc = null; resolve({ ...extra }); } };
+    const finish = (extra) => { if (!done) { done = true; if (judgmentProc === p) judgmentProc = null; dumpIO(tag, stdout, stderr); resolve({ ...extra }); } };
     p.stdout.on("data", (d) => { stdout += d; if (stdout.length > 16 * 1024 * 1024) p.kill("SIGKILL"); });
     p.stderr.on("data", (d) => { stderr += d; if (stderr.length > 16 * 1024 * 1024) p.kill("SIGKILL"); });
     p.on("error", (e) => finish({ status: null, signal: null, stdout, stderr, error: String(e) }));
@@ -435,7 +450,7 @@ async function llmDecide() {
   if (A.model) args.push("--model", A.model);
   if (A.provider) args.push("--provider", A.provider);
   args.push(prompt);
-  const r = await runCmdTracked(A.pi, args, A.timeoutSec * 1000);
+  const r = await runCmdTracked(A.pi, args, A.timeoutSec * 1000, `cycle-${state.cycles}-judgment`);
   const out = ((r.stdout || "") + "\n" + (r.stderr || "")).trim();
   const tail = out.split("\n").filter(Boolean);
   let decision = "OK", detail = "", raw = "";
@@ -478,6 +493,8 @@ meta-commentary about this report.`;
 
 async function writeFinalReport(reason) {
   ask("final report — asking parent to summarize the run…", true);   // v0.25.7: bright — the run's end
+  const frStarted = Date.now();   // v0.25.15: duration on the end line
+  flog(`final-report-start model=${A.model || "pi-default"} provider=${A.provider || "pi-default"} reason=${JSON.stringify(reason)}`);
   const projectLine = A.projectDir
     ? `Project directory: ${A.projectDir}`
     : "Project directory: unknown (check pi-child-status.json / git in the run dir)";
@@ -489,25 +506,30 @@ async function writeFinalReport(reason) {
   if (A.provider) args.push("--provider", A.provider);
   args.push(prompt);
   let r;
+  const frDur = () => `${Math.round((Date.now() - frStarted) / 1000)}s`;
   try {
     const stopHb = heartbeat("final report — parent summarizing");   // v0.24.3
-    try { r = await runCmd(A.pi, args, A.timeoutSec * 1000); } finally { stopHb(); }
+    try { r = await runCmd(A.pi, args, A.timeoutSec * 1000, "final-report"); } finally { stopHb(); }
   } catch (e) {
     glog("✗", 31, `final-report: FAILED (${e.message}) — skipping`);
+    flog(`final-report-end dur=${frDur()} outcome=error (${e.message})`);
     return null;
   }
   const text = (r.stdout || "").trim();
   if (r.status !== 0 || !text) {
     glog("✗", 31, `final-report: FAILED (exit=${r.status ?? r.signal}) — skipping`);
+    flog(`final-report-end dur=${frDur()} outcome=failed exit=${r.status ?? r.signal}`);
     return null;
   }
   const p = path.join(A.runDir, "FINAL-REPORT.md");
   try {
     writeFileSync(p, text + "\n");
     glog("✓", 32, `final-report: written (${text.length} chars) → ${p}`);
+    flog(`final-report-end dur=${frDur()} outcome=written chars=${text.length}`);
     return p;
   } catch (e) {
     glog("✗", 31, `final-report: write failed (${e.message})`);
+    flog(`final-report-end dur=${frDur()} outcome=write-failed (${e.message})`);
     return null;
   }
 }
@@ -636,6 +658,11 @@ for (;;) {
     const sJs = readStatus();
     const toolsAtJudgeStart = sJs ? Number(sJs.toolCalls) : NaN;
     if (Number.isFinite(toolsAtJudgeStart)) state.lastJudgeToolCalls = toolsAtJudgeStart;
+    // v0.25.15: the judgment's START lands in the log file too (ask() is
+    // terminal-only) — with the child's state, so a hung call can be tied to
+    // what the child was doing. (run1: the 600s kill was a call queued behind
+    // the child's own probe suite; that had to be inferred, not read.)
+    flog(`cycle=${state.cycles} judgment-start model=${A.model || "pi-default"} provider=${A.provider || "pi-default"} timeout-sec=${A.timeoutSec} child status=${sJs ? sJs.status : "?"} toolCalls=${Number.isFinite(toolsAtJudgeStart) ? toolsAtJudgeStart : "?"}${sJs && sJs.lastTool ? ` last=${sJs.lastTool}` : ""}`);
     const stopHb = heartbeat(`cycle ${state.cycles} — parent judging`);   // v0.24.3
     // v0.23.0: race the judgment against the deadline — see runCmdTracked.
     // v0.25.2: AND against the CHILD's own deadline (status.deadlineIso, written
@@ -659,13 +686,16 @@ for (;;) {
     const raced = await Promise.race([llmDecide(), watcher]);
     watcherDone = true;
     stopHb();
+    const jdur = Math.round((Date.now() - nowMs) / 1000);
     if (raced === "deadline" || raced === "child-deadline") {
+      flog(`cycle=${state.cycles} judgment-end dur=${jdur}s outcome=killed-by-${raced} io=llm/cycle-${state.cycles}-judgment.{out,err}`);
       if (judgmentProc) { try { judgmentProc.kill("SIGKILL"); } catch { /* best effort */ } }
       glog("!", 33, `cycle=${state.cycles} ${raced === "child-deadline" ? "child deadline" : "deadline"} passed while asking parent — judgment killed, handing off to the pre-checks`);
       saveState();
       continue;
     }
     const d = raced;
+    flog(`cycle=${state.cycles} judgment-end dur=${jdur}s exit=${d.exitStatus} io=llm/cycle-${state.cycles}-judgment.{out,err}`);
     if (!d.okExit) {
       // pi itself failed (model 400 "not running", crash, timeout): log and
       // RETRY next cycle — the loop never dies on one bad LLM call
