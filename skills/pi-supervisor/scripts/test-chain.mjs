@@ -53,8 +53,9 @@ try {
 } catch { /* best effort */ }
 console.log(JSON.stringify({ launched: true, pid: s.pid }));
 `);
-const { step } = await import(pathToFileURL(path.join(S, "lib", "chain.mjs")).href);
-const { allocWindow, readNode, activePath } = await import(pathToFileURL(path.join(S, "lib", "node.mjs")).href);
+const { step, reentry } = await import(pathToFileURL(path.join(S, "lib", "chain.mjs")).href);
+const { allocWindow, readNode, activePath, ensureRootNode, registerChild } = await import(pathToFileURL(path.join(S, "lib", "node.mjs")).href);
+const readJsonFile = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
 
 // ---------- harness ----------
 let passed = 0, failed = 0; const fails = [];
@@ -292,6 +293,192 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T14 monotonic (run-7)", a2.window === "run-7", a2.window);
   const b = allocWindow(p, "db");
   ok("T14 fresh node starts at run-1", b.window === "run-1", b.window);
+}
+
+// ================= S1 — v2: spawn creates a PROJECT-LEVEL dir (plan §4)
+// A fresh project has no dot-dir node.json → S0 materializes the root;
+// the spawn then creates P/<name>/ as a nested sub-project (NOT under runs/).
+{
+  const p = mkproj("s1-v2-spawn");
+  ensureRootNode(p, { deadline: ISO(inMin(120)) });
+  const taskFile = path.join(T, "s1-task.md");
+  fs.writeFileSync(taskFile, "implement the auth sub-project\n");
+  const w = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" });
+  fs.writeFileSync(path.join(w, "spawn-request.json"), JSON.stringify({
+    kind: "spawn", node: "auth", task: taskFile, runtime_min: 30, deadline: null,
+    reason: "auth first", at: ISO(Date.now()),
+  }));
+  const r = await step(p, w, CFG);
+  ok("S1 spawn honored", r.outcome?.next === "spawned" && r.outcome?.node_path === "auth", JSON.stringify(r));
+  const aproj = path.join(p, "auth");
+  ok("S1 child project dir at P/auth (not under runs/)", fs.existsSync(path.join(aproj, ".pi-supervisor")));
+  ok("S1 child TASK.md copied to project root", fs.readFileSync(path.join(aproj, "TASK.md"), "utf8").includes("implement the auth sub-project"));
+  ok("S1 child STATE.md created", fs.existsSync(path.join(aproj, "STATE.md")));
+  const snj = readJsonFile(path.join(aproj, ".pi-supervisor", "node.json"));
+  ok("S1 child node.json v2", snj && snj.v === 2 && snj.path === "auth" && snj.parent === null && snj.state === "active", JSON.stringify(snj));
+  const rnj = readJsonFile(path.join(p, ".pi-supervisor", "node.json"));
+  ok("S1 root registry entry", rnj && Array.isArray(rnj.children) && rnj.children.some((c) => c.name === "auth" && c.dir === "auth"), JSON.stringify(rnj));
+  const win = path.join(aproj, ".pi-supervisor", "runs", "run-1");
+  ok("S1 child window in the sub-project's runs dir", fs.existsSync(path.join(win, "TASK.md")));
+  ok("S1 child brief carries the task", fs.readFileSync(path.join(win, "TASK.md"), "utf8").includes("implement the auth sub-project"));
+  const args = fs.readFileSync(path.join(win, "launch-args.txt"), "utf8");
+  ok("S1 launch got --project <subproject>", args.includes(`--project ${aproj}`), args);
+  ok("S1 active.json in the sub-project", readJsonFile(path.join(aproj, ".pi-supervisor", "active.json"))?.node === "auth");
+  ok("S1 root paused(waiting:auth)", nodeState(p, "(root)") === "paused(waiting:auth)", nodeState(p, "(root)"));
+  ok("S1 root STATE.md (v2 location) has the spawn line", fs.readFileSync(path.join(p, "STATE.md"), "utf8").includes("child auth spawned"));
+}
+
+// ================= S2 — v2: join (existing sub-project) → continuation, no new project
+{
+  const p = mkproj("s2-v2-join");
+  ensureRootNode(p, { deadline: ISO(inMin(120)) });
+  const aproj = path.join(p, "auth");
+  fs.mkdirSync(path.join(aproj, ".pi-supervisor", "runs", "run-1"), { recursive: true });
+  fs.writeFileSync(path.join(aproj, "TASK.md"), "implement the auth sub-project\n");
+  fs.writeFileSync(path.join(aproj, ".pi-supervisor", "node.json"), JSON.stringify({
+    v: 2, name: "auth", path: "auth", parent: null, deadline: ISO(inMin(120)), state: "active", children: [],
+  }, null, 2));
+  fs.writeFileSync(path.join(aproj, ".pi-supervisor", "runs", "run-1", "pi-child-status.json"),
+    JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(120)) }));
+  registerChild(p, "auth", "auth", { parentPath: "(root)" });
+  const taskFile = path.join(T, "s2-task.md");
+  fs.writeFileSync(taskFile, "implement the auth sub-project\n");
+  const w = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" });
+  fs.writeFileSync(path.join(w, "spawn-request.json"), JSON.stringify({
+    kind: "spawn", node: "auth", task: taskFile, runtime_min: 30, deadline: null, reason: "join", at: ISO(Date.now()),
+  }));
+  const r = await step(p, w, CFG);
+  ok("S2 join honored", r.outcome?.next === "spawned" && r.outcome?.window === "run-2", JSON.stringify(r));
+  ok("S2 window in the SAME sub-project's runs dir", fs.existsSync(path.join(aproj, ".pi-supervisor", "runs", "run-2", "TASK.md")));
+  ok("S2 continuation-style brief", fs.readFileSync(path.join(aproj, ".pi-supervisor", "runs", "run-2", "TASK.md"), "utf8").includes("CONTINUATION"));
+  ok("S2 exactly one auth project (no duplicate)", fs.readdirSync(p).filter((n) => n.startsWith("auth")).length === 1);
+}
+
+// ================= S3 — v2: move-out → commit detached + child-moved halt on the parent
+// The defensive re-entry guard (plan §6): the parent is paused(waiting:X) and X's
+// project dir is gone (moved) — commit the line as detached, halt, never relaunch.
+{
+  const p = mkproj("s3-v2-moved");
+  ensureRootNode(p, { deadline: ISO(inMin(120)) });
+  const aproj = path.join(p, "auth");
+  fs.mkdirSync(path.join(aproj, ".pi-supervisor", "runs"), { recursive: true });
+  fs.writeFileSync(path.join(aproj, ".pi-supervisor", "node.json"), JSON.stringify({
+    v: 2, name: "auth", path: "auth", parent: null, deadline: ISO(inMin(120)), state: "active", children: [],
+  }, null, 2));
+  registerChild(p, "auth", "auth", { parentPath: "(root)" });
+  const rnj3 = path.join(p, ".pi-supervisor", "node.json");
+  const rnj3o = readJsonFile(rnj3); rnj3o.state = "paused(waiting:auth)"; fs.writeFileSync(rnj3, JSON.stringify(rnj3o, null, 2));
+  const win = path.join(p, ".pi-supervisor", "runs", "run-1");
+  fs.mkdirSync(win, { recursive: true });
+  fs.rmSync(aproj, { recursive: true, force: true }); // the sub-project is moved away
+  let outcome = null;
+  await reentry("(root)", p, "auth", win, CFG, () => {}, "done", (o) => { outcome = o; });
+  ok("S3 child-moved halt", outcome && outcome.next === "halted" && /detached/i.test(outcome.reason), JSON.stringify(outcome));
+  const rnj = readJsonFile(path.join(p, ".pi-supervisor", "node.json"));
+  const entry = rnj?.children?.find((c) => c.name === "auth");
+  ok("S3 entry committed as detached (iso stamped)", entry && typeof entry.detached === "string" && entry.detached.length > 0, JSON.stringify(entry));
+  ok("S3 parent node blocked", nodeState(p, "(root)") === "blocked", nodeState(p, "(root)"));
+}
+
+// ================= S4 — v2: standalone completion after move (no re-entry, idle, parent demoted to null)
+// The whole sub-tree is moved away; a window inside it completes. The registry
+// cannot resolve it → standalone: the project decides its own root, and its
+// nested node is demoted parent:null (one-time).
+{
+  const p = mkproj("s4-v2-standalone");
+  ensureRootNode(p, { deadline: ISO(inMin(120)) });
+  const aproj = path.join(p, "auth");
+  fs.mkdirSync(path.join(aproj, ".pi-supervisor", "runs"), { recursive: true });
+  fs.writeFileSync(path.join(aproj, ".pi-supervisor", "node.json"), JSON.stringify({
+    v: 2, name: "auth", path: "auth", parent: null, deadline: ISO(inMin(120)), state: "active", children: [],
+  }, null, 2));
+  registerChild(p, "auth", "auth", { parentPath: "(root)" });
+  // nested sub-project db inside auth (parent: "auth" — not yet null)
+  const dproj = path.join(aproj, "db");
+  fs.mkdirSync(path.join(dproj, ".pi-supervisor", "runs", "run-1"), { recursive: true });
+  fs.writeFileSync(path.join(dproj, ".pi-supervisor", "node.json"), JSON.stringify({
+    v: 2, name: "db", path: "auth/db", parent: "auth", deadline: ISO(inMin(120)), state: "active", children: [],
+  }, null, 2));
+  const win = path.join(dproj, ".pi-supervisor", "runs", "run-1");
+  fs.writeFileSync(path.join(win, "pi-child-status.json"), JSON.stringify({
+    v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(120)),
+  }));
+  fs.writeFileSync(path.join(win, "TASK.md"), "do db\n");
+  fs.mkdirSync(path.join(T, "moved"), { recursive: true });
+  fs.renameSync(aproj, path.join(T, "moved", "auth")); // the whole line moves out
+  const r = await step(p, path.join(T, "moved", "auth", "db", ".pi-supervisor", "runs", "run-1"), CFG);
+  ok("S4 standalone idle (no re-entry)", r.outcome?.next === "idle" && /standalone/.test(r.outcome?.reason || ""), JSON.stringify(r));
+  const snj = readJsonFile(path.join(T, "moved", "auth", "db", ".pi-supervisor", "node.json"));
+  ok("S4 nested node demoted parent:null", snj && snj.parent === null, JSON.stringify(snj));
+  ok("S4 demotion logged in the project STATE.md", fs.readFileSync(path.join(T, "moved", "auth", "db", "STATE.md"), "utf8").includes("STANDALONE"));
+  ok("S4 root tree untouched (still registered)", readJsonFile(path.join(p, ".pi-supervisor", "node.json"))?.children?.some((c) => c.name === "auth"));
+}
+
+// ================= S5 — v2: stale-entry spawn rejection (detached line is not re-created)
+{
+  const p = mkproj("s5-v2-stale");
+  ensureRootNode(p, { deadline: ISO(inMin(120)) });
+  const rnjPath = path.join(p, ".pi-supervisor", "node.json");
+  const rnj = readJsonFile(rnjPath);
+  rnj.children = [{ name: "auth", dir: "auth", parentPath: "(root)" }];
+  fs.writeFileSync(rnjPath, JSON.stringify(rnj, null, 2)); // entry without the project dir
+  const taskFile = path.join(T, "s5-task.md");
+  fs.writeFileSync(taskFile, "implement the auth sub-project\n");
+  const w = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" });
+  fs.writeFileSync(path.join(w, "spawn-request.json"), JSON.stringify({
+    kind: "spawn", node: "auth", task: taskFile, runtime_min: 30, deadline: null, reason: "should be rejected", at: ISO(Date.now()),
+  }));
+  const r = await step(p, w, CFG);
+  const d = readJsonFile(path.join(w, "spawn-decision.json"));
+  ok("S5 spawn rejected (detached)", d && d.ok === false && /detached/i.test(d.reason), JSON.stringify(d));
+  ok("S5 project NOT re-created", !fs.existsSync(path.join(p, "auth")));
+  const entry = readJsonFile(rnjPath)?.children?.find((c) => c.name === "auth");
+  ok("S5 entry now stamped detached", entry && typeof entry.detached === "string", JSON.stringify(entry));
+  ok("S5 falls through to terminal table (root done/idle)", r.outcome?.next === "idle" && nodeState(p, "(root)") === "done", JSON.stringify(r.outcome));
+}
+
+// ================= S8 — v2: nested spawn chain (root → auth → db) and the re-entry climbs one level
+{
+  const p = mkproj("s8-v2-nested");
+  ensureRootNode(p, { deadline: ISO(inMin(120)) });
+  const taskFile = path.join(T, "s8-task.md");
+  fs.writeFileSync(taskFile, "implement the auth sub-project\n");
+  const w1 = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" });
+  fs.writeFileSync(path.join(w1, "spawn-request.json"), JSON.stringify({
+    kind: "spawn", node: "auth", task: taskFile, runtime_min: 30, deadline: null, reason: "auth", at: ISO(Date.now()),
+  }));
+  const r1 = await step(p, w1, CFG);
+  ok("S8 root spawned auth", r1.outcome?.next === "spawned" && r1.outcome?.node_path === "auth", JSON.stringify(r1));
+  const aproj = path.join(p, "auth");
+  const awin = path.join(aproj, ".pi-supervisor", "runs", "run-1");
+  // auth completes and spawns db (the NESTED spawn — db is created inside the auth project)
+  const taskDb = path.join(T, "s8-task-db.md");
+  fs.writeFileSync(taskDb, "implement the db sub-project\n");
+  fs.writeFileSync(path.join(awin, "pi-child-status.json"), JSON.stringify({
+    v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(120)),
+  }));
+  fs.writeFileSync(path.join(awin, "spawn-request.json"), JSON.stringify({
+    kind: "spawn", node: "db", task: taskDb, runtime_min: 30, deadline: null, reason: "db under auth", at: ISO(Date.now()),
+  }));
+  const r2 = await step(p, awin, CFG);
+  ok("S8 auth spawned db", r2.outcome?.next === "spawned" && r2.outcome?.node_path === "auth/db", JSON.stringify(r2));
+  const dproj = path.join(aproj, "db");
+  ok("S8 db project nested inside the auth project", fs.existsSync(path.join(dproj, ".pi-supervisor", "node.json")));
+  const dnj = readJsonFile(path.join(dproj, ".pi-supervisor", "node.json"));
+  ok("S8 db node.json path+parent", dnj?.path === "auth/db" && dnj?.parent === "auth", JSON.stringify(dnj));
+  ok("S8 auth paused(waiting:db)", nodeState(p, "auth") === "paused(waiting:db)", nodeState(p, "auth"));
+  ok("S8 root still paused(waiting:auth)", nodeState(p, "(root)") === "paused(waiting:auth)", nodeState(p, "(root)"));
+  const dwin = path.join(dproj, ".pi-supervisor", "runs", "run-1");
+  fs.writeFileSync(path.join(dwin, "pi-child-status.json"), JSON.stringify({
+    v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(120)),
+  }));
+  const r3 = await step(p, dwin, CFG);
+  ok("S8 db done → re-entry of auth (not root)", r3.outcome?.next === "reentry" && r3.outcome?.node_path === "auth", JSON.stringify(r3));
+  ok("S8 re-entry window in the AUTH project's runs dir", fs.existsSync(path.join(aproj, ".pi-supervisor", "runs", "run-2", "TASK.md")));
+  ok("S8 root run-2 NOT created (re-entry went one level)", !fs.existsSync(path.join(p, ".pi-supervisor", "runs", "run-2")));
+  ok("S8 db node done", readJsonFile(path.join(dproj, ".pi-supervisor", "node.json"))?.state === "done");
+  ok("S8 auth active after re-entry", nodeState(p, "auth") === "active", nodeState(p, "auth"));
+  ok("S8 root still paused(waiting:auth)", nodeState(p, "(root)") === "paused(waiting:auth)", nodeState(p, "(root)"));
 }
 
 // ---------- summary ----------

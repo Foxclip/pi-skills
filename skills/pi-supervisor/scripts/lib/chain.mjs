@@ -316,40 +316,20 @@ function harvest(windowDir) {
  * }
  * Returns { kind, outcome, decision?, next? } — see chain-done.json.
  */
-// v0.27.0: which node owns this window dir? Legacy: the enclosing node
-// folder under runs/ (as before). v2: the window's project, looked up in the
-// tree registry — null when the registry does not know the project (moved or
-// foreign; the caller then treats the window as standalone).
 // v0.27.0: which node owns this window dir? Legacy shape first: the window's
 // dirname is a node folder under the project's runs/ (or runs/ itself) —
 // path-derived, exactly as v0.26. Then v2: the window's own project (its
-// runs live in a nested project dir), looked up in the tree registry — null
-// when the registry does not know the project (moved or foreign; the caller
-// then treats the window as standalone).
+// runs live in a nested project dir), looked up in the tree registry via
+// nodePathOfProject (BFS over each project's own children — the registry is
+// distributed, one level per project). ROOT when the window's project IS the
+// project; null when the registry does not know the project (moved or
+// foreign — the caller then treats the window as standalone).
 function resolveWindowNode(projectDir, windowDir) {
   const legacy = nodePathOf(projectDir, path.dirname(windowDir));
   if (legacy) return legacy;
   const wproj = windowProjectOf(windowDir);
   if (!wproj) return null;
-  if (path.resolve(wproj) === path.resolve(projectDir)) return ROOT;
-  const find = (entry, prefix) => {
-    const p = prefix ? `${prefix}/${entry.name}` : entry.name;
-    const proj = projectOfNode(projectDir, p);
-    if (proj.dir && path.resolve(proj.dir) === path.resolve(wproj)) return p;
-    for (const c of (Array.isArray(entry.children) ? entry.children : [])) {
-      const r = find(c, p);
-      if (r) return r;
-    }
-    return null;
-  };
-  const nj = readJson(supNodePath(projectDir));
-  if (nj && Array.isArray(nj.children)) {
-    for (const c of nj.children) {
-      const r = find(c, "");
-      if (r) return r;
-    }
-  }
-  return null;
+  return nodePathOfProject(projectDir, wproj);
 }
 
 export async function step(projectDir, windowDir, cfg = {}) {
@@ -546,7 +526,7 @@ async function openWithRetryName({ projectDir, nodePath, brief, budget, cfg, win
   return { ok: true, window, dir: wdir, launchOut: r.launchOut };
 }
 
-async function reentry(parentPath, projectDir, childPath, childWindowDir, cfg, log, childState, done) {
+export async function reentry(parentPath, projectDir, childPath, childWindowDir, cfg, log, childState, done) {
   const v2 = nodeShape(projectDir, parentPath) === "v2";
   const childV2 = nodeShape(projectDir, childPath) === "v2";
   if (v2) {
