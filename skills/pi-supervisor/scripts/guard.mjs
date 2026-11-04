@@ -2258,10 +2258,15 @@ try {
     // final status is durable and BEFORE exit; a chain failure must NEVER
     // change this window's own exit code (plan §5.4). Only for windows
     // launched with a project (PI_SUP_PROJECT set by launch.mjs).
+    // v0.27.0: the step runs at the SCHEDULER ROOT (PI_SUP_TREE_ROOT, set by
+    // launch.mjs; defaults to this window's own project) — in a v2 tree a
+    // sub-project window is decided by its tree root. A root whose
+    // .pi-supervisor is gone (the tree moved) is NOT an error here: the chain
+    // degrades to standalone mode inside step() (plan §4).
     try {
       if (process.env.PI_SUP_PROJECT) {
         const { step: chainStep } = await import("./lib/chain.mjs");
-        await chainStep(process.env.PI_SUP_PROJECT, outDir, {
+        await chainStep(process.env.PI_SUP_TREE_ROOT || process.env.PI_SUP_PROJECT, outDir, {
           repair: false,
           launch: {
             provider: provider || undefined,

@@ -31,6 +31,13 @@
 //                        PROJECT in its env: the sub-runs identity (v0.26.0 gate —
 //                        a child session's own env carries PI_SUP_CHILD, so
 //                        ralph.sh can refuse its direct launches)
+//     --tree-root <dir>  v0.27.0: the SCHEDULER ROOT (default: --project) — the
+//                        project whose lock/chain owns this window. In a v2 tree
+//                        the chain step allocates a window into a SUB-PROJECT
+//                        (--project) but decides from the tree root, so the guard
+//                        carries PI_SUP_TREE_ROOT for its window-end chain hook.
+//                        The guard also runs with cwd = --project, so the child
+//                        pi's cwd (and its session home) is the sub-project.
 //     --node <path>      the node path this window belongs to (default: "(root)";
 //                        "auth" | "auth/deeper" for sub-project nodes)
 //
@@ -128,6 +135,7 @@ let guardPath = join(HERE, "guard.mjs");
 let verifySec = 8;
 let graceSec = 60;
 let projectDir = process.cwd(); // --project: home of .pi-supervisor/ (active.json)
+let treeRoot = null;            // --tree-root: scheduler root (default: projectDir)
 let nodePath = "(root)";        // --node: the node this window belongs to
 let deadlineRaw = null; // --deadline <time>: size --timeout so finalize lands on this wall clock
 let task = null;
@@ -146,6 +154,7 @@ for (let i = 0; i < argv.length; i++) {
   if (x === "--verify-sec") { verifySec = Number(argv[++i]); pendingValueFor = null; continue; }
   if (x === "--grace-sec") { graceSec = Number(argv[++i]); pendingValueFor = null; continue; }
   if (x === "--project") { projectDir = argv[++i]; pendingValueFor = null; continue; }
+  if (x === "--tree-root") { treeRoot = argv[++i]; pendingValueFor = null; continue; }
   if (x === "--node") { nodePath = argv[++i]; pendingValueFor = null; continue; }
   if (x === "--deadline") { deadlineRaw = argv[++i]; pendingValueFor = null; continue; }
   if (x === "--") { passthrough.push(x); pendingValueFor = null; continue; }
@@ -281,6 +290,7 @@ const guardEnv = {
   PI_SUP_RUN_DIR: outDir,
   PI_SUP_NODE: nodePath,
   PI_SUP_PROJECT: projectDir,
+  PI_SUP_TREE_ROOT: treeRoot || projectDir,
   ...(childUser ? { PI_SUP_CHILD_USER: childUser } : {}),
 };
 try {
@@ -291,6 +301,9 @@ try {
     windowsHide: true,
     stdio: ["ignore", outFd, errFd],
     env: guardEnv,
+    cwd: projectDir, // v0.27.0: the WINDOW's project (sub-project in a v2 tree) —
+    // the guard inherits it, RpcClient inherits it, so the child pi's cwd (and
+    // its session home) is the project the window belongs to.
   });
 } catch (e) {
   fail(`spawn failed: ${e.message}`);

@@ -124,6 +124,30 @@ export function projectOfNode(rootProject, nodePath) {
   return { dir: exists ? dir : null, entry, stale: !exists, mode };
 }
 
+// Inverse of projectOfNode (v2): which node path resolves to projectDir.
+//   "(root)" when projectDir IS the root project; a node path like "auth" /
+//   "auth/ssl" when found in the registry; null when projectDir is not part
+//   of this tree (moved away, never registered, or foreign).
+export function nodePathOfProject(rootProject, projectDir) {
+  const target = path.resolve(projectDir);
+  if (path.resolve(rootProject) === target) return ROOT;
+  if (modeOf(rootProject) === "legacy") return null;
+  const queue = [[rootProject, ROOT]];
+  let guard = 0;
+  while (queue.length && guard++ < 10000) {
+    const [cur, curPath] = queue.shift();
+    const nj = readJson(supNodePath(cur)) || {};
+    for (const e of (Array.isArray(nj.children) ? nj.children : [])) {
+      if (!e || !e.name) continue;
+      const p = curPath === ROOT ? String(e.name) : `${curPath}/${e.name}`;
+      const d = path.join(cur, String(e.dir));
+      if (path.resolve(d) === target) return p;
+      queue.push([d, p]);
+    }
+  }
+  return null;
+}
+
 // The nearest ancestor of windowDir (self first) that contains .pi-supervisor
 // — the window's own project (v2: <project>/.pi-supervisor/runs/run-N).
 export function windowProjectOf(windowDir) {

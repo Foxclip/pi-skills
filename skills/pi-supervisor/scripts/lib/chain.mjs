@@ -1,4 +1,4 @@
-// lib/chain.mjs — the window-end chain step (v0.26.0).
+// lib/chain.mjs — the window-end chain step (v0.27.0 — sub-runs as projects).
 //
 // A deterministic, idempotent transition from "window run-N of node X ended"
 // to the project's next state: either a NEW WINDOW is launched (continuation
@@ -45,6 +45,21 @@ import {
   clearActive,
   windowBudget,
   withLock,
+  supRoot,
+  supNodePath,
+  modeOf,
+  projectOfNode,
+  nodePathOfProject,
+  windowProjectOf,
+  nodeJsonAt,
+  nodeRunsDir,
+  stateFileOf,
+  ensureRootNode,
+  ensureStateMdAt,
+  registerChild,
+  commitDetached,
+  allocWindowIn,
+  writeActive,
 } from "./node.mjs";
 
 const LIB = path.dirname(new URL(import.meta.url).pathname);
@@ -112,7 +127,7 @@ function budgetLine(budget) {
 }
 
 // Sub window 1 — a spawned child node's first window.
-function briefSub({ nodePath, taskText, budget }) {
+function briefSub({ nodePath, taskText, budget, v2 = false }) {
   const L = [];
   L.push(`# SUB-PROJECT — ${nodePath}`);
   L.push("");
@@ -126,7 +141,7 @@ function briefSub({ nodePath, taskText, budget }) {
   L.push("```");
   L.push("");
   L.push("## Sub-run rules (on top of the standard contract above)");
-  L.push("- Work the task; update this node's STATE.md (in your node folder, one up) at every milestone — it is the distillation the next window reads.");
+  L.push(`- Work the task; update this node's STATE.md (${v2 ? "in your project dir, one level up from .pi-supervisor" : "in your node folder, one up"}) at every milestone — it is the distillation the next window reads.`);
   L.push("- To start your own sub-project: write its task file, run `ralph.sh spawn --name <node> --task <file> [--deadline <t>] [--runtime <m>]`, then END THE TURN cleanly. You will be paused and re-entered later. Direct launches are denied for child sessions.");
   L.push("- When the task is done: end with a final report (the standard contract's report protocol) — the chain reads it when it re-enters your parent.");
   L.push("");
@@ -134,7 +149,7 @@ function briefSub({ nodePath, taskText, budget }) {
 }
 
 // Continuation — the same node, previous window used its budget, goal not met.
-function briefContinuation({ nodePath, window, prevWindowDir, budget }) {
+function briefContinuation({ nodePath, window, prevWindowDir, budget, v2 = false }) {
   const L = [];
   L.push(`# CONTINUATION — ${nodePath} / ${window}`);
   L.push("");
@@ -150,7 +165,7 @@ function briefContinuation({ nodePath, window, prevWindowDir, budget }) {
   L.push("```");
   L.push("");
   L.push("## Your job");
-  L.push("1. Read the previous report and the node's STATE.md (in your node folder, one up).");
+  L.push(`1. Read the previous report and the node's STATE.md (${v2 ? "in your project dir, one level up from .pi-supervisor" : "in your node folder, one up"}).`);
   L.push("2. Continue the remaining work — pick up where it stopped.");
   L.push("3. Keep STATE.md current; end with the standard final report when the goal is met (or when this budget runs out — the next window continues).");
   L.push("");
@@ -189,16 +204,58 @@ function briefReentry({ nodePath, window, childPath, childState, childFinalDir, 
 }
 
 // ---------- node state bookkeeping -------------------------------------------
+// Mode-aware (v0.27.0): v2 nodes keep their node.json in their OWN project
+// dot dir and STATE.md at the project root; legacy keeps both in the node
+// folder under runs/ (nodeJsonAt/stateFileOf resolve per mode).
 function setNodeState(projectDir, nodePath, state) {
   const nj = readNode(projectDir, nodePath);
   if (!nj) return;
+  const p = nodeJsonAt(projectDir, nodePath);
+  if (!p) return;
   nj.state = state;
-  writeJson(path.join(nodeDir(projectDir, nodePath), "node.json"), nj);
+  writeJson(p, nj);
 }
 
 function appendState(projectDir, nodePath, lines) {
-  const sp = path.join(nodeDir(projectDir, nodePath), "STATE.md");
+  const sp = stateFileOf(projectDir, nodePath);
+  if (!sp) return;
   fs.appendFileSync(sp, "\n" + lines + "\n");
+}
+
+// Clear the active slot of the tree root AND of the window's own project when
+// they differ (v0.27.0 §3: two slots — the window's project slot is the
+// terminal's; the root slot is what the root's attach follows). Same dir →
+// one clear, as in legacy.
+function clearActiveSlots(projectDir, windowDir) {
+  clearActive(projectDir);
+  const wproj = windowProjectOf(windowDir);
+  if (wproj && path.resolve(wproj) !== path.resolve(projectDir)) clearActive(wproj);
+}
+
+// How a node's windows are stored: "legacy" (node folder under runs/) or
+// "v2" (the node project's own runs dir). Rule: the ROOT is v2 exactly when
+// the dot-dir node.json exists (a bare project keeps the v0.26 legacy root
+// until ralph.sh's S0 gate — or the first ensureRootNode — materializes it);
+// a non-root node is v2 exactly when the registry has an entry for it (live
+// or detached — a detached line keeps v2 semantics, the child-moved path).
+// A non-root node WITHOUT an entry is a legacy node-folder shape (v0.26
+// compat: mixed trees keep working).
+function nodeShape(projectDir, nodePath) {
+  if (nodePath === ROOT) return fs.existsSync(supNodePath(projectDir)) ? "v2" : "legacy";
+  const pof = projectOfNode(projectDir, nodePath);
+  return pof.entry ? "v2" : "legacy";
+}
+
+// Allocate a window for a node — legacy: into the node folder under runs/;
+// v2: into the node project's own runs dir, under that project's lock (nested
+// lock order is always root → child; the caller holds the root lock).
+async function allocForNode(projectDir, nodePath, { deadline = null } = {}) {
+  if (nodeShape(projectDir, nodePath) === "legacy") return allocWindow(projectDir, nodePath, { deadline });
+  const pof = projectOfNode(projectDir, nodePath);
+  const runsDir = nodeRunsDir(projectDir, nodePath);
+  if (!pof.dir || !runsDir) return null;
+  if (path.resolve(pof.dir) === path.resolve(projectDir)) return allocWindowIn(runsDir); // caller holds the root lock
+  return withLock(pof.dir, () => allocWindowIn(runsDir));
 }
 
 // ---------- launch ------------------------------------------------------------
@@ -207,11 +264,17 @@ function appendState(projectDir, nodePath, lines) {
 // outcome. Returns { ok, error, launchOut }.
 function launchWindow(projectDir, nodePath, wdir, budget, cfg, windowDir, log) {
   const L = cfg.launch || {};
+  // v0.27.0: the window's OWN project (its runs/ home — the sub-project in a
+  // v2 tree, the tree itself in legacy) vs the SCHEDULER ROOT (projectDir).
+  // launch.mjs records active.json in the window's project and spawns the
+  // guard with cwd = that project, so the child pi works in it (plan §3/§4).
+  const wproj = windowProjectOf(wdir) || projectDir;
   const args = [
     LAUNCH,
     "--task-file", path.join(wdir, "TASK.md"),
     "--out-dir", wdir,
-    "--project", projectDir,
+    "--project", wproj,
+    "--tree-root", projectDir,
     "--node", nodePath || ROOT,
     "--deadline", String(Math.floor(budget.deadlineMs / 1000)),
     "--idle-timeout", String(L.idleTimeoutSec ?? 300),
@@ -222,10 +285,10 @@ function launchWindow(projectDir, nodePath, wdir, budget, cfg, windowDir, log) {
   if (L.provider) args.push("--provider", L.provider);
   if (L.model) args.push("--model", L.model);
   if (L.thinking != null) args.push("--thinking", String(L.thinking));
-  log(`launch: node=${nodePath || ROOT} window=${path.basename(wdir)} deadline=${new Date(budget.deadlineMs).toISOString()}`);
+  log(`launch: node=${nodePath || ROOT} window=${path.basename(wdir)} project=${wproj} deadline=${new Date(budget.deadlineMs).toISOString()}`);
   let r;
   try {
-    r = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 180000 });
+    r = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 180000, cwd: wproj });
   } catch (e) {
     return { ok: false, error: `spawnSync threw: ${e.message}` };
   }
@@ -253,40 +316,137 @@ function harvest(windowDir) {
  * }
  * Returns { kind, outcome, decision?, next? } — see chain-done.json.
  */
+// v0.27.0: which node owns this window dir? Legacy: the enclosing node
+// folder under runs/ (as before). v2: the window's project, looked up in the
+// tree registry — null when the registry does not know the project (moved or
+// foreign; the caller then treats the window as standalone).
+// v0.27.0: which node owns this window dir? Legacy shape first: the window's
+// dirname is a node folder under the project's runs/ (or runs/ itself) —
+// path-derived, exactly as v0.26. Then v2: the window's own project (its
+// runs live in a nested project dir), looked up in the tree registry — null
+// when the registry does not know the project (moved or foreign; the caller
+// then treats the window as standalone).
+function resolveWindowNode(projectDir, windowDir) {
+  const legacy = nodePathOf(projectDir, path.dirname(windowDir));
+  if (legacy) return legacy;
+  const wproj = windowProjectOf(windowDir);
+  if (!wproj) return null;
+  if (path.resolve(wproj) === path.resolve(projectDir)) return ROOT;
+  const find = (entry, prefix) => {
+    const p = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const proj = projectOfNode(projectDir, p);
+    if (proj.dir && path.resolve(proj.dir) === path.resolve(wproj)) return p;
+    for (const c of (Array.isArray(entry.children) ? entry.children : [])) {
+      const r = find(c, p);
+      if (r) return r;
+    }
+    return null;
+  };
+  const nj = readJson(supNodePath(projectDir));
+  if (nj && Array.isArray(nj.children)) {
+    for (const c of nj.children) {
+      const r = find(c, "");
+      if (r) return r;
+    }
+  }
+  return null;
+}
+
 export async function step(projectDir, windowDir, cfg = {}) {
   const marker = path.join(windowDir, "chain-done.json");
   if (fs.existsSync(marker)) return { skipped: "chain-done" };
-  const nodePath = nodePathOf(projectDir, path.dirname(windowDir)) || ROOT;
   const log = (line) => {
     clog(projectDir, windowDir, line);
     if (typeof cfg.log === "function") { try { cfg.log(line); } catch { /* sink must not kill the chain */ } }
   };
-  return withLock(projectDir, async () => {
-    if (fs.existsSync(marker)) return { skipped: "chain-done" }; // re-check under the lock
-    const st = readJson(path.join(windowDir, "pi-child-status.json"));
-    const hasFinal = fs.existsSync(path.join(windowDir, "FINAL-REPORT.md"));
-    const kind = classifyWindow(projectDir, windowDir, st, hasFinal, Boolean(cfg.repair));
-    log(`step start: window=${path.basename(windowDir)} node=${nodePath} kind=${kind} repair=${Boolean(cfg.repair)}`);
+  // v0.27.0: the scheduler root no longer holds .pi-supervisor (the tree moved
+  // away or was deleted) — the window has no parent tree to be decided by.
+  // DEGRADE TO STANDALONE (plan §4): the window's own project decides it with
+  // the same table as root, its own lock, one-time parent:null demotion. A
+  // normal mode change, NOT an error — no chain-error.json.
+  if (!fs.existsSync(supRoot(projectDir))) {
+    return stepStandalone(projectDir, windowDir, cfg, log);
+  }
+  return withLock(projectDir, () => stepCore(projectDir, windowDir, cfg, log, false));
+}
 
-    const done = (outcome) => {
-      const rec = { v: 1, at: new Date().toISOString(), kind, outcome };
-      writeJson(marker, rec);
-      log(`step done: outcome=${outcome.next || "halted"}${outcome.node_path ? ` next=${outcome.node_path}/${outcome.window}` : ""}`);
-      return { kind, outcome };
-    };
+// Standalone degradation (plan §4): step the window under ITS OWN project —
+// same terminal table with isRoot=true, the project's own lock, one-time
+// `parent: null` demotion in the project's node.json.
+async function stepStandalone(treeRoot, windowDir, cfg, log) {
+  const wproj = windowProjectOf(windowDir);
+  if (!wproj) {
+    log(`standalone: tree root ${treeRoot} AND the window's project are both gone — cannot step`);
+    return { kind: "standalone", outcome: { next: "halted", reason: "standalone-unresolved" } };
+  }
+  const njp = supNodePath(wproj);
+  const snj = readJson(njp);
+  if (snj && snj.parent) {
+    snj.parent = null;
+    writeJson(njp, snj);
+    ensureStateMdAt(path.join(wproj, "STATE.md"), snj.name || "(root)");
+    fs.appendFileSync(path.join(wproj, "STATE.md"),
+      `\n- [${new Date().toISOString()}] tree root ${treeRoot} is gone — this project is now STANDALONE (parent demoted to null); its windows are decided by its own chain\n`);
+    log(`standalone mode: demoted ${wproj} to parent:null`);
+  } else {
+    log(`standalone mode: tree root ${treeRoot} no longer holds .pi-supervisor — stepping ${wproj} on its own`);
+  }
+  return withLock(wproj, () => stepCore(wproj, windowDir, cfg, log, true));
+}
 
-    // ensureNode materializes the node lazily (root included — back-compat:
-    // a project without node.json works as today, the root appears on first step)
-    const { node: nj } = ensureNode(projectDir, nodePath, {});
-
-    // ---- 1) stopped (user stop / reboot — repair path): halt, no auto-next
-    if (kind === "stopped") {
-      setNodeState(projectDir, nodePath, "stopped");
-      appendState(projectDir, nodePath,
-        `- [${new Date().toISOString()}] window ${path.basename(windowDir)} ended externally (user stop / reboot) — chain halted; continue only on explicit relaunch`);
-      clearActive(projectDir);
-      return done({ next: "halted", reason: "stopped" });
+// The terminal table (shared by the tree path and standalone degradation).
+// projectDir is the SCHEDULER project whose lock the caller ALREADY HOLDS:
+// the tree root, or — standalone — the window's own project.
+async function stepCore(projectDir, windowDir, cfg, log, standalone) {
+  const marker = path.join(windowDir, "chain-done.json");
+  if (fs.existsSync(marker)) return { skipped: "chain-done" }; // re-check under the lock
+  let nodePath = standalone ? ROOT : resolveWindowNode(projectDir, windowDir);
+  if (!nodePath) {
+    // v2 window in a project the registry does not know (moved back, foreign)
+    // — treat it as standalone: demotion + its own lock (root → child order).
+    const wproj = windowProjectOf(windowDir);
+    if (!wproj) {
+      const reason = "cannot resolve the window's project from its location";
+      log(reason);
+      try { writeJson(marker, { v: 1, at: new Date().toISOString(), kind: "unresolved", outcome: { next: "halted", reason } }); } catch { /* best effort */ }
+      return { kind: "unresolved", outcome: { next: "halted", reason } };
     }
+    log(`window's project ${wproj} is not in the tree's registry — treating it as standalone`);
+    return stepStandalone(projectDir, windowDir, cfg, log);
+  }
+  const st = readJson(path.join(windowDir, "pi-child-status.json"));
+  const hasFinal = fs.existsSync(path.join(windowDir, "FINAL-REPORT.md"));
+  const kind = classifyWindow(projectDir, windowDir, st, hasFinal, Boolean(cfg.repair));
+  log(`step start: window=${path.basename(windowDir)} node=${nodePath} kind=${kind} repair=${Boolean(cfg.repair)} standalone=${standalone}`);
+
+  const done = (outcome) => {
+    const rec = { v: 1, at: new Date().toISOString(), kind, outcome };
+    writeJson(marker, rec);
+    log(`step done: outcome=${outcome.next || "halted"}${outcome.node_path ? ` next=${outcome.node_path}/${outcome.window}` : ""}`);
+    return { kind, outcome };
+  };
+
+  // Materialize the node: legacy shape → ensureNode (lazy, node folder —
+  // v0.26 behavior, back-compat: a project without node.json works as today);
+  // v2 root → ensureRootNode (idempotent); a v2 sub-node already exists — it
+  // was materialized by the spawn that created its project.
+  const shape = nodeShape(projectDir, nodePath);
+  let nj;
+  if (shape === "legacy") nj = ensureNode(projectDir, nodePath, {}).node;
+  else if (nodePath === ROOT) nj = ensureRootNode(projectDir, {}).node;
+  else nj = readNode(projectDir, nodePath);
+  if (!nj) {
+    return haltBlocked(projectDir, nodePath, windowDir, log, `node ${nodePath} has no node.json (registry entry without a project?) — human attention`, (o) => done(o));
+  }
+
+  // ---- 1) stopped (user stop / reboot — repair path): halt, no auto-next
+  if (kind === "stopped") {
+    setNodeState(projectDir, nodePath, "stopped");
+    appendState(projectDir, nodePath,
+      `- [${new Date().toISOString()}] window ${path.basename(windowDir)} ended externally (user stop / reboot) — chain halted; continue only on explicit relaunch`);
+    clearActiveSlots(projectDir, windowDir);
+    return done({ next: "halted", reason: "stopped" });
+  }
 
     // ---- 2) harvest (idempotent, never throws)
     harvest(windowDir);
@@ -307,13 +467,14 @@ export async function step(projectDir, windowDir, cfg = {}) {
     // ---- 4) the terminal table (no request, or an invalid one)
     const parent = parentNodePath(nodePath);
     const parentName = parent === null ? null : parent; // root has no parent
-    const isRoot = parentName === null;
+    // standalone: the project decides as its own root — no re-entry, no hand-off
+    const isRoot = standalone || parentName === null;
 
     if (kind === "completed") {
       setNodeState(projectDir, nodePath, "done");
       appendState(projectDir, nodePath,
         `- [${new Date().toISOString()}] window ${path.basename(windowDir)} completed — node done`);
-      if (isRoot) { clearActive(projectDir); return done({ next: "idle", reason: "root-done" }); }
+      if (isRoot) { clearActiveSlots(projectDir, windowDir); return done({ next: "idle", reason: standalone ? "standalone-done" : "root-done" }); }
       return await reentry(parentName, projectDir, nodePath, windowDir, cfg, log, "done", (o) => done(o));
     }
 
@@ -323,14 +484,14 @@ export async function step(projectDir, windowDir, cfg = {}) {
         setNodeState(projectDir, nodePath, "deadline-expired");
         appendState(projectDir, nodePath,
           `- [${new Date().toISOString()}] window ${path.basename(windowDir)} used its budget and the node deadline has passed — deadline-expired`);
-        if (isRoot) { clearActive(projectDir); return done({ next: "idle", reason: "root-deadline-expired" }); }
+        if (isRoot) { clearActiveSlots(projectDir, windowDir); return done({ next: "idle", reason: standalone ? "standalone-deadline-expired" : "root-deadline-expired" }); }
         return await reentry(parentName, projectDir, nodePath, windowDir, cfg, log, "deadline-expired", (o) => done(o));
       }
       // continuation of the same node
       const b = windowBudget({ nodeDeadline: nj.deadline, runtimeMin: cfg.launch?.runtimeMin ?? 90, now: new Date() });
       if (!b.ok) { return haltBlocked(projectDir, nodePath, windowDir, log, `cannot size the continuation budget: ${b.why}`, (o) => done(o)); }
       const prevReport = windowFinalReport(windowDir);
-      const brief = (wname) => briefContinuation({ nodePath, window: wname, prevWindowDir: windowDir, budget: b });
+      const brief = (wname) => briefContinuation({ nodePath, window: wname, prevWindowDir: windowDir, budget: b, v2: shape === "v2" });
       const opened = await openWithRetryName({ projectDir, nodePath, brief, budget: b, cfg, windowDir, log });
       if (!opened.ok) { return haltBlocked(projectDir, nodePath, windowDir, log, `continuation launch failed: ${opened.error}`, (o) => done(o)); }
       setNodeState(projectDir, nodePath, "active");
@@ -341,7 +502,6 @@ export async function step(projectDir, windowDir, cfg = {}) {
 
     // blocked (stuck / consult / error / aborted)
     return haltBlocked(projectDir, nodePath, windowDir, log, `window ended ${st?.exitReason || st?.status || "unclassified"} — human attention needed`, (o) => done(o));
-  });
 }
 
 // Allocate a window, write its brief (a function of the window name, so the
@@ -349,7 +509,11 @@ export async function step(projectDir, windowDir, cfg = {}) {
 // allocated window dir (no process could have started from it) so the number
 // is not burned, and leave NO chain-done marker (retryable via repair).
 async function openWithRetryName({ projectDir, nodePath, brief, budget, cfg, windowDir, log }) {
-  const { window, dir: wdir } = allocWindow(projectDir, nodePath);
+  const { window, dir: wdir } = await allocForNode(projectDir, nodePath);
+  if (!window) {
+    clog(projectDir, windowDir, `allocation failed for ${nodePath}: the node's runs dir is unresolvable (project dir missing?)`);
+    return { ok: false, error: "allocation failed (node's runs dir unresolvable)" };
+  }
   fs.writeFileSync(path.join(wdir, "TASK.md"), brief(window));
   const r = launchWindow(projectDir, nodePath, wdir, budget, cfg, windowDir, log);
   if (!r.ok) {
@@ -357,14 +521,70 @@ async function openWithRetryName({ projectDir, nodePath, brief, budget, cfg, win
     try { fs.rmSync(wdir, { recursive: true, force: true }); } catch { /* best effort */ }
     return { ok: false, error: r.error };
   }
+  // v0.27.0 §3: the chain maintains the TREE ROOT's active slot (what a root
+  // attach follows) from the launched guard's pid; the window's OWN project
+  // slot is launch.mjs's (already written under that project's lock).
+  const wproj = windowProjectOf(wdir);
+  if (wproj && path.resolve(wproj) !== path.resolve(projectDir)) {
+    let pid = null;
+    try {
+      const last = (r.launchOut || "").trim().split(/\r?\n/).filter(Boolean).pop() || "";
+      const j = JSON.parse(last);
+      pid = j.guardPid ?? j.pid ?? null;
+    } catch { /* the slot is a convenience — a parse miss is not fatal */ }
+    try {
+      writeActive(projectDir, {
+        run_dir: wdir,
+        node: nodePath || ROOT,
+        guard_pid: pid,
+        window,
+        started_at: new Date().toISOString(),
+        deadline: new Date(budget.deadlineMs).toISOString(),
+      });
+    } catch { /* best effort — the launch itself is the truth */ }
+  }
   return { ok: true, window, dir: wdir, launchOut: r.launchOut };
 }
 
 async function reentry(parentPath, projectDir, childPath, childWindowDir, cfg, log, childState, done) {
+  const v2 = nodeShape(projectDir, parentPath) === "v2";
+  const childV2 = nodeShape(projectDir, childPath) === "v2";
+  if (v2) {
+    // §6 child-moved: (a) the re-entry TARGET's project dir is gone, or
+    // (b) the parent is paused(waiting:X) and X's dir is gone. A detached
+    // line is never re-entered — a human decides (re-point or clear it).
+    const pof = projectOfNode(projectDir, parentPath);
+    if (!pof.dir) {
+      const gparent = parentNodePath(parentPath);
+      const gproj = (gparent === null || gparent === ROOT)
+        ? projectDir
+        : (projectOfNode(projectDir, gparent).dir || projectDir);
+      commitDetached(gproj, childName(parentPath));
+      return haltBlocked(projectDir, parentPath, childWindowDir, log,
+        `child-moved: the re-entry target's project dir for ${parentPath} is not found (moved?) — point the registry at the new location or clear the line`, done);
+    }
+    const pnj0 = readNode(projectDir, parentPath) || {};
+    const m = String(pnj0.state || "").match(/^paused\(waiting:([A-Za-z0-9._-]+)\)$/);
+    if (m) {
+      const x = m[1];
+      const xFull = parentPath === ROOT ? x : `${parentPath}/${x}`;
+      const xproj = projectOfNode(projectDir, xFull);
+      if (!xproj.dir) {
+        commitDetached(pof.dir, x);
+        appendState(projectDir, parentPath,
+          `- [${new Date().toISOString()}] child ${xFull} is DETACHED (dir not found — moved?) — no re-entry; point the registry at the new location or clear this line`);
+        return haltBlocked(projectDir, parentPath, childWindowDir, log,
+          `child-moved: ${xFull} is detached (dir not found — moved?) — point the registry at the new location or clear the line`, done);
+      }
+    }
+  }
   const pnj = readNode(projectDir, parentPath);
-  // the child's final window (its report is the re-entry's input)
-  const childNodeDir = nodeDir(projectDir, childPath);
-  const childFinalDir = path.join(childNodeDir, newestWindow(childNodeDir) || "run-1");
+  // the child's final window (its report is the re-entry's input) — v2:
+  // the child project's OWN runs dir, not the parent's node folder
+  const childRuns = childV2
+    ? (nodeRunsDir(projectDir, childPath) || nodeDir(projectDir, childPath))
+    : nodeDir(projectDir, childPath);
+  const childFinalDir = path.join(childRuns, newestWindow(childRuns) || "run-1");
   // the decision that launched THIS child lives in the PARENT's window that
   // carried the request (newest-first: a re-spawned child takes its latest)
   const decision = findSpawnDecision(projectDir, parentPath, childPath);
@@ -389,7 +609,9 @@ async function reentry(parentPath, projectDir, childPath, childWindowDir, cfg, l
 }
 
 function findSpawnDecision(projectDir, parentPath, childPath) {
-  const pdir = nodeDir(projectDir, parentPath);
+  const pdir = nodeShape(projectDir, parentPath) === "v2"
+    ? (nodeRunsDir(projectDir, parentPath) || nodeDir(projectDir, parentPath))
+    : nodeDir(projectDir, parentPath);
   let ents = [];
   try { ents = fs.readdirSync(pdir, { withFileTypes: true }); } catch { return null; }
   const wins = ents.filter((e) => e.isDirectory() && /^run-\d+$/.test(e.name))
@@ -404,7 +626,7 @@ function findSpawnDecision(projectDir, parentPath, childPath) {
 function haltBlocked(projectDir, nodePath, windowDir, log, reason, done) {
   setNodeState(projectDir, nodePath, "blocked");
   appendState(projectDir, nodePath, `- [${new Date().toISOString()}] window ${path.basename(windowDir)}: ${reason}`);
-  clearActive(projectDir);
+  clearActiveSlots(projectDir, windowDir);
   return done({ next: "halted", reason });
 }
 
@@ -418,7 +640,8 @@ function nodeDeadlineExpired(nj, projectDir, nodePath, windowDir) {
     dl = st?.deadlineIso || st?.deadline || null;
     if (dl) {
       const n2 = readNode(projectDir, nodePath);
-      if (n2 && !n2.deadline) writeJson(path.join(nodeDir(projectDir, nodePath), "node.json"), { ...n2, deadline: String(dl) });
+      const p2 = nodeJsonAt(projectDir, nodePath);
+      if (n2 && p2 && !n2.deadline) writeJson(p2, { ...n2, deadline: String(dl) });
     }
   }
   if (!dl) return false; // no deadline anywhere — never "expired"
@@ -458,10 +681,44 @@ async function processSpawnRequest(projectDir, parentNodePath2, windowDir, req, 
   }
   const full = parentNodePath2 === ROOT ? nm : `${parentNodePath2}/${nm}`;
 
-  const { node: cnj, dir: cdir } = ensureNode(projectDir, full, { deadline: childDeadline });
-  fs.writeFileSync(path.join(cdir, "task.md"), taskText); // the node's persistent sub-task
+  const v2 = nodeShape(projectDir, parentNodePath2) === "v2";
+  let cdir;            // the node's windows dir (legacy: node folder; v2: the sub-project's runs dir)
+  let nodeDeadline = childDeadline;
+  if (v2) {
+    // plan §4: the sub-run IS a project — P/<name>/ with its own
+    // .pi-supervisor, its own TASK.md at the project root, next to the code.
+    const pof = projectOfNode(projectDir, parentNodePath2);
+    const parentProj = pof.dir || projectDir;
+    const njParent = readJson(supNodePath(parentProj)) || {};
+    const existing = (Array.isArray(njParent.children) ? njParent.children : []).find((c) => c && c.name === nm);
+    if (existing && !fs.existsSync(path.join(parentProj, String(existing.dir)))) {
+      commitDetached(parentProj, nm);
+      return fail(`"${nm}" is detached (its dir ${existing.dir} is not found — moved?) — point the registry at the new location or clear the line; not re-creating silently`);
+    }
+    const subDir = path.join(parentProj, nm);
+    fs.mkdirSync(path.join(subDir, ".pi-supervisor", "runs"), { recursive: true });
+    fs.writeFileSync(path.join(subDir, "TASK.md"), taskText); // the sub-project's task file
+    ensureStateMdAt(path.join(subDir, "STATE.md"), nm);
+    const snjPath = supNodePath(subDir);
+    let snj = readJson(snjPath);
+    if (!snj) {
+      snj = { v: 2, name: nm, path: full, parent: parentNodePath2 === ROOT ? null : parentNodePath2, deadline: childDeadline, state: "active", children: [], createdAt: new Date().toISOString() };
+      writeJson(snjPath, snj);
+    } else if (childDeadline && !snj.deadline) {
+      snj.deadline = childDeadline;
+      writeJson(snjPath, snj);
+    }
+    nodeDeadline = snj.deadline ?? null;
+    registerChild(parentProj, nm, nm, { parentPath: parentNodePath2 });
+    cdir = nodeRunsDir(projectDir, full);
+  } else {
+    const { node: cnj } = ensureNode(projectDir, full, { deadline: childDeadline });
+    cdir = nodeDir(projectDir, full);
+    fs.writeFileSync(path.join(cdir, "task.md"), taskText); // the node's persistent sub-task
+    nodeDeadline = cnj.deadline;
+  }
 
-  const b = windowBudget({ nodeDeadline: cnj.deadline, runtimeMin: req.runtime_min ?? null, now: new Date() });
+  const b = windowBudget({ nodeDeadline, runtimeMin: req.runtime_min ?? null, now: new Date() });
   if (!b.ok) {
     if (b.expired) return fail(`deadline expired: ${b.why}`);
     return fail(`cannot size window 1: ${b.why} — pass --deadline or --runtime to the spawn`);
@@ -471,9 +728,9 @@ async function processSpawnRequest(projectDir, parentNodePath2, windowDir, req, 
   // (previous report + unchanged task); a fresh node gets the sub brief.
   const prevWins = listWindows(cdir);
   const brief = prevWins.length
-    ? (wname) => briefContinuation({ nodePath: full, window: wname, prevWindowDir: path.join(cdir, prevWins[prevWins.length - 1]), budget: b })
+    ? (wname) => briefContinuation({ nodePath: full, window: wname, prevWindowDir: path.join(cdir, prevWins[prevWins.length - 1]), budget: b, v2 })
       + `\n## Task (the node's task file, unchanged)\n\n\`\`\`\n${taskText.trim()}\n\`\`\`\n`
-    : (wname) => briefSub({ nodePath: full, taskText, budget: b });
+    : (wname) => briefSub({ nodePath: full, taskText, budget: b, v2 });
   // launch via the shared opener (alloc + brief + launch; failure = blocked marker)
   return openChildWindow(projectDir, full, brief, b, cfg, windowDir, log, full);
 }
