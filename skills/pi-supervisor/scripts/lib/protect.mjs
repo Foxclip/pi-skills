@@ -187,8 +187,11 @@ function ensureSudoers(spec) {
 function ensureAgentConfig(user, piBin) {
   // The child's pi resolves its agent dir from ITS home (HOME is reset by
   // sudo), so model/auth config must exist there. We sync the owner's
-  // auth.json (and models.json / settings.json when present) as base64 to
-  // avoid any shell-quoting of secrets.
+  // auth.json (+ models.json / models-store.json / settings.json when present)
+  // as base64 to avoid any shell-quoting of secrets. models-store.json is
+  // load-bearing: it DEFINES the custom providers (e.g. llama.cpp) that the
+  // inherited --provider/--model reference — without it the child's pi dies
+  // with "Unknown provider llama.cpp" (run28, 2026-11-04).
   const ownerAgent = path.join(os.homedir(), ".pi", "agent");
   const userHome = homeOf(user);
   if (!userHome) return { ok: false, detail: `no home for '${user}'` };
@@ -196,7 +199,7 @@ function ensureAgentConfig(user, piBin) {
   let r = sudoAs(user, `umask 077; mkdir -p ${sq(userAgent)}`);
   if (r.code !== 0) return { ok: false, detail: `cannot create agent dir: ${r.err}` };
   const synced = [];
-  for (const f of ["auth.json", "models.json", "settings.json"]) {
+  for (const f of ["auth.json", "models.json", "models-store.json", "settings.json"]) {
     const src = path.join(ownerAgent, f);
     if (!fs.existsSync(src)) continue;
     const b64 = fs.readFileSync(src).toString("base64");

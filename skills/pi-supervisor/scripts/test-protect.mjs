@@ -118,6 +118,17 @@ setTimeout(() => {}, 300000);
   ok(c.out.trim() === `${TEST_USER}\nHOME=/home/${TEST_USER}`, "child runs as test user with own HOME");
   c = asUser(TEST_USER, `test -r $HOME/.pi/agent/auth.json && echo auth-ok`);
   ok(c.out.includes("auth-ok"), "child can read synced auth.json");
+  // models-store.json carries the custom provider DEFINITIONS (e.g. llama.cpp)
+  // that the inherited --provider/--model reference — without it the child's pi
+  // dies with "Unknown provider llama.cpp" (run28, 2026-11-04).
+  const ownerStore = path.join(os.homedir(), ".pi", "agent", "models-store.json");
+  if (fs.existsSync(ownerStore)) {
+    const childMd5 = asUser(TEST_USER, `md5sum $HOME/.pi/agent/models-store.json 2>/dev/null | cut -d' ' -f1`).out.trim();
+    const ownerMd5 = sh("md5sum", [ownerStore]).out.trim().split(/\s+/)[0];
+    ok(!!childMd5 && childMd5 === ownerMd5, "child's models-store.json matches the owner's (custom providers resolvable)");
+  } else {
+    ok(true, "models-store sync (owner has no models-store.json — skipped)");
+  }
   c = asUser(TEST_USER, `cd / && test -f $HOME/.gitconfig && git config --global user.name`);
   ok(c.out.includes(TEST_USER), "child git identity configured");
 
