@@ -337,6 +337,10 @@ PATH="$T/sandbox/scripts:$PATH" ralph.sh --help > $T/S9.log 2>&1
 grep -q "ralph.sh spawn" $T/S9.log && ok "S9: --help documents spawn" || bad "S9: $(grep -c spawn $T/S9.log)"
 grep -q -- "--sudo" $T/S9.log && ok "S9b: --help documents --sudo" || bad "S9b: --sudo missing from --help"
 
+# S10: the monitor's parent-session wrapper ships EXECUTABLE (run27: it was 644 —
+# every judgment spawn died at EACCES and the monitor was blind for the whole run)
+[ -x "$T/sandbox/scripts/lib/pi-as-child.sh" ] && ok "S10: lib/pi-as-child.sh is executable" || bad "S10: lib/pi-as-child.sh missing or not executable (run27 regression)"
+
 echo ""
 echo "=== $PASS passed, $FAIL failed (sandbox: $T) ==="
 pkill -f "sleep 600" 2>/dev/null
