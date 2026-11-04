@@ -932,9 +932,15 @@ rlog "monitor wait rc=$rc (mon_pid=$MON_PID, waited $(( $(date +%s) - wait_start
 # the parent's final report (v0.20.0 — written by the monitor on completion or
 # parent-stop; absent otherwise, e.g. Ctrl+C — the child is stopped before the
 # parent can summarize)
-if [ -f "$RUN_DIR/FINAL-REPORT.md" ]; then
+# v0.26.4: this box is the PARENT's report. Since sub-runs the run dir is
+# child-writable and the child's own report may hold FINAL-REPORT.md — the
+# monitor then writes its report to FINAL-REPORT.monitor.md; prefer it so the
+# box doesn't show the child's file under the parent's heading.
+FR="$RUN_DIR/FINAL-REPORT.md"
+[ -f "$RUN_DIR/FINAL-REPORT.monitor.md" ] && FR="$RUN_DIR/FINAL-REPORT.monitor.md"
+if [ -f "$FR" ]; then
   printf '%s┌ final report (parent)%s %s\n' "$C_B" "$C_N" "$(rule)" >&2
-  while IFS= read -r line; do printf '│ %s\n' "$line" >&2; done < "$RUN_DIR/FINAL-REPORT.md"
+  while IFS= read -r line; do printf '│ %s\n' "$line" >&2; done < "$FR"
   printf '└%s\n' "$(rule)" >&2
 fi
 exit $rc

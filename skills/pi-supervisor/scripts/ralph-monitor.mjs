@@ -55,7 +55,7 @@
 //   --dry-run pre-checks + state update only; no LLM call (prints the view).
 
 import { spawn, spawnSync } from "node:child_process";
-import { writeFileSync, readFileSync, existsSync, appendFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, readFileSync, existsSync, appendFileSync, mkdirSync, accessSync, constants } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseDeadline } from "./lib/deadline.mjs";
@@ -522,11 +522,19 @@ async function writeFinalReport(reason) {
     flog(`final-report-end dur=${frDur()} outcome=failed exit=${r.status ?? r.signal}`);
     return null;
   }
-  const p = path.join(A.runDir, "FINAL-REPORT.md");
+  // v0.26.4: run dirs are child-writable (spawn protocol, sub-run era) — the
+  // child's OWN final report may already hold the canonical name (run30
+  // re-entry, 2026-11-04: the child claimed FINAL-REPORT.md, the parent's
+  // overwrite hit EACCES). If the existing file is not overwritable by this
+  // process, write FINAL-REPORT.monitor.md and leave the child's file intact
+  // — ralph.sh prefers this file when printing the parent box.
+  let p = path.join(A.runDir, "FINAL-REPORT.md");
+  try { accessSync(p, constants.W_OK); }
+  catch (e) { if (e.code !== "ENOENT") p = path.join(A.runDir, "FINAL-REPORT.monitor.md"); }
   try {
     writeFileSync(p, text + "\n");
     glog("✓", 32, `final-report: written (${text.length} chars) → ${p}`);
-    flog(`final-report-end dur=${frDur()} outcome=written chars=${text.length}`);
+    flog(`final-report-end dur=${frDur()} outcome=written chars=${text.length} file=${path.basename(p)}`);
     return p;
   } catch (e) {
     glog("✗", 31, `final-report: write failed (${e.message})`);

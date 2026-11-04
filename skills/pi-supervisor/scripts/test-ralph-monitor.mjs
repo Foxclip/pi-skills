@@ -786,6 +786,37 @@ const waitExit = (p, ms) => new Promise((resolve) => {
     `ttyEsc=${t.includes("\x1b[")} plainEsc=${pl.includes("\x1b[")} ttyBanner=${t.includes("┌ ralph")} plainBanner=${pl.includes("┌ ralph")} greenDone=${greenDone}`);
 }
 
+// R37 (v0.26.4): filename collision — since sub-runs the run dir is
+// child-writable and the child's own report may hold FINAL-REPORT.md (run30
+// re-entry, 2026-11-04: the parent's overwrite hit EACCES). The monitor must
+// fall back to FINAL-REPORT.monitor.md, leave the child's file intact, and
+// ralph.sh must print the parent box from the fallback file.
+{
+  const proj = path.join(root, "p34"); const rd = path.join(proj, "run1");
+  mkdirSync(rd, { recursive: true });
+  writeFileSync(path.join(proj, "TASK.md"), "# T34");
+  // emulate a pichild-owned file as seen by the monitor (which runs as the
+  // owner user): a 444 file fails accessSync(W_OK) for its owner too
+  const claimed = path.join(rd, "FINAL-REPORT.md");
+  writeFileSync(claimed, "# the child's own report\n");
+  chmodSync(claimed, 0o444);
+  writeFileSync(path.join(rd, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed", guardPid: 999999, childPid: 999999, attempt: 1, rewinds: 0, toolCalls: 5, elapsedMs: 1234, deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
+  writeFileSync(path.join(rd, "pi-child-progress.log"), "tool line 1\n");
+  const logf = path.join(root, "r37.log");
+  const child = spawn("bash", [SBX_RALPH, rd], { cwd: proj, stdio: ["ignore", "ignore", openSync(logf, "w")],
+    env: { ...process.env, PI: STUB_OK, NO_COLOR: "1" } });
+  const rc37 = await waitExit(child, 25000);
+  const out = readFileSync(logf, "utf8");
+  const alt = path.join(rd, "FINAL-REPORT.monitor.md");
+  const altText = existsSync(alt) ? readFileSync(alt, "utf8") : "";
+  let claimedIntact = false;
+  try { claimedIntact = readFileSync(claimed, "utf8") === "# the child's own report\n"; } catch {}
+  report("R37 attach: child-claimed FINAL-REPORT.md → parent falls back to FINAL-REPORT.monitor.md (printed, child file intact)",
+    rc34 === 0 && altText.length > 0 && claimedIntact && out.includes("┌ final report (parent)"),
+    `rc=${rc37} alt=${altText.length}B claimedIntact=${claimedIntact} boxed=${out.includes("┌ final report (parent)")}`);
+  try { chmodSync(claimed, 0o644); } catch {}
+}
+
 // R32 ralph.sh flags (v0.25.9): --task <path> points the child at a non-default
 // task file; --cycle <duration> sets the parent's judgment period (2h30m → --cycle-sec 9000)
 {
