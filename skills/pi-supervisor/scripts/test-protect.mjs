@@ -33,6 +33,12 @@ function j(o) { try { return JSON.parse(o); } catch { return {}; } }
 function sq(s) { return `'${String(s).replaceAll("'", "'\\''")}'`; }
 function asUser(user, s) { return sh("sudo", ["-n", "-u", user, "/bin/sh", "-c", s]); }
 
+// fs.rmSync's force skips ENOENT but EACCES still throws — the S5c sysbin dir is root-owned.
+function cleanSb() {
+  try { sh("sudo", ["-n", "rm", "-rf", path.join(SB, "sysbin")], { timeoutMs: 10000 }); } catch {}
+  try { fs.rmSync(SB, { recursive: true, force: true }); } catch {}
+}
+
 const TEST_USER = "pisuptest";
 const SB = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sup-protect-test-"));
 
@@ -170,6 +176,15 @@ setTimeout(() => {}, 300000);
   priv = asUser(TEST_USER, "sudo -n true; echo rc=$?");
   ok(!priv.out.includes("rc=0"), "child sudo denied after revocation");
 
+  // ---- S5c: non-owner (system) node tree rejected fast ----------------------
+  console.log("S5c: system node tree rejected");
+  const sysbin = path.join(SB, "sysbin");
+  sh("sudo", ["-n", "mkdir", "-p", sysbin]);
+  sh("sudo", ["-n", "touch", path.join(sysbin, "node")]); // root-owned dir + file
+  let sys = sh(NODE, [PROTECT, "apply", "--project", proj, "--user", TEST_USER, "--pi-bin", fakePi, "--real-cli", fakeCli, "--node", path.join(sysbin, "node"), "--node-bin-dir", sysbin, "--live", liveRun]);
+  ok(sys.code !== 0 && /ungrantable/i.test(sys.err), "apply with root-owned node bin dir fails fast");
+  ok(!sys.err.includes("Operation not permitted"), "no raw setfacl EPERM storm");
+
   // ---- S6: wrapper e2e ------------------------------------------------------
   console.log("S6: child wrapper");
   let w = spawnSync(NODE, [WRAPPER, "--uid-test"], {
@@ -231,7 +246,7 @@ setTimeout(() => {}, 300000);
   ok(!acl.out.includes(`user:${TEST_USER}:`), "project ACLs removed");
   ok(sh("rm", ["-rf", path.join(proj, ".pi-supervisor")]).code === 0, "owner rm -rf works after unprotect");
   sh("sudo", ["-n", "userdel", "-r", TEST_USER]);
-  fs.rmSync(SB, { recursive: true, force: true });
+  cleanSb();
 
   console.log(`\npi-supervisor kernel-protection: ${pass} passed, ${fail} failed`);
   process.exit(fail > 0 ? 1 : 0);
@@ -241,6 +256,6 @@ try {
   main();
 } catch (e) {
   console.error("suite crashed:", e && e.stack ? e.stack.split("\n").slice(0, 3).join(" | ") : e);
-  fs.rmSync(SB, { recursive: true, force: true });
+  cleanSb();
   process.exit(1);
 }

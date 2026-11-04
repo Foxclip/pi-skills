@@ -316,10 +316,22 @@ function findDirs(root) {
 // the root's ACL so repeat applies are cheap.
 function treeAcl(spec, root) {
   if (!root || !fs.existsSync(root)) return;
+  // Fail fast on trees we cannot grant (e.g. a root-owned /usr/bin when the
+  // system node won PATH): a recursive setfacl there is a wall of EPERM lines.
+  const st = fs.statSync(root);
+  const me = typeof process.getuid === "function" ? process.getuid() : -1;
+  if (me !== 0 && st.uid !== me)
+    throw new Error(
+      `cannot grant ACLs over ${root} — owned by uid ${st.uid}, not the running user (uid ${me}). ` +
+      `System paths (e.g. /usr/bin) are ungrantable: point --node / PI_SUP_NODE at an owner-owned node, or opt out with PI_SUP_NO_PROTECT=1`
+    );
   const probe = sh("getfacl", ["-p", root]);
   if (probe.code === 0 && probe.out.includes(`user:${spec.user}:`)) return;
-  const r = sh(SH_BIN, ["-c", `find ${sq(root)} \\( -type f -o -type d \\) -print0 | xargs -0 setfacl -m u:${spec.user}:rX`]);
-  if (r.code !== 0) throw new Error(`setfacl over ${root}: ${r.err || "failed"}`);
+  const r = sh(SH_BIN, ["-c", `find ${sq(root)} \\( -type f -o -type d \\) -print0 | xargs -0 setfacl -m u:${spec.user}:rX 2>&1`]);
+  if (r.code !== 0) {
+    const first = (r.out || "").trim().split("\n").find(Boolean) || "setfacl failed";
+    throw new Error(`setfacl over ${root} failed: ${first}`);
+  }
   spec.actions.push(`${root} → u:${spec.user}:rX (recursive)`);
 }
 

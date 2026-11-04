@@ -130,7 +130,14 @@ if [ -z "${PI_SUP_NO_PROTECT:-}" ] && [ "$(uname -s)" = "Linux" ]; then
   export PI_SUP_CHILD_USER="$PI_PROTECT_USER"   # monitor (pi-as-child) + chain repair inherit
 fi
 resolve_protection_paths() { # sets REAL_CLI / NODE_PATH / NODE_BIN_DIR / PI_ABS
-  NODE_PATH="$(command -v node 2>/dev/null || true)"
+  # node: protection grants ACLs over the node's bin dir, so it must be owner-owned.
+  # A plain terminal's PATH resolves `node` to the root-owned system node
+  # (/usr/bin/node on this host) — prefer pi's own node instead.
+  local cand
+  for cand in "${PI_SUP_NODE:-}" "$HOME/.local/share/pi-node/current/bin/node"; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then NODE_PATH="$cand"; break; fi
+  done
+  [ -n "${NODE_PATH:-}" ] || NODE_PATH="$(command -v node 2>/dev/null || true)"
   NODE_BIN_DIR="$(dirname "$NODE_PATH" 2>/dev/null || true)"
   REAL_CLI="$(node -e '
     const { existsSync, readFileSync } = require("fs");
