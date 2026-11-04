@@ -315,7 +315,9 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("S1 child TASK.md copied to project root", fs.readFileSync(path.join(aproj, "TASK.md"), "utf8").includes("implement the auth sub-project"));
   ok("S1 child STATE.md created", fs.existsSync(path.join(aproj, "STATE.md")));
   const snj = readJsonFile(path.join(aproj, ".pi-supervisor", "node.json"));
-  ok("S1 child node.json v2", snj && snj.v === 2 && snj.path === "auth" && snj.parent === null && snj.state === "active", JSON.stringify(snj));
+  // parent = the parent node's path ("(root)") — plan §4.2. Live children
+  // read parent != null; only the standalone demotion writes null.
+  ok("S1 child node.json v2", snj && snj.v === 2 && snj.path === "auth" && snj.parent === "(root)" && snj.state === "active", JSON.stringify(snj));
   const rnj = readJsonFile(path.join(p, ".pi-supervisor", "node.json"));
   ok("S1 root registry entry", rnj && Array.isArray(rnj.children) && rnj.children.some((c) => c.name === "auth" && c.dir === "auth"), JSON.stringify(rnj));
   const win = path.join(aproj, ".pi-supervisor", "runs", "run-1");
@@ -336,7 +338,7 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   fs.mkdirSync(path.join(aproj, ".pi-supervisor", "runs", "run-1"), { recursive: true });
   fs.writeFileSync(path.join(aproj, "TASK.md"), "implement the auth sub-project\n");
   fs.writeFileSync(path.join(aproj, ".pi-supervisor", "node.json"), JSON.stringify({
-    v: 2, name: "auth", path: "auth", parent: null, deadline: ISO(inMin(120)), state: "active", children: [],
+    v: 2, name: "auth", path: "auth", parent: "(root)", deadline: ISO(inMin(120)), state: "active", children: [],
   }, null, 2));
   fs.writeFileSync(path.join(aproj, ".pi-supervisor", "runs", "run-1", "pi-child-status.json"),
     JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(120)) }));
@@ -363,7 +365,7 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const aproj = path.join(p, "auth");
   fs.mkdirSync(path.join(aproj, ".pi-supervisor", "runs"), { recursive: true });
   fs.writeFileSync(path.join(aproj, ".pi-supervisor", "node.json"), JSON.stringify({
-    v: 2, name: "auth", path: "auth", parent: null, deadline: ISO(inMin(120)), state: "active", children: [],
+    v: 2, name: "auth", path: "auth", parent: "(root)", deadline: ISO(inMin(120)), state: "active", children: [],
   }, null, 2));
   registerChild(p, "auth", "auth", { parentPath: "(root)" });
   const rnj3 = path.join(p, ".pi-supervisor", "node.json");
@@ -390,7 +392,7 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const aproj = path.join(p, "auth");
   fs.mkdirSync(path.join(aproj, ".pi-supervisor", "runs"), { recursive: true });
   fs.writeFileSync(path.join(aproj, ".pi-supervisor", "node.json"), JSON.stringify({
-    v: 2, name: "auth", path: "auth", parent: null, deadline: ISO(inMin(120)), state: "active", children: [],
+    v: 2, name: "auth", path: "auth", parent: "(root)", deadline: ISO(inMin(120)), state: "active", children: [],
   }, null, 2));
   registerChild(p, "auth", "auth", { parentPath: "(root)" });
   // nested sub-project db inside auth (parent: "auth" — not yet null)
@@ -410,6 +412,9 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("S4 standalone idle (no re-entry)", r.outcome?.next === "idle" && /standalone/.test(r.outcome?.reason || ""), JSON.stringify(r));
   const snj = readJsonFile(path.join(T, "moved", "auth", "db", ".pi-supervisor", "node.json"));
   ok("S4 nested node demoted parent:null", snj && snj.parent === null, JSON.stringify(snj));
+  // demotion is scoped to the window's project — the moved ancestor keeps its
+  // (now stale) parent until ITS OWN window completes standalone
+  ok("S4 ancestor node.json untouched (still parent (root))", readJsonFile(path.join(T, "moved", "auth", ".pi-supervisor", "node.json"))?.parent === "(root)");
   ok("S4 demotion logged in the project STATE.md", fs.readFileSync(path.join(T, "moved", "auth", "db", "STATE.md"), "utf8").includes("STANDALONE"));
   ok("S4 root tree untouched (still registered)", readJsonFile(path.join(p, ".pi-supervisor", "node.json"))?.children?.some((c) => c.name === "auth"));
 }

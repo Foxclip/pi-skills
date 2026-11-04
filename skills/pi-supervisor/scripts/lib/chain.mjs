@@ -682,7 +682,11 @@ async function processSpawnRequest(projectDir, parentNodePath2, windowDir, req, 
     const snjPath = supNodePath(subDir);
     let snj = readJson(snjPath);
     if (!snj) {
-      snj = { v: 2, name: nm, path: full, parent: parentNodePath2 === ROOT ? null : parentNodePath2, deadline: childDeadline, state: "active", children: [], createdAt: new Date().toISOString() };
+      // parent = the parent node's path ("(root)" for a top-level sub-project
+      // — plan §4.2). Live children therefore read parent != null; only the
+      // one-time standalone demotion (a moved tree) writes null, which is
+      // exactly the signal ralph.sh's up-front spawn refusal keys on.
+      snj = { v: 2, name: nm, path: full, parent: parentNodePath2, deadline: childDeadline, state: "active", children: [], createdAt: new Date().toISOString() };
       writeJson(snjPath, snj);
     } else if (childDeadline && !snj.deadline) {
       snj.deadline = childDeadline;
