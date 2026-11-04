@@ -353,13 +353,16 @@ USAGE
   [ -f "$SP_TASK_ABS" ] || { saye "${C_R}✗${C_N} spawn: task file not found: $SP_TASK_ABS"; exit 2; }
   [ -s "$SP_TASK_ABS" ] || { saye "${C_R}✗${C_N} spawn: task file is empty: $SP_TASK_ABS"; exit 2; }
   # v0.27.0 (plan §5): a DETACHED project (its own node.json says parent ==
-  # null — the tree moved away, the chain demoted it) cannot spawn: there is
-  # no parent tree to hand the child back to. Refuse up front.
+  # null AND it is not a root — the tree moved away, the chain demoted it,
+  # keeping its non-root name/path) cannot spawn: there is no parent tree to
+  # hand the child back to; its final report IS the deliverable. A genuine
+  # standalone root (name "(root)", parent null — never had a parent) spawns
+  # normally: its own chain step is the handler.
   SP_PROJ="$(node --input-type=module -e 'const { windowProjectOf } = await import(process.argv[1]); process.stdout.write(windowProjectOf(process.argv[2]) || "");' "file://$HERE/lib/node.mjs" "$PI_SUP_RUN_DIR" 2>/dev/null || true)"
   if [ -n "$SP_PROJ" ] && [ -f "$SP_PROJ/.pi-supervisor/node.json" ]; then
-    SP_PARENT="$(node -e 'try{process.stdout.write(String(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).parent))}catch{process.stdout.write("?")}' "$SP_PROJ/.pi-supervisor/node.json" 2>/dev/null || true)"
-    if [ "$SP_PARENT" = "null" ]; then
-      saye "${C_R}✗${C_N} spawn: this project is DETACHED (no parent tree — node.json parent == null)"
+    SP_NP="$(node -e 'try{const n=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(n.name+"|"+String(n.parent))}catch{process.stdout.write("|")}' "$SP_PROJ/.pi-supervisor/node.json" 2>/dev/null || true)"
+    if [ "${SP_NP#*|}" = "null" ] && [ "${SP_NP%%|*}" != "(root)" ]; then
+      saye "${C_R}✗${C_N} spawn: this project is DETACHED (no parent tree — node.json parent == null, name '${SP_NP%%|*}')"
       sayc "${C_D}there is nothing to hand a sub-run back to — complete the task and end with a final report instead.${C_N}"
       exit 1
     fi
@@ -767,6 +770,22 @@ AJEOF
       saye "${C_R}✗${C_N} fresh launches are refused here: this project is NESTED inside the tree at ${NESTED_PARENT}"
       sayc "${C_D}windows in a nested project are launched by the parent's chain step — spawn from inside a window (ralph.sh spawn …), or run ralph.sh in the parent tree. Attach/view/stop still work: ralph.sh <run-dir>${C_N}"
       exit 1
+    fi
+    # v0.27.0 (plan §4 S0): a FRESH launch materializes the v2 root node (the
+    # dot-dir node.json) so the FIRST spawn lands as a sub-project with a
+    # registry entry — otherwise the first chain step would see a legacy
+    # shape and materialize the v0.26 root in runs/. Idempotent; and only
+    # when no legacy v0.26 root exists (runs/node.json — those trees stay
+    # legacy, "finish in place", plan §8). Best effort: a failed materialize
+    # never blocks the launch (the chain step re-derives).
+    if [ ! -f "$PROJECT_DIR/.pi-supervisor/node.json" ] && [ ! -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
+      node --input-type=module -e '
+const { ensureRootNode } = await import(process.argv[1]);
+let dl = process.argv[3] || null;
+if (dl && /^\d+$/.test(dl)) dl = new Date(Number(dl) * 1000).toISOString();
+else if (dl && !/\d{4}-\d{2}-\d{2}T/.test(dl)) dl = null; // HH:MM — leave for the chain step
+try { ensureRootNode(process.argv[2], { deadline: dl }); } catch {}
+' "file://$HERE/lib/node.mjs" "$PROJECT_DIR" "${DEADLINE_EPOCH:-}" 2>/dev/null || true
     fi
     mkdir -p "$RUNROOT"
     n=0

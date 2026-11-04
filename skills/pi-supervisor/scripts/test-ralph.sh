@@ -399,6 +399,21 @@ RC=$?
   && ok "S13: spawn in a detached project → refused (exit 1, no request file)" \
   || bad "S13: rc=$RC $(head -5 $T/S13.log)"
 
+# S14: spawn in a GENUINE standalone v2 ROOT (name "(root)", parent null —
+# never had a parent) must NOT be refused — its own chain step is the handler.
+# Regression guard: the detached refusal is keyed on non-root name, not just
+# parent==null (e2e-2 2026-11-05: a real standalone root was refused).
+mkdir -p $T/projS14/.pi-supervisor/runs/run-1
+echo '{"v":2,"name":"(root)","path":"(root)","parent":null,"state":"active","children":[]}' > $T/projS14/.pi-supervisor/node.json
+echo "# root task" > $T/projS14/TASK.md
+echo "# sub task" > $T/spawn-task-S14.md
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$T/projS14/.pi-supervisor/runs/run-1 ralph.sh spawn \
+  --name beta --task $T/spawn-task-S14.md > $T/S14.log 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && [ -f $T/projS14/.pi-supervisor/runs/run-1/spawn-request.json ] \
+  && ok "S14: spawn in a standalone v2 root → allowed (request written)" \
+  || bad "S14: rc=$RC $(head -5 $T/S14.log)"
+
 echo ""
 echo "=== $PASS passed, $FAIL failed (sandbox: $T) ==="
 pkill -f "sleep 600" 2>/dev/null
