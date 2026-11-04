@@ -40,6 +40,12 @@
 //       flog lines with child state + durations (v0.25.15)
 //
 // Run:  node test-ralph-monitor.mjs [--keep]
+// Sanitize the inherited environment: this suite must run even when invoked
+// FROM INSIDE a supervised window — the inherited PI_SUP_* vars would flip
+// ralph.sh into the child gate (fresh launches denied) and point the
+// follow-the-slot logic at the outer window. Each case sets exactly what it needs.
+for (const k of ["PI_SUP_RUN_DIR", "PI_SUP_CHILD", "PI_SUP_PROJECT", "PI_SUP_NODE", "PI_SUP_CHILD_USER"]) delete process.env[k];
+
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, chmodSync, cpSync, openSync } from "node:fs";
 import os from "node:os";
@@ -812,7 +818,7 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   let claimedIntact = false;
   try { claimedIntact = readFileSync(claimed, "utf8") === "# the child's own report\n"; } catch {}
   report("R37 attach: child-claimed FINAL-REPORT.md → parent falls back to FINAL-REPORT.monitor.md (printed, child file intact)",
-    rc34 === 0 && altText.length > 0 && claimedIntact && out.includes("┌ final report (parent)"),
+    rc37 === 0 && altText.length > 0 && claimedIntact && out.includes("┌ final report (parent)"),
     `rc=${rc37} alt=${altText.length}B claimedIntact=${claimedIntact} boxed=${out.includes("┌ final report (parent)")}`);
   try { chmodSync(claimed, 0o644); } catch {}
 }
