@@ -1749,7 +1749,29 @@ try {
           : ` The process is force-killed at that point with no chance to report.`) +
         ` Plan to finish the task — and any required report files — before the deadline.`
       : ""; // --timeout 0 = unlimited: there is no wall clock to pace against
-    const disp0 = await promptChild(task + deadlineNote);
+    let disp0;
+    try {
+      disp0 = await promptChild(task + deadlineNote);
+    } catch (e) {
+      // v0.26.1: cold child start. pi's RpcClient gives every RPC response a
+      // hardcoded 30s timeout; a first launch as the child user bootstraps its
+      // pi install for 30-60s+ before the prompt is even read — the prompt IS
+      // buffered in the child's stdin and will be processed. If the child is
+      // alive, continue (the event loop picks up its activity; the turn-stall
+      // ladder still bounds a truly lost prompt).
+      const msg = String((e && e.message) || e);
+      let childAliveNow = false;
+      try {
+        const leader = readFileSync(childPidFile, "utf8").trim().split("\n")[0];
+        childAliveNow = !!leader && existsSync(`/proc/${leader}`);
+      } catch { childAliveNow = false; }
+      if (childUser && /Timeout waiting for response to prompt/.test(msg) && childAliveNow) {
+        logSup(`[guard] first-prompt response timed out during child start (${childUser}) — child alive, assuming the prompt is buffered; continuing`);
+        disp0 = "timeout-assumed-delivered";
+      } else {
+        throw e;
+      }
+    }
     logSup(`[guard] prompt disposition=${disp0}`);
     if (hardTimeoutMs > 0) {
       logSup(`[guard] hard deadline: ${deadlineLocal} (${deadlineIso} UTC)` + (finalizeMin > 0 ? ` + ${finalizeMin}min finalization window` : ""));

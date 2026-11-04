@@ -184,7 +184,7 @@ function ensureSudoers(spec) {
   return { ok: true, changed: true, detail: `sudoers drop-in installed: ${dest}` };
 }
 
-function ensureAgentConfig(user) {
+function ensureAgentConfig(user, piBin) {
   // The child's pi resolves its agent dir from ITS home (HOME is reset by
   // sudo), so model/auth config must exist there. We sync the owner's
   // auth.json (and models.json / settings.json when present) as base64 to
@@ -204,7 +204,21 @@ function ensureAgentConfig(user) {
     if (r.code !== 0) return { ok: false, detail: `sync ${f} failed: ${r.err}` };
     synced.push(f);
   }
-  return { ok: true, detail: synced.length ? `agent config synced: ${synced.join(", ")}` : "no owner agent config to sync" };
+  // v0.26.1: prewarm the child's pi runtime. The child's FIRST launch
+  // bootstraps the pi install into its own home (an npm install of ~200
+  // packages, 30-60s+) — longer than the RPC client's hardcoded 30s
+  // first-prompt response timeout, so an un-prewarmed child dies on its very
+  // first prompt (run27, 2026-11-04). `pi --version` as the child triggers
+  // that install; afterwards it is <1s and idempotent, and re-asserting on
+  // every window self-heals a pi version bump. Failure is a warning, not a
+  // hard fail — the guard's tolerant first prompt is the safety net.
+  let detail = synced.length ? `agent config synced: ${synced.join(", ")}` : "no owner agent config to sync";
+  if (piBin) {
+    const pw = sudoAs(user, `${sq(piBin)} --version`, { timeout: 300000 });
+    if (pw.code === 0) detail += `; pi runtime prewarmed${pw.out ? ` (${pw.out.slice(0, 40)})` : ""}`;
+    else detail += `; WARN pi runtime prewarm failed (code=${pw.code}: ${(pw.err || pw.out).slice(0, 120)}) — first child launch may be slow`;
+  }
+  return { ok: true, detail };
 }
 
 function ensureGitConfig(user, dirs) {
@@ -448,7 +462,7 @@ export function ensureProtection(opts) {
   results.push(su);
   if (!su.ok) throw new Error(su.detail);
 
-  const cfg = ensureAgentConfig(user);
+  const cfg = ensureAgentConfig(user, opts.piBin || null);
   results.push(cfg);
   if (!cfg.ok) throw new Error(cfg.detail);
 

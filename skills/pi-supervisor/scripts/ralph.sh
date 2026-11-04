@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.26.0: run a supervised child with zero arguments.
+# ralph.sh — v0.26.1: run a supervised child with zero arguments.
 # (v0.26.0 = sub-runs: spawn requests + the guard-driven chain step; see SKILL.md)
+# (v0.26.1 = kernel-protection fixes: the monitor's parent sessions run as the
+#  owner with full permissions — the pi-as-child.sh wrapper is removed; the
+#  child's pi runtime is prewarmed at protect time so the first launch is warm)
 #
 # ZERO-ARG MODE (the point of this script):
 #   1. put a TASK.md in the current directory (your project)
@@ -148,7 +151,7 @@ PI_PROTECT_USER=""
 if [ -z "${PI_SUP_NO_PROTECT:-}" ] && [ "$(uname -s)" = "Linux" ]; then
   PI_PROTECT_USER="${PI_SUP_CHILD_USER:-pichild}"
   PI_BIN_ABS="$(command -v -- "$PI_BIN" 2>/dev/null || true)"
-  export PI_SUP_CHILD_USER="$PI_PROTECT_USER"   # monitor (pi-as-child) + chain repair inherit
+  export PI_SUP_CHILD_USER="$PI_PROTECT_USER"   # chain repair + guard verification inherit
 fi
 resolve_protection_paths() { # sets REAL_CLI / NODE_PATH / NODE_BIN_DIR / PI_ABS
   # node: protection grants ACLs over the node's bin dir, so it must be owner-owned.
@@ -199,14 +202,12 @@ protect_apply() { # $1=project dir  $2=live run dir (may be "")
       ${SUDO_ALLOWED:+--sudo} \
       ${PI_SUP_WORK_DIRS:+--work-dirs "$PI_SUP_WORK_DIRS"} 2>&1)"; then
     printf '%s\n' "$out" | grep -q '"firstRun":true' 2>/dev/null \
-      && saye "${C_G}✓${C_N} kernel protection on — child + parent sessions run as '$PI_PROTECT_USER'" \
+      && saye "${C_G}✓${C_N} kernel protection on — child sessions run as '$PI_PROTECT_USER' (monitor stays the owner)" \
       || saye "${C_D}·${C_N} kernel protection current (user=$PI_PROTECT_USER)"
   else
     saye "${C_R}✗${C_N} kernel protection FAILED (protect.mjs):"; printf '%s\n' "$out" | tail -5 >&2
     return 1
   fi
-  # the pi-as-child wrapper (parent sessions) reads the real pi path from disk
-  printf '%s\n' "$PI_ABS" > "$proj/.pi-supervisor/pi-abs" 2>/dev/null || true
   return 0
 }
 protect_unprotect() { # $1=project dir
@@ -642,8 +643,6 @@ if [ $# -ge 1 ]; then
     # the parent sessions stay the owner. Mandatory once the tree exists.
     if [ -d "$PROJECT_DIR/.pi-supervisor" ]; then
       protect_apply "$PROJECT_DIR" "$RUN_DIR" || { saye "${C_R}✗${C_N} kernel protection failed — cannot attach to a protected run"; exit 1; }
-      ralph_flags+=(--pi "$HERE/lib/pi-as-child.sh")
-      export PI_SUP_PI_ABS_FILE="$PROJECT_DIR/.pi-supervisor/pi-abs"
     else
       saye "${C_D}·${C_N} kernel protection skipped — no run tree at $PROJECT_DIR/.pi-supervisor (the run lives outside the tree)"
     fi
@@ -775,8 +774,6 @@ if [ "$ATTACHED" -eq 0 ]; then
         saye "${C_R}✗${C_N} cannot start a protected run — fix the message above, or opt out with PI_SUP_NO_PROTECT=1"
         exit 1
       fi
-      ralph_flags+=(--pi "$HERE/lib/pi-as-child.sh")
-      export PI_SUP_PI_ABS_FILE="$PROJECT_DIR/.pi-supervisor/pi-abs"
     fi
     RALPH_MODE=launch
     banner launch
@@ -818,8 +815,6 @@ if [ "$ATTACHED" -eq 0 ]; then
       SUBRUNS_ATTACH_TREE=1   # v0.26.0: sub-runs project → the tree banner is the view
     fi
     if [ -n "$PI_PROTECT_USER" ]; then
-      ralph_flags+=(--pi "$HERE/lib/pi-as-child.sh")
-      export PI_SUP_PI_ABS_FILE="$PROJECT_DIR/.pi-supervisor/pi-abs"
       protect_apply "$PROJECT_DIR" "$RUN_DIR" || { saye "${C_R}✗${C_N} kernel protection failed — cannot attach to a protected run"; exit 1; }
     fi
   fi
