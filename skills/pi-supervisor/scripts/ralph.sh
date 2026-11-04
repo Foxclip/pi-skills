@@ -690,7 +690,7 @@ if [ "$ATTACHED" -eq 0 ]; then
   # that ended WITHOUT its chain step (reboot/crash mid-finalize — repair: run
   # the missing step() once, then follow its result).
   RUN_DIR=""
-  AJ_REPAIRED=0; AJ_OUTCOME=""
+  AJ_REPAIRED=0; AJ_NEXT=""; AJ_OUTCOME=""
   ACTIVE_JSON="$PROJECT_DIR/.pi-supervisor/active.json"
   if [ -f "$ACTIVE_JSON" ]; then
     aj_dir="$(status_field "$ACTIVE_JSON" run_dir)"
@@ -703,7 +703,13 @@ if [ "$ATTACHED" -eq 0 ]; then
       node --input-type=module -e 'const { step } = await import(process.argv[1]); await step(process.argv[2], process.argv[3]);' "file://$HERE/lib/chain.mjs" "$PROJECT_DIR" "$aj_dir" \
         || saye "${C_Y}!${C_N} repair step failed — the window is preserved; re-run to retry"
       if [ -f "$aj_dir/chain-done.json" ]; then
-        AJ_OUTCOME="$(status_field "$aj_dir/chain-done.json" next 2>/dev/null || true)"
+        # The record NESTS the outcome: {v, at, kind, outcome:{next, reason?,
+        # node_path?, window?, ...}} — status_field only reads top-level keys
+        # (run27: j.next is undefined → "no outcome recorded"). Read it directly.
+        IFS=$'\t' read -r AJ_NEXT AJ_DETAIL <<AJEOF
+$(node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));const o=j.outcome||{};let d=String(o.reason||"").replace(/\s+/g," ").trim().slice(0,160);if(o.node_path&&o.window)d=(d?d+" ":"")+o.node_path+"/"+o.window;process.stdout.write((o.next||"")+"\t"+d)}catch{}' "$aj_dir/chain-done.json" 2>/dev/null)
+AJEOF
+        AJ_OUTCOME="${AJ_NEXT}${AJ_DETAIL:+ — $AJ_DETAIL}"
       fi
       aj_dir2="$(status_field "$ACTIVE_JSON" run_dir 2>/dev/null || true)"
       aj_pid2="$(status_field "$ACTIVE_JSON" guard_pid 2>/dev/null || true)"
@@ -728,7 +734,7 @@ if [ "$ATTACHED" -eq 0 ]; then
   if [ -z "$RUN_DIR" ]; then
     if [ "$AJ_REPAIRED" -eq 1 ]; then
       node "$HERE/lib/node.mjs" tree "$PROJECT_DIR"
-      case "$AJ_OUTCOME" in
+      case "$AJ_NEXT" in
         idle) saye "${C_G}✓${C_N} the chain finished — root node done (windows under .pi-supervisor/runs/)"; exit 0 ;;
         *)    saye "${C_R}✗${C_N} the chain is not running — last step: ${AJ_OUTCOME:-no outcome recorded} (inspect .pi-supervisor/runs/)"; exit 1 ;;
       esac
