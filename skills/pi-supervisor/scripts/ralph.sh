@@ -116,6 +116,27 @@ HERE="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
 PI_BIN="${PI:-pi}"
 HARVEST_TARGET=""   # set once RUN_DIR is known; the EXIT trap harvests it
 
+# ---- consistent runtime (v0.26.0) -------------------------------------------------
+# A plain terminal's PATH may resolve `node` to a DIFFERENT installation than
+# the one pi itself runs on (this host: root-owned /usr/bin/node alongside pi's
+# own ~/.local/share/pi-node/current/bin — nothing in the login PATH adds it).
+# Everything ralph spawns (launch.mjs → guard → chain → monitor → pi sessions)
+# must run on the SAME node the protection ACLs were granted for, so prefer pi's
+# own node and put its bin dir at the FRONT of PATH for this script + children.
+# $PI_SUP_NODE overrides; without a pi-node dir this resolves to the PATH node
+# (already on PATH → the prefix is skipped: a no-op).
+for _rt in "${PI_SUP_NODE:-}" "$HOME/.local/share/pi-node/current/bin/node"; do
+  if [ -n "$_rt" ] && [ -x "$_rt" ]; then _rtd="$(dirname "$_rt")"; break; fi
+done
+[ -n "${_rtd:-}" ] || _rtd="$(dirname "$(command -v node 2>/dev/null || echo /dev/null)")"
+if [ -d "$_rtd" ]; then
+  case ":$PATH:" in
+    *"$_rtd:"*) ;;
+    *) PATH="$_rtd:$PATH"; export PATH ;;
+  esac
+fi
+unset _rt _rtd
+
 # ------------------------------------------------------------- kernel protection (v0.26.0)
 # The child pi (and the parent's judgment/final-report turns) run as a separate
 # OS user: the owner's 700 run tree is simply unreadable/unwritable to it —
