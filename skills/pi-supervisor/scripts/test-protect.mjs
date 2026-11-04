@@ -16,6 +16,7 @@ import { spawnSync, spawn } from "node:child_process";
 const SKILL_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
 const PROTECT = path.join(SKILL_DIR, "scripts", "lib", "protect.mjs");
 const WRAPPER = path.join(SKILL_DIR, "scripts", "lib", "child-wrapper.mjs");
+const GUARD = path.join(SKILL_DIR, "scripts", "guard.mjs");
 const NODE = process.execPath;
 const ME = os.userInfo().username;
 
@@ -184,6 +185,25 @@ setTimeout(() => {}, 300000);
   let sys = sh(NODE, [PROTECT, "apply", "--project", proj, "--user", TEST_USER, "--pi-bin", fakePi, "--real-cli", fakeCli, "--node", path.join(sysbin, "node"), "--node-bin-dir", sysbin, "--live", liveRun]);
   ok(sys.code !== 0 && /ungrantable/i.test(sys.err), "apply with root-owned node bin dir fails fast");
   ok(!sys.err.includes("Operation not permitted"), "no raw setfacl EPERM storm");
+
+  // ---- S7: guard.mjs module-eval under protection ----------------------------
+  // Regression: outDir was initialized BELOW the protected-child block (TDZ →
+  // ReferenceError on every protected run; suites never caught it because they
+  // opt out via PI_SUP_NO_PROTECT). The stub package's index.js exits 42 the
+  // moment guard imports it — reaching the import proves module-eval survived
+  // the protected-child block, with no model touched.
+  console.log("S7: guard module-eval with PI_SUP_CHILD_USER");
+  const fakePkg = path.join(SB, "fakepkg");
+  fs.mkdirSync(path.join(fakePkg, "dist"), { recursive: true });
+  fs.writeFileSync(path.join(fakePkg, "dist", "index.js"),
+    'console.log("STUB-LOADED"); process.exit(42);\nexport class RpcClient {}\n');
+  fs.writeFileSync(path.join(fakePkg, "dist", "cli.js"), "// stub cli entry (guard resolves it before the import)\n");
+  const guardTask = path.join(SB, "guard-task.md");
+  fs.writeFileSync(guardTask, "stub task");
+  const gr = sh(NODE, [GUARD, "--out-dir", path.join(SB, "gout"), "--task-file", guardTask],
+    { timeout: 30000, env: { ...process.env, PI_PACKAGE_DIR: fakePkg, PI_SUP_CHILD_USER: "pichild" } });
+  ok(gr.code === 42, "guard with child user reaches the (stub) RpcClient import");
+  ok(gr.out.includes("STUB-LOADED") && !gr.err.includes("ReferenceError"), "no TDZ/crash during guard module-eval");
 
   // ---- S6: wrapper e2e ------------------------------------------------------
   console.log("S6: child wrapper");

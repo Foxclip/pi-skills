@@ -647,6 +647,11 @@ if (!cliPath) {
   process.exit(2);
 }
 
+// outDir is initialized here (not at its former position below) because the
+// protected-child block below needs it at module-eval time — a later init is
+// a temporal-dead-zone crash (ReferenceError) on every protected run.
+const outDir = outDirArg || process.cwd();
+
 // Kernel protection (v0.26.0): PI_SUP_CHILD_USER (set by launch.mjs) makes the
 // child pi run as a separate OS user — the owner's 700 run tree is simply
 // unreadable/unwritable to it (DAC). RpcClient hard-codes
@@ -794,7 +799,6 @@ function resetAttemptCounters() {
 // tool call, plus [start]/[settled]/[result] markers. The parent session
 // should poll THIS small file instead of parsing the (multi-MB) session
 // jsonl.
-const outDir = outDirArg || process.cwd();
 // Expected-file resolution (fixed 2026-10-26, found by a live child): a bare
 // relative name ("report.md") is expected in the OUT DIR — the child's
 // artifacts live there, while existsSync(bareName) resolved it against the
