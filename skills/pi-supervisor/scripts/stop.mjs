@@ -33,6 +33,11 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+// v0.26.0 kernel protection: the child pi runs as a separate OS user in its own
+// process group (child-pgid file: "<group-pid>\n<user>", written by
+// child-wrapper.mjs). The guard-group signal covers the wrapper (which
+// forwards) — but confirm the child group directly and, if it lingers, signal
+// it owner-side + child-user via the scoped sudo kill rule.
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -213,6 +218,37 @@ if (!A.force) {
   while (!groupDead() && Date.now() < kEnd) await sleep(400);
   out.stopped = groupDead();
   out.stoppedVia = "SIGKILL-group";
+}
+
+let childGroup = null;
+try {
+  const lines = readFileSync(join(dirname(statusPath), "child-pgid"), "utf8").trim().split("\n");
+  const g = parseInt(lines[0], 10);
+  if (Number.isInteger(g) && g > 0) childGroup = { group: g, user: lines[1] || "pichild" };
+} catch { /* no child-pgid — unprotected run or pre-v0.26.0 */ }
+if (childGroup && process.platform === "linux") {
+  out.childGroup = childGroup;
+  const childGroupGone = () => {
+    try { process.kill(-childGroup.group, 0); return false; }
+    catch (e) { return e.code === "ESRCH"; }
+  };
+  for (const sig of [A.signal, "SIGKILL"]) {
+    try { process.kill(-childGroup.group, sig); } catch { /* gone or not ours */ }
+    try {
+      spawnSync("sudo", ["-n", "-u", childGroup.user, "/usr/bin/kill", "-s", sig, `-${childGroup.group}`], {
+        stdio: "ignore", timeout: 5000,
+      });
+    } catch { /* best effort */ }
+    const end = Date.now() + (sig === "SIGKILL" ? 2500 : 1500);
+    let gone = false;
+    while (Date.now() < end) {
+      if (childGroupGone()) { gone = true; break; }
+      await sleep(200);
+    }
+    if (gone) break;
+  }
+  out.childGroupGone = childGroupGone();
+  if (!out.childGroupGone) out.childGroupNote = `child process group ${childGroup.group} still has members — verify manually`;
 }
 
 // Re-read: the guard's SIGTERM/SIGINT handler marks error/killed-<sig>; a

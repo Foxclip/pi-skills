@@ -360,6 +360,35 @@ export function protectionStatus({ projectDir, user }) {
   return st;
 }
 
+// Resolve the real pi CLI bundle (the node entry the wrapper execs).
+// Order: the pi binary's own package (through symlinks), then the pi install
+// layout (current-version → releases/<v>). Returns null when unresolvable —
+// the drop-in then has no node rule and the guard's verified launch aborts.
+// (launch.mjs calls ensureProtection without an explicit --real-cli, the way
+// the chain path does; ralph.sh still passes the resolved path explicitly.)
+export function resolveRealCli(opts = {}) {
+  const cands = [];
+  const pushPkg = (pkgDir) => {
+    cands.push(path.join(pkgDir, "dist", "bundle", "cli.js"), path.join(pkgDir, "dist", "cli.js"));
+  };
+  if (opts.packageDir) pushPkg(opts.packageDir);
+  if (opts.piBin) {
+    try {
+      const real = fs.realpathSync(String(opts.piBin));
+      if (path.basename(path.dirname(real)) === ".bin")
+        pushPkg(path.join(path.dirname(real), "..", "@earendil-works", "pi-coding-agent"));
+    } catch { /* not resolvable — keep going */ }
+  }
+  try {
+    const v = fs.readFileSync(path.join(os.homedir(), ".pi", "agent", "install", "current-version"), "utf8").trim();
+    pushPkg(path.join(os.homedir(), ".pi", "agent", "install", "releases", v, "node_modules", "@earendil-works", "pi-coding-agent"));
+  } catch { /* no install layout */ }
+  for (const c of cands) {
+    try { if (fs.existsSync(c)) return path.resolve(c); } catch { /* next candidate */ }
+  }
+  return null;
+}
+
 export function ensureProtection(opts) {
   const t0 = Date.now();
   const projectDir = path.resolve(opts.projectDir);
@@ -389,7 +418,7 @@ export function ensureProtection(opts) {
     user,
     owner: ownerUser(),
     nodePath,
-    realCli: opts.realCli || null,
+    realCli: opts.realCli || resolveRealCli({ piBin: opts.piBin }),
     piBin: opts.piBin || null,
     nodeBinDir: opts.nodeBinDir || null,
   });

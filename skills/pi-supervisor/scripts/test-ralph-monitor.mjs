@@ -675,6 +675,11 @@ console.log("DECISION: OK");`);
     `lines=${lines.filter((l) => /child (running|finalizing)/.test(l)).map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 260)}`);
 }
 
+// kernel protection (v0.26.0) has its own suite (test-protect.mjs) — the
+// ralph.sh integration cases run unprotected (faster, hermetic, no mounts left
+// behind when a case kills its run mid-flight).
+process.env.PI_SUP_NO_PROTECT = "1";
+
 // ================= RALPH.SH integration (v0.21.0 terminal design) =================
 // sandbox: ralph.sh + ralph-monitor.mjs + stop.mjs + lib/ copied into root/sbx/scripts,
 // launch.mjs REPLACED with a stub (writes launch-args.txt, spawns a detached
@@ -710,7 +715,9 @@ const waitExit = (p, ms) => new Promise((resolve) => {
 {
   const proj = path.join(root, "p18"); mkdirSync(proj, { recursive: true });
   writeFileSync(path.join(proj, "TASK.md"), "# T18 task");
-  const dl = String(Math.floor(Date.now() / 1000) + 7200);
+  // +7300, not +7200: the banner prints a few ms after dl is computed and
+  // truncates — an exact 2h deadline would already read "1h 59m" by then.
+  const dl = String(Math.floor(Date.now() / 1000) + 7300);
   const logf = path.join(root, "r18.log");
   const child = spawn("bash", [SBX_RALPH], { cwd: proj, stdio: ["ignore", "ignore", openSync(logf, "w")],
     env: { ...process.env, PI: STUB_OK, DEADLINE: dl, CHILD_MODEL: "cm-e2e", PARENT_MODEL: "pm-e2e", CYCLE_SEC: "1" } });

@@ -6,6 +6,9 @@
 # Note: a foreground `ralph.sh` blocks while it monitors — cases that launch
 # run it backgrounded and assert on its log, then stop it via the pointer.
 set -u
+# Kernel protection (v0.26.0) is covered by test-protect.mjs (it creates real
+# users + sudoers state); the ralph-level suites run unprotected.
+export PI_SUP_NO_PROTECT=1
 SELF="$(readlink -f "$0")"
 SKILL="$(cd "$(dirname "$SELF")" && pwd)"
 S=$SKILL

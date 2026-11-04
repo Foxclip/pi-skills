@@ -116,6 +116,80 @@ HERE="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
 PI_BIN="${PI:-pi}"
 HARVEST_TARGET=""   # set once RUN_DIR is known; the EXIT trap harvests it
 
+# ------------------------------------------------------------- kernel protection (v0.26.0)
+# The child pi (and the parent's judgment/final-report turns) run as a separate
+# OS user: the owner's 700 run tree is simply unreadable/unwritable to it —
+# kernel-level DAC, enforced by the filesystem, not by prompts. protect.mjs
+# installs the user + ACLs + scoped passwordless sudo + a self bind-mount on
+# .pi-supervisor (closes the `mv` hole a DAC-only layout leaves). Idempotent;
+# re-asserted on every window. PI_SUP_NO_PROTECT=1 opts out (test sandboxes).
+PI_PROTECT_USER=""
+if [ -z "${PI_SUP_NO_PROTECT:-}" ] && [ "$(uname -s)" = "Linux" ]; then
+  PI_PROTECT_USER="${PI_SUP_CHILD_USER:-pichild}"
+  PI_BIN_ABS="$(command -v -- "$PI_BIN" 2>/dev/null || true)"
+  export PI_SUP_CHILD_USER="$PI_PROTECT_USER"   # monitor (pi-as-child) + chain repair inherit
+fi
+resolve_protection_paths() { # sets REAL_CLI / NODE_PATH / NODE_BIN_DIR / PI_ABS
+  NODE_PATH="$(command -v node 2>/dev/null || true)"
+  NODE_BIN_DIR="$(dirname "$NODE_PATH" 2>/dev/null || true)"
+  REAL_CLI="$(node -e '
+    const { existsSync, readFileSync } = require("fs");
+    const { join } = require("path");
+    const { homedir } = require("os");
+    const cands = [];
+    if (process.env.PI_PACKAGE_DIR) cands.push(join(process.env.PI_PACKAGE_DIR, "dist", "bundle", "cli.js"));
+    try {
+      const v = readFileSync(join(homedir(), ".pi", "agent", "install", "current-version"), "utf8").trim();
+      for (const e of ["bundle", ""])
+        cands.push(join(homedir(), ".pi", "agent", "install", "releases", v, "node_modules", "@earendil-works", "pi-coding-agent", "dist", e ? e + "/cli.js" : "cli.js"));
+    } catch {}
+    for (const p of cands) if (existsSync(p)) { console.log(p); break; }
+  ' 2>/dev/null || true)"
+  PI_ABS="${PI_BIN_ABS:-}"
+}
+protect_apply() { # $1=project dir  $2=live run dir (may be "")
+  [ -n "$PI_PROTECT_USER" ] || return 0
+  local proj="$1" live="${2:-}"
+  case "$live" in ""|"$proj"/*) ;; *) live="" ;; esac   # only our own windows are rwx
+  resolve_protection_paths
+  if [ -z "$NODE_PATH" ]; then
+    saye "${C_R}✗${C_N} kernel protection: node not found on PATH — cannot protect the run (set PI_SUP_NO_PROTECT=1 to opt out)"
+    return 1
+  fi
+  if [ -z "$REAL_CLI" ]; then
+    saye "${C_R}✗${C_N} kernel protection: cannot locate the pi CLI bundle — set PI_PACKAGE_DIR (or PI_SUP_NO_PROTECT=1 to opt out)"
+    return 1
+  fi
+  if [ -z "$PI_ABS" ] || [ ! -f "$PI_ABS" ]; then
+    saye "${C_R}✗${C_N} kernel protection: pi binary '${PI_BIN}' not found on PATH — cannot protect the run"
+    return 1
+  fi
+  local out
+  if out="$(node "$HERE/lib/protect.mjs" apply --project "$proj" ${live:+--live "$live"} \
+      --user "$PI_PROTECT_USER" --pi-bin "$PI_ABS" --real-cli "$REAL_CLI" \
+      --node "$NODE_PATH" --node-bin-dir "$NODE_BIN_DIR" \
+      ${PI_SUP_WORK_DIRS:+--work-dirs "$PI_SUP_WORK_DIRS"} 2>&1)"; then
+    printf '%s\n' "$out" | grep -q '"firstRun":true' 2>/dev/null \
+      && saye "${C_G}✓${C_N} kernel protection on — child + parent sessions run as '$PI_PROTECT_USER'" \
+      || saye "${C_D}·${C_N} kernel protection current (user=$PI_PROTECT_USER)"
+  else
+    saye "${C_R}✗${C_N} kernel protection FAILED (protect.mjs):"; printf '%s\n' "$out" | tail -5 >&2
+    return 1
+  fi
+  # the pi-as-child wrapper (parent sessions) reads the real pi path from disk
+  printf '%s\n' "$PI_ABS" > "$proj/.pi-supervisor/pi-abs" 2>/dev/null || true
+  return 0
+}
+protect_unprotect() { # $1=project dir
+  [ -n "$PI_PROTECT_USER" ] || { saye "${C_D}·${C_N} kernel protection is not in effect (PI_SUP_NO_PROTECT)"; return 0; }
+  local proj="$1"
+  resolve_protection_paths
+  node "$HERE/lib/protect.mjs" unprotect --project "$proj" --user "$PI_PROTECT_USER" \
+      ${PI_ABS:+--pi-bin "$PI_ABS"} ${REAL_CLI:+--real-cli "$REAL_CLI"} \
+      ${NODE_BIN_DIR:+--node-bin-dir "$NODE_BIN_DIR"}
+  rm -f "$proj/.pi-supervisor/pi-abs" 2>/dev/null || true
+}
+
 # every wrapper message is timestamped in LOCAL time (terminal = human-facing;
 # the log files keep ISO-8601 UTC — see ts() format vs the monitor's log())
 # ------------------------------------------------------------- terminal (v0.21.0, glyphs v0.24.0)
@@ -296,6 +370,8 @@ ralph.sh — supervised pi child (ralph loop). Zero-arg pipeline:
   ralph.sh spawn --name <node> --task <file> [--deadline <t>] [--runtime <m>]
                        [--reason <text>]   THE CHILD'S API (inside a window):
                        writes spawn-request.json; the chain step launches it
+  ralph.sh unprotect [project-dir]   remove the kernel-protection boundary
+                       (child user ACLs, scoped sudo rule, bind mount)
   ralph.sh -h | --help         this help
 normal-mode flags (anywhere in the arg list): --deadline <ISO|HH:MM|epoch>
   --runtime <duration>    relative deadline: 90 = 90min, or 45s/90m/2h/1h30m
@@ -398,6 +474,31 @@ stop_and_report() { # $1=run-dir; remaining args → stop.mjs (e.g. --force)
   return $rc
 }
 
+# ------------------------------------------------------------- unprotect
+if [ "${1:-}" = "unprotect" ]; then
+  shift
+  UP_PROJECT=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --project)   [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --project needs a value"; exit 2; }; UP_PROJECT="$2"; shift 2 ;;
+      --project=*) UP_PROJECT="${1#*=}"; shift ;;
+      -*) saye "${C_R}✗${C_N} unprotect: unknown flag: $1"; exit 2 ;;
+      *) if [ -n "${UP_PROJECT:-}" ]; then saye "${C_R}✗${C_N} unprotect: one project dir at a time"; exit 2; fi
+         UP_PROJECT="$1"; shift ;;
+    esac
+  done
+  UP_PROJECT="${UP_PROJECT:-$PWD}"
+  if [ ! -d "$UP_PROJECT/.pi-supervisor" ]; then
+    saye "${C_R}✗${C_N} no .pi-supervisor in $UP_PROJECT — nothing to unprotect"; exit 1
+  fi
+  if protect_unprotect "$UP_PROJECT"; then
+    saye "${C_G}✓${C_N} kernel protection removed for $UP_PROJECT"
+  else
+    saye "${C_R}✗${C_N} unprotect failed — inspect the output above"; exit 1
+  fi
+  exit 0
+fi
+
 # ------------------------------------------------------------- --harvest
 if [ "${1:-}" = "--harvest" ]; then
   SRC="${2:-}"; DEST="${3:-}"
@@ -498,6 +599,18 @@ if [ $# -ge 1 ]; then
   if [ -n "${PROJECT_DIR:-}" ]; then ralph_flags+=(--project-dir "$PROJECT_DIR"); fi
   if [ -n "$DEADLINE_EPOCH" ]; then ralph_flags+=(--deadline "$DEADLINE_EPOCH"); fi
   EXTRA=("$@")
+  if [ -n "$PI_PROTECT_USER" ]; then
+    # A power-user attach may point at a run that lives OUTSIDE the project's
+    # run tree (any dir the user names) — there is nothing to protect there and
+    # the parent sessions stay the owner. Mandatory once the tree exists.
+    if [ -d "$PROJECT_DIR/.pi-supervisor" ]; then
+      protect_apply "$PROJECT_DIR" "$RUN_DIR" || { saye "${C_R}✗${C_N} kernel protection failed — cannot attach to a protected run"; exit 1; }
+      ralph_flags+=(--pi "$HERE/lib/pi-as-child.sh")
+      export PI_SUP_PI_ABS_FILE="$PROJECT_DIR/.pi-supervisor/pi-abs"
+    else
+      saye "${C_D}·${C_N} kernel protection skipped — no run tree at $PROJECT_DIR/.pi-supervisor (the run lives outside the tree)"
+    fi
+  fi
   RALPH_MODE=attach   # the banner prints before the monitor starts
   MONITOR_ARGS=(--run-dir "$RUN_DIR" "${ralph_flags[@]}" "${EXTRA[@]}")
   if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
@@ -616,6 +729,18 @@ if [ "$ATTACHED" -eq 0 ]; then
     if [ -n "$CHILD_PROVIDER_VAL" ]; then launch_args+=(--provider "$CHILD_PROVIDER_VAL"); fi
     if [ -n "${CHILD_THINKING:-}" ]; then launch_args+=(--thinking "$CHILD_THINKING"); fi
 
+    # kernel protection — the boundary must exist BEFORE the child starts
+    # (the wrapper verifies the child actually runs as the protected user; a
+    # protected launch without the boundary would fail at spawn). Mandatory by
+    # default: refuse early with a clear message instead.
+    if [ -n "$PI_PROTECT_USER" ]; then
+      if ! protect_apply "$PROJECT_DIR" "$RUN_DIR"; then
+        saye "${C_R}✗${C_N} cannot start a protected run — fix the message above, or opt out with PI_SUP_NO_PROTECT=1"
+        exit 1
+      fi
+      ralph_flags+=(--pi "$HERE/lib/pi-as-child.sh")
+      export PI_SUP_PI_ABS_FILE="$PROJECT_DIR/.pi-supervisor/pi-abs"
+    fi
     RALPH_MODE=launch
     banner launch
     launch_out=$(node "$HERE/launch.mjs" "${launch_args[@]}" 2>&1) || true
@@ -654,6 +779,11 @@ if [ "$ATTACHED" -eq 0 ]; then
     RALPH_MODE=attach
     if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
       SUBRUNS_ATTACH_TREE=1   # v0.26.0: sub-runs project → the tree banner is the view
+    fi
+    if [ -n "$PI_PROTECT_USER" ]; then
+      ralph_flags+=(--pi "$HERE/lib/pi-as-child.sh")
+      export PI_SUP_PI_ABS_FILE="$PROJECT_DIR/.pi-supervisor/pi-abs"
+      protect_apply "$PROJECT_DIR" "$RUN_DIR" || { saye "${C_R}✗${C_N} kernel protection failed — cannot attach to a protected run"; exit 1; }
     fi
   fi
 
