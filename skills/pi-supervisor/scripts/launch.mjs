@@ -267,6 +267,7 @@ if (childUser) {
       nodePath: process.execPath,
       nodeBinDir: dirname(process.execPath),
       workDirs: (process.env.PI_SUP_WORK_DIRS || "").split(":").filter(Boolean),
+      sudo: process.env.PI_SUP_SUDO === "1",
     });
     console.log(`[launch] kernel protection: ${res.firstRun ? "applied" : "current"} (live=${outDir})`);
   } catch (e) {

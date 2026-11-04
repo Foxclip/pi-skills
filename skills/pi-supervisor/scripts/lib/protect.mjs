@@ -32,6 +32,7 @@
 //   Sudo surface (drop-in /etc/sudoers.d/pi-supervisor-<user>, managed):
 //     Cmnd_Alias PI_SUP_CMDS_<USER> = <node> <realCli> *, <piBin> *, /usr/bin/kill *, /bin/sh *
 //     <owner> ALL=(<user>) NOPASSWD: PI_SUP_CMDS_<USER>
+//     [with --sudo]  <user> ALL=(ALL) NOPASSWD: ALL   # child gets root: protection is voidable
 //     Defaults:<owner> env_keep += "PI_SUP_*"   (gate identity crosses sudo)
 //     Defaults:<owner> secure_path = "<pi-node bin>:<standard paths>"
 //   The child user itself has NO sudo rules — it cannot escalate.
@@ -112,7 +113,7 @@ export function sudoersPathFor(user) {
   return `${SUDOERS_D}/pi-supervisor-${user}`;
 }
 
-function dropinContent({ user, owner, nodePath, realCli, piBin, nodeBinDir }) {
+function dropinContent({ user, owner, nodePath, realCli, piBin, nodeBinDir, sudo }) {
   const alias = `PI_SUP_CMDS_${user.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
   const cmds = [];
   if (nodePath && realCli) cmds.push(`${nodePath} ${realCli} *`);
@@ -121,10 +122,17 @@ function dropinContent({ user, owner, nodePath, realCli, piBin, nodeBinDir }) {
   const lines = [
     `# pi-supervisor kernel protection for '${user}' — MANAGED FILE, rewritten by ralph.sh protect.`,
     `# Grants the owner passwordless, scoped sudo AS '${user}': run the pi CLI (node bundle or`,
-    `# launcher), signal processes, and run shell lines for provisioning. The child user itself`,
-    `# has no sudo rules. Re-asserted idempotently on every window.`,
+    `# launcher), signal processes, and run shell lines for provisioning. Without --sudo the`,
+    `# child user itself has no sudo rules. Re-asserted idempotently on every window.`,
     `Cmnd_Alias ${alias} = ${cmds.join(", ")}`,
     `${owner} ALL=(${user}) NOPASSWD: ${alias}`,
+    ...(sudo
+      ? [
+          `# EXPLICIT --sudo grant — the child has full root, so kernel protection is voidable`,
+          `# from inside the run by design (audit the transcripts).`,
+          `${user} ALL=(ALL) NOPASSWD: ALL`,
+        ]
+      : []),
     `Defaults:${owner} env_keep += "${ENV_KEEP_VARS}"`,
     `Defaults:${owner} secure_path = "${(nodeBinDir ? nodeBinDir + ":" : "")}${SECURE_PATH}"`,
   ];
@@ -346,6 +354,8 @@ export function protectionStatus({ projectDir, user }) {
   };
   try {
     st.sudoers.present = fs.existsSync(sudoersPathFor(user));
+    if (st.sudoers.present)
+      st.sudoers.childRoot = fs.readFileSync(sudoersPathFor(user), "utf8").includes("ALL=(ALL) NOPASSWD: ALL");
   } catch {}
   if (st.psup.exists) {
     const probe = sudo(["-u", user, SH_BIN, "-c", `test -x ${sq(psup)} && test ! -w ${sq(psup)}`]);
@@ -421,6 +431,7 @@ export function ensureProtection(opts) {
     realCli: opts.realCli || resolveRealCli({ piBin: opts.piBin }),
     piBin: opts.piBin || null,
     nodeBinDir: opts.nodeBinDir || null,
+    sudo: !!opts.sudo,
   });
   results.push(su);
   if (!su.ok) throw new Error(su.detail);
@@ -530,7 +541,10 @@ function cli() {
   const A = {};
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith("--")) A[a.slice(2)] = argv[i + 1], i++;
+    if (a.startsWith("--")) {
+      if (a === "--sudo") { A.sudo = true; continue; } // bare flag; the generic path takes a value
+      A[a.slice(2)] = argv[i + 1], i++;
+    }
   }
   const fail = (msg) => {
     console.error(`protect: ${msg}`);
@@ -548,6 +562,7 @@ function cli() {
         nodePath: A.node || null,
         nodeBinDir: A["node-bin-dir"] || null,
         workDirs: A["work-dirs"] ? String(A["work-dirs"]).split(":").filter(Boolean) : [],
+        sudo: !!A.sudo,
       });
       // Machine contract: stdout is ONE JSON object (tests + ralph.sh parse
       // it); human-facing progress goes to stderr.
@@ -563,7 +578,7 @@ function cli() {
       for (const a of res.actions) console.error(`  ${a}`);
       console.log(JSON.stringify({ ok: true, actions: res.actions }));
     } else {
-      console.error("usage: protect.mjs apply|status|unprotect --project <d> [--live <run-dir>] [--user <u>] [--pi-bin <p>] [--real-cli <p>] [--node <p>] [--node-bin-dir <d>] [--work-dirs <a:b>]");
+      console.error("usage: protect.mjs apply|status|unprotect --project <d> [--live <run-dir>] [--user <u>] [--pi-bin <p>] [--real-cli <p>] [--node <p>] [--node-bin-dir <d>] [--work-dirs <a:b>] [--sudo]");
       process.exit(2);
     }
   } catch (e) {

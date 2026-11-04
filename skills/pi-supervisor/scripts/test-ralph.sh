@@ -335,6 +335,7 @@ grep -q -- "--project $T/projC --node (root)" $T/projC/.pi-supervisor/runs/run1/
 cd $T/projS1
 PATH="$T/sandbox/scripts:$PATH" ralph.sh --help > $T/S9.log 2>&1
 grep -q "ralph.sh spawn" $T/S9.log && ok "S9: --help documents spawn" || bad "S9: $(grep -c spawn $T/S9.log)"
+grep -q -- "--sudo" $T/S9.log && ok "S9b: --help documents --sudo" || bad "S9b: --sudo missing from --help"
 
 echo ""
 echo "=== $PASS passed, $FAIL failed (sandbox: $T) ==="

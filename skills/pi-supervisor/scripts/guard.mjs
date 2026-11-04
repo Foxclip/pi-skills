@@ -465,6 +465,10 @@ if (preamble === "standard") {
     console.error(`error: --preamble standard: cannot read ${contractPath}: ${e.message}`);
     process.exit(2);
   }
+  // ralph.sh --sudo grants the child user root — the contract's no-escalation
+  // rule is explicitly lifted for this run (PI_SUP_SUDO is exported by ralph.sh).
+  if (process.env.PI_SUP_SUDO === "1")
+    preamble += "\n\nNOTE: this run was launched with --sudo — the child user HAS root sudo, lifting the no-escalation rule above. Use sudo only for the task, never against the run tree.";
 }
 
 task = prompts.join(" ");

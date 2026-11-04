@@ -153,6 +153,23 @@ setTimeout(() => {}, 300000);
   c = sh("sudo", ["-n", "-u", TEST_USER, "/bin/sh", "-c", "echo v=$PI_SUP_CHILD"], { env: { ...process.env, PI_SUP_CHILD: "1" } });
   ok(c.out.trim() === "v=1", "PI_SUP_CHILD crosses sudo (env_keep)");
 
+  // ---- S5b: --sudo grant (opt-in child root) --------------------------------
+  console.log("S5b: --sudo");
+  r = sh(NODE, [PROTECT, ...applyArgs(["--sudo"])]);
+  let asu = j(r.out);
+  ok(asu.ok === true, `apply --sudo ok (${asu.error || ""})`);
+  let dp = sh("sudo", ["-n", "cat", dropin]).out; // drop-in is root:root 0440
+  ok(dp.includes(`${TEST_USER} ALL=(ALL) NOPASSWD: ALL`), "drop-in grants child root with --sudo");
+  let priv = asUser(TEST_USER, "sudo -n true; echo rc=$?");
+  ok(priv.out.includes("rc=0"), "child sudo (root) works with --sudo");
+  r = sh(NODE, [PROTECT, ...applyArgs()]);
+  asu = j(r.out);
+  ok(asu.ok === true, `re-apply without --sudo ok (${asu.error || ""})`);
+  dp = sh("sudo", ["-n", "cat", dropin]).out;
+  ok(!dp.includes("ALL=(ALL)"), "child root rule revoked on plain re-apply");
+  priv = asUser(TEST_USER, "sudo -n true; echo rc=$?");
+  ok(!priv.out.includes("rc=0"), "child sudo denied after revocation");
+
   // ---- S6: wrapper e2e ------------------------------------------------------
   console.log("S6: child wrapper");
   let w = spawnSync(NODE, [WRAPPER, "--uid-test"], {

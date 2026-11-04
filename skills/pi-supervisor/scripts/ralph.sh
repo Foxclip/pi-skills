@@ -168,6 +168,7 @@ protect_apply() { # $1=project dir  $2=live run dir (may be "")
   if out="$(node "$HERE/lib/protect.mjs" apply --project "$proj" ${live:+--live "$live"} \
       --user "$PI_PROTECT_USER" --pi-bin "$PI_ABS" --real-cli "$REAL_CLI" \
       --node "$NODE_PATH" --node-bin-dir "$NODE_BIN_DIR" \
+      ${SUDO_ALLOWED:+--sudo} \
       ${PI_SUP_WORK_DIRS:+--work-dirs "$PI_SUP_WORK_DIRS"} 2>&1)"; then
     printf '%s\n' "$out" | grep -q '"firstRun":true' 2>/dev/null \
       && saye "${C_G}✓${C_N} kernel protection on — child + parent sessions run as '$PI_PROTECT_USER'" \
@@ -360,6 +361,7 @@ while [ $# -gt 0 ]; do
     --task=*)          TASK_FILE=${1#*=}; shift ;;
     --cycle)           [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --cycle needs a value"; exit 2; }; CYCLE_RAW=$2; shift 2 ;;
     --cycle=*)         CYCLE_RAW=${1#*=}; shift ;;
+    --sudo)            SUDO_ALLOWED=1; shift ;;
     -h|--help)
       cat <<'USAGE'
 ralph.sh — supervised pi child (ralph loop). Zero-arg pipeline:
@@ -379,6 +381,9 @@ normal-mode flags (anywhere in the arg list): --deadline <ISO|HH:MM|epoch>
   --child-thinking <level>   the CHILD's thinking level (off|minimal|low|medium|high)
   --task <path>           task file to run (default TASK.md)
   --cycle <duration>      parent's judgment period: 45s/90m/2h/2h30m (default 20m)
+  --sudo                 grant the child user root sudo (NOPASSWD) — voids kernel protection;
+                         for tasks that genuinely need root. Off by default; per-user-global,
+                         dropped on the next plain re-protect or unprotect.
 environment: PI TASK_FILE RUNS_DIR DEADLINE RUNTIME MAX_HOURS MODEL PROVIDER
   CHILD_MODEL CHILD_PROVIDER CHILD_THINKING PARENT_MODEL PARENT_PROVIDER PREAMBLE IDLE_TIMEOUT TURN_STALL_SEC FINALIZE
   CYCLE_SEC TIMEOUT_SEC MAX_INTERVENTIONS STUCK_SEC STALE_SEC LLM_FAIL_MAX
@@ -389,6 +394,10 @@ USAGE
     *) _cli_pos+=("$1"); shift ;;
   esac
 done
+if [ "${SUDO_ALLOWED:-0}" = "1" ]; then
+  saye "${C_Y}!${C_N} --sudo: the child user will have ROOT (NOPASSWD) — kernel protection is voidable from inside the run (by design; audit the transcripts)"
+fi
+export PI_SUP_SUDO="${SUDO_ALLOWED:-0}"
 if [ ${#_cli_pos[@]} -gt 0 ]; then set -- "${_cli_pos[@]}"; else set --; fi
 
 DEADLINE_RAW="${DEADLINE:-}"
