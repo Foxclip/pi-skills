@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.28.0: run a supervised child with zero arguments.
+# ralph.sh — v0.29.0: run a supervised child with zero arguments.
+# (v0.29.0 = the child user's pi package: ralph.sh (via protect_apply) syncs the
+#  repo in the CHILD home from the owner's canonical checkout before every
+#  protected bootstrap — fresh/attach/repair — and child-wrapper.mjs re-syncs
+#  before every child spawn; PI_OFFLINE=1 is then set so pi's own session-start
+#  package check cannot re-align that clone to the remote mid-run)
 # (v0.28.0 = sub-runs as projects is the ONLY layout — the v0.26 runs/ node-folder
 #  shape is removed; a rejected spawn escalates the node to blocked/halted, never
 #  a silent idle; the spawn budget is validated before any side effect)
@@ -214,6 +219,7 @@ protect_apply() { # $1=project dir  $2=live run dir (may be "")
     printf '%s\n' "$out" | grep -q '"firstRun":true' 2>/dev/null \
       && saye "${C_G}✓${C_N} kernel protection on — child + parent sessions run as '$PI_PROTECT_USER'" \
       || saye "${C_D}·${C_N} kernel protection current (user=$PI_PROTECT_USER)"
+    pkg_sync_status   # v0.29.0: child-home package sync (best effort, warn-only)
   else
     saye "${C_R}✗${C_N} kernel protection FAILED (protect.mjs):"; printf '%s\n' "$out" | tail -5 >&2
     return 1
@@ -251,6 +257,23 @@ else C_B=""; C_D=""; C_G=""; C_Y=""; C_R=""; C_N=""; fi
 say()  { printf '[%s] %s\n' "$(ts)" "$*"; }
 saye() { printf '%s[%s]%s %s\n' "$C_D" "$(ts_s)" "$C_N" "$*" >&2; }
 sayc() { printf '%s[%s]%s     %s\n' "$C_D" "$(ts_s)" "$C_N" "$*" >&2; }   # continuation: dim, indented under the glyph column
+# v0.29.0: sync the child user's pi package clone from the owner's canonical
+# repo (the checkout THIS ralph.sh runs from), so that every session running as
+# the child user — the supervised child and the monitor's parent sessions —
+# uses the repo in the CHILD home at the exact code being orchestrated.
+# Semantics live in lib/child-package.mjs (local clone if missing, fetch HEAD,
+# ff-only or reset --hard, verify). Best effort — a skip is a warning, never a
+# failure (the child's pi then self-syncs online at session start).
+pkg_sync_status() {
+  [ -n "$PI_PROTECT_USER" ] || return 0
+  local out
+  out="$(node "$HERE/lib/child-package.mjs" sync --user "$PI_PROTECT_USER" 2>&1)" || true
+  if printf '%s' "$out" | grep -q '"ok":true'; then
+    saye "child package: $(printf '%s' "$out" | node -e 'let s="";process.stdin.on("data",(d)=>s+=d).on("end",()=>{try{const j=JSON.parse(s);console.log((j.target||"")+" @ "+String(j.head||"").slice(0,7))}catch{console.log(s.slice(0,120))}})' 2>/dev/null || true)"
+  else
+    saye "${C_Y}!${C_N} child package: $(printf '%s' "$out" | tr -d "\n" | cut -c1-160)"
+  fi
+}
 # v0.25.15: the wrapper's own on-disk record — <run-dir>/ralph.log. Before this,
 # everything ralph.sh said lived only in terminal scrollback: the 2026-11-02 run
 # that printed `✗ done · exit 127` left no trace of which shell waited on which

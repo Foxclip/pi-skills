@@ -30,7 +30,7 @@
 //   project dir cannot complete either, because the tree cannot be emptied).
 //
 //   Sudo surface (drop-in /etc/sudoers.d/pi-supervisor-<user>, managed):
-//     Cmnd_Alias PI_SUP_CMDS_<USER> = <node> <realCli> *, <piBin> *, /usr/bin/kill *, /bin/sh *
+//     Cmnd_Alias PI_SUP_CMDS_<USER> = <node> <realCli> *, <piBin> *, /usr/bin/kill *, /bin/sh *, <git> *
 //     <owner> ALL=(<user>) NOPASSWD: PI_SUP_CMDS_<USER>
 //     [with --sudo]  <user> ALL=(ALL) NOPASSWD: ALL   # child gets root: protection is voidable
 //     Defaults:<owner> env_keep += "PI_SUP_*"   (gate identity crosses sudo)
@@ -59,8 +59,12 @@ import { fileURLToPath } from "node:url";
 
 export const KILL_BIN = "/usr/bin/kill";
 const SH_BIN = "/bin/sh";
+const GIT_BIN = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"].find((p) => fs.existsSync(p)) || "git";
 const SUDOERS_D = "/etc/sudoers.d";
-const ENV_KEEP_VARS = "PI_SUP_CHILD PI_SUP_RUN_DIR PI_SUP_NODE PI_SUP_PROJECT PI_SUP_WORK_DIRS PI_SUP_CHILD_USER";
+// PI_OFFLINE: v0.29.0 — set by child-wrapper/pi-as-child after a verified child
+// package sync, so pi's own session-start git-package check cannot re-align
+// the child home's clone to the remote mid-run.
+const ENV_KEEP_VARS = "PI_SUP_CHILD PI_SUP_RUN_DIR PI_SUP_NODE PI_SUP_PROJECT PI_SUP_WORK_DIRS PI_SUP_CHILD_USER PI_OFFLINE";
 const SECURE_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 // ---------------------------------------------------------------------------
@@ -118,6 +122,9 @@ function dropinContent({ user, owner, nodePath, realCli, piBin, nodeBinDir, sudo
   const cmds = [];
   if (nodePath && realCli) cmds.push(`${nodePath} ${realCli} *`);
   if (piBin) cmds.push(`${piBin} *`);
+  // v0.29.0: the owner-side child package sync (child-package.mjs) runs git AS
+  // the child user so the synced clone stays child-owned.
+  cmds.push(`${GIT_BIN} *`);
   cmds.push(`${KILL_BIN} *`, `${SH_BIN} *`);
   const lines = [
     `# pi-supervisor kernel protection for '${user}' — MANAGED FILE, rewritten by ralph.sh protect.`,
