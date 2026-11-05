@@ -507,6 +507,15 @@ export function ensureProtection(opts) {
   }
   if (opts.nodeBinDir) treeAcl(spec, opts.nodeBinDir);
   if (opts.realCli) treeAcl(spec, releaseRootOf(opts.realCli));
+  // v0.29.0: the child's pi package clone syncs FROM the owner's checkout
+  // (lib/child-package.mjs) — grant the child read over it (rX incl. .git)
+  // so a restrictive umask can't break the local clone/fetch. ralph.sh sets
+  // PI_SUP_OWNER_PKG; direct protect.mjs runs without it are unchanged.
+  const pkgRepo = process.env.PI_SUP_OWNER_PKG ? path.resolve(process.env.PI_SUP_OWNER_PKG) : null;
+  if (pkgRepo && fs.existsSync(path.join(pkgRepo, ".git"))) {
+    aclChainX(spec, pkgRepo);
+    treeAcl(spec, pkgRepo);
+  }
   if (!fs.existsSync(sessions)) fs.mkdirSync(sessions, { mode: 0o700 });
   aclSet(sessions, spec, "rwx");
   sh("setfacl", ["-d", "-m", `u:${ownerUser()}:rX`, sessions]); // owner can read child's session files
@@ -552,7 +561,8 @@ export function unprotect(opts) {
       aclUnset(path.dirname(opts.piBin), spec);
       aclUnset(opts.piBin, spec);
     }
-    for (const root of [opts.nodeBinDir, opts.realCli ? releaseRootOf(opts.realCli) : null]) {
+    const pkgRepo = process.env.PI_SUP_OWNER_PKG ? path.resolve(process.env.PI_SUP_OWNER_PKG) : null;
+    for (const root of [opts.nodeBinDir, opts.realCli ? releaseRootOf(opts.realCli) : null, pkgRepo]) {
       if (root && fs.existsSync(root)) {
         sh(SH_BIN, ["-c", `find ${sq(root)} \\( -type f -o -type d \\) -print0 | xargs -0 setfacl -x u:${user}`]);
         actions.push(`${root} ACLs removed`);

@@ -131,6 +131,10 @@ set -euo pipefail
 #   via PATH (bash passes the full resolved path as $0 in both cases)
 # - readlink -f: the entry may be a symlink — we want the scripts dir, not the project
 HERE="$(cd "$(dirname "$(readlink -f "${0}")")" && pwd)"
+# v0.29.0: owner-side package checkout (repo root = 3 levels above scripts/).
+# protect_apply passes it to protect.mjs (child gets rX over it) and
+# child-package.mjs syncs the child-home clone FROM it.
+PI_PROTECT_PKG_REPO="$(cd "$HERE/../../.." 2>/dev/null && pwd || true)"
 PI_BIN="${PI:-pi}"
 HARVEST_TARGET=""   # set once RUN_DIR is known; the EXIT trap harvests it
 
@@ -211,7 +215,7 @@ protect_apply() { # $1=project dir  $2=live run dir (may be "")
     return 1
   fi
   local out
-  if out="$(node "$HERE/lib/protect.mjs" apply --project "$proj" ${live:+--live "$live"} \
+  if out="$(PI_SUP_OWNER_PKG="$PI_PROTECT_PKG_REPO" node "$HERE/lib/protect.mjs" apply --project "$proj" ${live:+--live "$live"} \
       --user "$PI_PROTECT_USER" --pi-bin "$PI_ABS" --real-cli "$REAL_CLI" \
       --node "$NODE_PATH" --node-bin-dir "$NODE_BIN_DIR" \
       ${SUDO_ALLOWED:+--sudo} \

@@ -290,6 +290,18 @@ setTimeout(() => {}, 300000);
     clearTimeout(wt);
   }
 
+  // ---- S6b: owner package repo ACL (v0.29.0) --------------------------------
+  console.log("S6b: owner package repo ACL");
+  const pkgRepo = path.join(SB, "pkgrepo");
+  sh("git", ["init", "-q", pkgRepo]);
+  sh("git", ["-C", pkgRepo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
+  r = sh(NODE, [PROTECT, ...applyArgs()], { env: { ...process.env, PI_SUP_OWNER_PKG: pkgRepo } });
+  let a24 = j(r.out);
+  ok(a24.ok === true, `apply with PI_SUP_OWNER_PKG ok (${a24.error || ""})`);
+  ok(a24.actions.some((x) => x.startsWith(pkgRepo + " ")), "repo rX action reported");
+  const fa24 = sh("getfacl", ["-p", path.join(pkgRepo, ".git")]);
+  ok(fa24.out.includes(`user:${TEST_USER}:`), "repo .git granted to child (umask-independent)");
+
   // ---- S7: unprotect restores -----------------------------------------------
   console.log("S7: unprotect");
   // Remove child-owned files AS THE CHILD first — unprotect about to run
