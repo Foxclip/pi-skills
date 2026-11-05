@@ -64,8 +64,19 @@
 // ~verify-sec.
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, delimiter } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+
+// Kernel protection (v0.26.0): locate the owner's pi binary for the protect
+// call — PATH first, then the well-known launcher location.
+function resolvePiBinForProtection() {
+  for (const d of (process.env.PATH || "").split(delimiter).filter(Boolean)) {
+    const p = join(d, "pi");
+    try { if (existsSync(p)) return p; } catch { /* keep looking */ }
+  }
+  try { return join(homedir(), ".pi", "agent", "bin", "pi"); } catch { return null; }
+}
 import { parseDeadline, sizeDeadline, fmtLocal } from "./lib/deadline.mjs";
 import { activePath, writeJson } from "./lib/node.mjs";
 
@@ -229,13 +240,48 @@ if (deadlineRaw !== null) {
 // child pi with {...process.env, ...}, so PI_SUP_* reaches the child's shell
 // tools — ralph.sh reads PI_SUP_CHILD to refuse a child's direct launches, and
 // the guard keeps PI_SUP_RUN_DIR for the chain hook.
-const guardArgs = taskFromFlag ? [guardPath, ...passthrough] : [guardPath, task, ...passthrough];
+let guardArgs = taskFromFlag ? [guardPath, ...passthrough] : [guardPath, task, ...passthrough];
+const childUser = (process.env.PI_SUP_NO_PROTECT ? "" : process.env.PI_SUP_CHILD_USER) || "";
+if (childUser) {
+  // Kernel protection (v0.26.0): the child pi runs as another OS user. Keep
+  // its session transcript inside the owner-owned run tree — the child user's
+  // own home is unreadable to the owner, and harvest.mjs must find the
+  // transcript there (status.sessionFile is authoritative, but the fallback
+  // pid-search only looks under the session dir).
+  const sessionsDir = join(projectDir, ".pi-supervisor", "sessions");
+  try { mkdirSync(sessionsDir, { recursive: true }); } catch { /* best effort */ }
+  guardArgs = [...guardArgs, "--session-dir", sessionsDir];
+  // Re-assert the DAC boundary for THIS window before the child starts: the
+  // chain step allocates the run dir on the owner side, so a fresh run-N has
+  // no child ACL yet — without this the child could not write its live dir
+  // (spawn-requests, reports) from the second window on. Idempotent and fast
+  // when current. A window that cannot be protected must NOT launch
+  // unprotected — that would silently drop the whole boundary.
+  try {
+    const { ensureProtection } = await import("./lib/protect.mjs");
+    const res = await ensureProtection({
+      projectDir,
+      liveRunDir: outDir,
+      user: childUser,
+      piBin: resolvePiBinForProtection(),
+      nodePath: process.execPath,
+      nodeBinDir: dirname(process.execPath),
+      workDirs: (process.env.PI_SUP_WORK_DIRS || "").split(":").filter(Boolean),
+      sudo: process.env.PI_SUP_SUDO === "1",
+    });
+    console.log(`[launch] kernel protection: ${res.firstRun ? "applied" : "current"} (live=${outDir})`);
+  } catch (e) {
+    console.error(`[launch] kernel protection FAILED — refusing to launch an unprotected window: ${e.message}`);
+    process.exit(41);
+  }
+}
 const guardEnv = {
   ...process.env,
   PI_SUP_CHILD: "1",
   PI_SUP_RUN_DIR: outDir,
   PI_SUP_NODE: nodePath,
   PI_SUP_PROJECT: projectDir,
+  ...(childUser ? { PI_SUP_CHILD_USER: childUser } : {}),
 };
 try {
   const outFd = openSync(join(outDir, "launch.out"), "a");

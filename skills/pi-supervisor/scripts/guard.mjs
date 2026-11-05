@@ -465,6 +465,10 @@ if (preamble === "standard") {
     console.error(`error: --preamble standard: cannot read ${contractPath}: ${e.message}`);
     process.exit(2);
   }
+  // ralph.sh --sudo grants the child user root — the contract's no-escalation
+  // rule is explicitly lifted for this run (PI_SUP_SUDO is exported by ralph.sh).
+  if (process.env.PI_SUP_SUDO === "1")
+    preamble += "\n\nNOTE: this run was launched with --sudo — the child user HAS root sudo, lifting the no-escalation rule above. Use sudo only for the task, never against the run tree.";
 }
 
 task = prompts.join(" ");
@@ -635,12 +639,46 @@ function resolvePackageDir() {
 }
 
 const pkgDir = resolvePackageDir();
-const cliPath = [join(pkgDir, "dist", "bundle", "cli.js"), join(pkgDir, "dist", "cli.js")].find(
+let cliPath = [join(pkgDir, "dist", "bundle", "cli.js"), join(pkgDir, "dist", "cli.js")].find(
   (p) => existsSync(p)
 );
 if (!cliPath) {
   console.error(`error: no cli entry found under ${pkgDir}/dist`);
   process.exit(2);
+}
+
+// outDir is initialized here (not at its former position below) because the
+// protected-child block below needs it at module-eval time — a later init is
+// a temporal-dead-zone crash (ReferenceError) on every protected run.
+const outDir = outDirArg || process.cwd();
+
+// Kernel protection (v0.26.0): PI_SUP_CHILD_USER (set by launch.mjs) makes the
+// child pi run as a separate OS user — the owner's 700 run tree is simply
+// unreadable/unwritable to it (DAC). RpcClient hard-codes
+// spawn("node", [cliPath, ...]), so the user switch happens at the cliPath
+// level: point it at the owner-side child-wrapper, which re-execs the real
+// CLI as the child user through the scoped passwordless sudo rule.
+const childUser = process.env.PI_SUP_CHILD_USER || "";
+let childPidFile = "";
+let childVerified = null; // { user, uid, group } once the launch is verified
+let rpcEnv = {};
+if (childUser) {
+  if (process.platform !== "linux") {
+    console.error("error: kernel protection (PI_SUP_CHILD_USER) is Linux-only");
+    process.exit(2);
+  }
+  const wrapperPath = join(dirname(fileURLToPath(import.meta.url)), "lib", "child-wrapper.mjs");
+  if (!existsSync(wrapperPath)) {
+    console.error(`error: child wrapper missing: ${wrapperPath}`);
+    process.exit(2);
+  }
+  childPidFile = join(outDir, "child-pgid");
+  rpcEnv = {
+    PI_SUP_CHILD_USER: childUser,
+    PI_SUP_REAL_CLI: cliPath,
+    PI_SUP_PIDFILE: childPidFile,
+  };
+  cliPath = wrapperPath;
 }
 
 const { RpcClient } = await import(pathToFileURL(join(pkgDir, "dist", "index.js")).href);
@@ -674,7 +712,7 @@ if (thinking) args.push("--thinking", thinking);
   if (excluded.length > 0) args.push("--exclude-tools", excluded.join(","));
 }
 
-const client = new RpcClient({ cliPath, args });
+const client = new RpcClient({ cliPath, args, env: rpcEnv });
 
 // ---------------------------------------------------------------------------
 // Event plumbing: every child event lands in a queue the main loop drains with
@@ -761,7 +799,6 @@ function resetAttemptCounters() {
 // tool call, plus [start]/[settled]/[result] markers. The parent session
 // should poll THIS small file instead of parsing the (multi-MB) session
 // jsonl.
-const outDir = outDirArg || process.cwd();
 // Expected-file resolution (fixed 2026-10-26, found by a live child): a bare
 // relative name ("report.md") is expected in the OUT DIR — the child's
 // artifacts live there, while existsSync(bareName) resolved it against the
@@ -855,6 +892,7 @@ plog(
 let lastStatus = "starting";
 let lastExitReason = undefined;
 const statusPids = { guardPid: process.pid, childPid: null };
+void childVerified; // referenced in the status payload below
 function writeStatus(status, exitReason) {
   try {
     lastStatus = status;
@@ -875,7 +913,13 @@ function writeStatus(status, exitReason) {
       sessionId: stateSessionId || null,
       sessionFile: stateSessionFile || null,
       sessionBytes: stateSessionFile && existsSync(stateSessionFile) ? statSync(stateSessionFile).size : undefined,
+      // Kernel protection: the child subtree runs as a different OS user —
+      // stop.mjs / kill-child.mjs need the group + user to signal it through
+      // the scoped sudo kill rule (an owner-side signal alone is EPERM there).
+      childUser: childVerified ? childVerified.user : undefined,
+      childPgid: childVerified ? Number(childVerified.group) : undefined,
       expectedFiles: expectFiles.length > 0 ? Object.fromEntries(expectFiles.map((f) => [f, expectedExists(f)])) : undefined,
+      protectedChild: childVerified || undefined, // v0.26.0 kernel protection
       deadlineIso: deadlineIso || undefined, // v0.17.0: the monitor prints the countdown
     };
     writeFileSync(statusFilePath, JSON.stringify(payload, null, 2));
@@ -1570,6 +1614,33 @@ try {
   }
   await client.start();
 
+  if (childUser) {
+    // Verified launch (kernel protection): the wrapper's process group must
+    // contain a member running as the child user — an owner-privileged RPC
+    // child would own the project tree and defeat the DAC.
+    for (let t = 0; t < 25 && !childVerified; t++) {
+      await new Promise((r) => setTimeout(r, 200));
+      try {
+        const leader = readFileSync(childPidFile, "utf8").trim().split("\n")[0];
+        const kids = readFileSync(`/proc/${leader}/task/${leader}/children`, "utf8").trim().split(/\s+/).filter(Boolean);
+        for (const k of kids) {
+          const line = readFileSync(`/proc/${k}/status`, "utf8").split("\n").find((l) => l.startsWith("Uid:"));
+          const uid = line ? line.trim().split(/\s+/)[1] : "";
+          if (uid && uid !== String(process.getuid())) {
+            childVerified = { user: childUser, uid, group: leader };
+            break;
+          }
+        }
+      } catch { /* not up yet */ }
+    }
+    if (!childVerified) {
+      logSup(`[error] kernel protection: could not verify the child runs as ${childUser} — aborting window`);
+      writeStatus("error", "protection-verification-failed");
+      process.exit(49);
+    }
+    logSup(`[info] kernel protection verified: group ${childVerified.group} contains uid ${childVerified.uid} (${childUser})`);
+  }
+
   try {
     const st = await client.getState();
     if (st) {
@@ -1678,7 +1749,29 @@ try {
           : ` The process is force-killed at that point with no chance to report.`) +
         ` Plan to finish the task — and any required report files — before the deadline.`
       : ""; // --timeout 0 = unlimited: there is no wall clock to pace against
-    const disp0 = await promptChild(task + deadlineNote);
+    let disp0;
+    try {
+      disp0 = await promptChild(task + deadlineNote);
+    } catch (e) {
+      // v0.26.1: cold child start. pi's RpcClient gives every RPC response a
+      // hardcoded 30s timeout; a first launch as the child user bootstraps its
+      // pi install for 30-60s+ before the prompt is even read — the prompt IS
+      // buffered in the child's stdin and will be processed. If the child is
+      // alive, continue (the event loop picks up its activity; the turn-stall
+      // ladder still bounds a truly lost prompt).
+      const msg = String((e && e.message) || e);
+      let childAliveNow = false;
+      try {
+        const leader = readFileSync(childPidFile, "utf8").trim().split("\n")[0];
+        childAliveNow = !!leader && existsSync(`/proc/${leader}`);
+      } catch { childAliveNow = false; }
+      if (childUser && /Timeout waiting for response to prompt/.test(msg) && childAliveNow) {
+        logSup(`[guard] first-prompt response timed out during child start (${childUser}) — child alive, assuming the prompt is buffered; continuing`);
+        disp0 = "timeout-assumed-delivered";
+      } else {
+        throw e;
+      }
+    }
     logSup(`[guard] prompt disposition=${disp0}`);
     if (hardTimeoutMs > 0) {
       logSup(`[guard] hard deadline: ${deadlineLocal} (${deadlineIso} UTC)` + (finalizeMin > 0 ? ` + ${finalizeMin}min finalization window` : ""));

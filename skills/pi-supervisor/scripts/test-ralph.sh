@@ -6,6 +6,9 @@
 # Note: a foreground `ralph.sh` blocks while it monitors — cases that launch
 # run it backgrounded and assert on its log, then stop it via the pointer.
 set -u
+# Kernel protection (v0.26.0) is covered by test-protect.mjs (it creates real
+# users + sudoers state); the ralph-level suites run unprotected.
+export PI_SUP_NO_PROTECT=1
 SELF="$(readlink -f "$0")"
 SKILL="$(cd "$(dirname "$SELF")" && pwd)"
 S=$SKILL
@@ -332,6 +335,37 @@ grep -q -- "--project $T/projC --node (root)" $T/projC/.pi-supervisor/runs/run1/
 cd $T/projS1
 PATH="$T/sandbox/scripts:$PATH" ralph.sh --help > $T/S9.log 2>&1
 grep -q "ralph.sh spawn" $T/S9.log && ok "S9: --help documents spawn" || bad "S9: $(grep -c spawn $T/S9.log)"
+grep -q -- "--sudo" $T/S9.log && ok "S9b: --help documents --sudo" || bad "S9b: --sudo missing from --help"
+
+# S10: the monitor's parent-session wrapper ships EXECUTABLE (run27: it was 644 —
+# every judgment spawn died at EACCES and the monitor was blind for the whole run)
+[ -x "$T/sandbox/scripts/lib/pi-as-child.sh" ] && ok "S10: lib/pi-as-child.sh is executable" || bad "S10: lib/pi-as-child.sh missing or not executable (run27 regression)"
+
+# S11: zero-arg attach to a run that ended WITHOUT its chain step (the repair
+# path, run27): the missing step() must run, AND its outcome must be read from
+# chain-done.json's NESTED .outcome — status_field only reads top-level keys,
+# so "no outcome recorded" is the regression signal.
+mkdir -p $T/projS11/.pi-supervisor/runs/run1
+echo "# Test task" > $T/projS11/TASK.md
+cat > $T/projS11/.pi-supervisor/active.json <<EOF
+{"run_dir":"$T/projS11/.pi-supervisor/runs/run1","node":"(root)","guard_pid":999999,"window":null,"started_at":"2026-11-04T00:00:00.000Z","deadline":null}
+EOF
+cat > $T/projS11/.pi-supervisor/runs/run1/pi-child-status.json <<EOF
+{"v":2,"at":"2026-11-04T00:00:01.000Z","status":"error","exitReason":"S11 test exit reason","guardPid":null,"childPid":null,"attempt":1,"rewinds":0,"toolCalls":0,"lastTool":null,"lastToolStartedAt":null,"elapsedMs":0,"deadlineIso":"2026-11-04T01:00:00.000Z"}
+EOF
+cd $T/projS11
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh > $T/S11.log 2>&1
+S11RC=$?
+grep -q "ended without its chain step" $T/S11.log \
+  && ok "S11: missing chain step detected — repair step ran" || bad "S11: $(tail -3 $T/S11.log)"
+[ -f $T/projS11/.pi-supervisor/runs/run1/chain-done.json ] \
+  && grep -q '"next": "halted"' $T/projS11/.pi-supervisor/runs/run1/chain-done.json \
+  && ok "S11: repair wrote chain-done.json (outcome halted)" \
+  || bad "S11: chain-done $(cat $T/projS11/.pi-supervisor/runs/run1/chain-done.json 2>/dev/null)"
+grep -q "last step: halted" $T/S11.log && ! grep -q "no outcome recorded" $T/S11.log \
+  && ok "S11: outcome read from nested .outcome (not 'no outcome recorded')" \
+  || bad "S11: $(grep -F 'chain is not running' $T/S11.log || tail -3 $T/S11.log)"
+[ "$S11RC" -eq 1 ] && ok "S11: halted chain → exit 1" || bad "S11: rc=$S11RC"
 
 echo ""
 echo "=== $PASS passed, $FAIL failed (sandbox: $T) ==="
