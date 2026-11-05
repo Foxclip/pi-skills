@@ -232,9 +232,20 @@ export function ensureRootNode(projectDir, { deadline = null, state = "active" }
       createdAt: new Date().toISOString(),
     };
     writeJson(p, nj);
-  } else if (!nj.deadline && deadline) {
-    nj.deadline = String(deadline);
-    writeJson(p, nj);
+  } else if (deadline) {
+    // v0.29.2 (run34): a PAST invariant deadline can only reject — every
+    // spawn from this node inherits it and dies in windowBudget, and a plain
+    // re-run of the project used to freeze the whole spawn tree. A fresh
+    // launch with a FUTURE deadline refreshes a past (or unparseable) one;
+    // a FUTURE invariant deadline still never moves.
+    const fresh = parseDeadline(String(deadline));
+    const old = nj.deadline ? parseDeadline(nj.deadline) : null;
+    if (!nj.deadline
+      || (fresh.ok && fresh.ts.getTime() > Date.now()
+      && (!old.ok || old.ts.getTime() <= Date.now()))) {
+      nj.deadline = String(deadline);
+      writeJson(p, nj);
+    }
   }
   ensureStateMdAt(path.join(projectDir, "STATE.md"), ROOT);
   return { node: readJson(p), dir: projectDir, created };

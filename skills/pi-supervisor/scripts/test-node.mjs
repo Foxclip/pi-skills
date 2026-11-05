@@ -58,16 +58,38 @@ ok(!validNodeName("has space").ok, "space rejected");
 // --------------------------------------------------------------------------
 section("N2 — root materialization (ensureRootNode)");
 {
+  // relative dates — the invariant semantics depend on the wall clock (v0.29.2)
+  const F1 = new Date(Date.now() + 86400e3).toISOString();
+  const F2 = new Date(Date.now() + 2 * 86400e3).toISOString();
   const p = proj("p-root");
-  let rn = ensureRootNode(p, { deadline: "2026-11-05T08:00:00Z" });
+  let rn = ensureRootNode(p, { deadline: F1 });
   ok(rn.created === true, "first call creates");
   let nj = J(supNodePath(p));
   ok(nj.v === 2 && nj.name === ROOT && nj.parent === null && Array.isArray(nj.children) && nj.children.length === 0, "v2 root shape (dot-dir node.json)", JSON.stringify(nj));
-  ok(nj.deadline === "2026-11-05T08:00:00Z", "deadline recorded");
+  ok(nj.deadline === F1, "deadline recorded");
   ok(fs_exists(path.join(p, "STATE.md")), "root STATE.md at the project root");
-  rn = ensureRootNode(p, { deadline: "2026-12-31T00:00:00Z" });
+  rn = ensureRootNode(p, { deadline: F2 });
   ok(rn.created === false, "second call joins, does not create");
-  ok(J(supNodePath(p)).deadline === "2026-11-05T08:00:00Z", "deadline never moves (invariant)");
+  ok(J(supNodePath(p)).deadline === F1, "future invariant deadline never moves");
+}
+
+// --------------------------------------------------------------------------
+section("N2b — v0.29.2 (run34): a PAST invariant deadline is refreshed by a future one");
+{
+  const past = new Date(Date.now() - 3600e3).toISOString();
+  const past2 = new Date(Date.now() - 7200e3).toISOString();
+  const future = new Date(Date.now() + 3600e3).toISOString();
+  // run34: re-running an old tree with --deadline <later> inherited the past
+  // invariant and froze every spawn until node.json was hand-edited
+  const p = proj("p-root-past");
+  ensureRootNode(p, { deadline: past });
+  ok(J(supNodePath(p)).deadline === past, "past deadline recorded");
+  ensureRootNode(p, { deadline: future });
+  ok(J(supNodePath(p)).deadline === future, "a future --deadline refreshes the past invariant");
+  const p2 = proj("p-root-past2");
+  ensureRootNode(p2, { deadline: past });
+  ensureRootNode(p2, { deadline: past2 });
+  ok(J(supNodePath(p2)).deadline === past, "another past deadline does not refresh");
 }
 
 // --------------------------------------------------------------------------

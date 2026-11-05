@@ -56,6 +56,7 @@ import {
   allocWindowIn,
   writeActive,
 } from "./node.mjs";
+import { sizeDeadline } from "./deadline.mjs";
 
 const LIB = path.dirname(new URL(import.meta.url).pathname);
 const SCRIPTS = path.dirname(LIB);
@@ -243,6 +244,18 @@ async function allocForNode(projectDir, nodePath) {
 // outcome. Returns { ok, error, launchOut }.
 function launchWindow(projectDir, nodePath, wdir, budget, cfg, windowDir, log) {
   const L = cfg.launch || {};
+  // v0.29.2 (run34): never hand launch.mjs a deadline it is forced to reject —
+  // the same rule sizeDeadline applies at its wall clock, checked once here
+  // (covers the continuation and re-entry paths; the spawn path ALSO checks
+  // this earlier, before its side effects).
+  {
+    const finalizeMin = Number(L.finalizeMin) || 10;
+    const sized = sizeDeadline({ ts: new Date(budget.deadlineMs), finalizeMin, now: new Date() });
+    if (!sized.ok) {
+      log(`launch refused: node=${nodePath || ROOT} window=${path.basename(wdir)} — ${sized.why}`);
+      return { ok: false, error: sized.why };
+    }
+  }
   // v0.27.0: the window's OWN project (its runs/ home — the sub-project, or
   // the tree root itself) vs the SCHEDULER ROOT (projectDir).
   // launch.mjs records active.json in the window's project and spawns the
@@ -434,7 +447,7 @@ async function stepCore(projectDir, windowDir, cfg, log, standalone) {
           // A rejected spawn at a terminal root would otherwise disappear
           // into a quiet "done" — escalate: the root is BLOCKED, not idle.
           return haltBlocked(projectDir, nodePath, windowDir, log,
-            `spawn request rejected (${spawnRejected}) — all windows completed and no window left to carry it — manual attention (fix the node, then run ralph.sh in this project)`, (o) => done(o));
+            `spawn request rejected (${spawnRejected}) — all windows completed and no window left to carry it — manual attention: fix the cause, then re-spawn under the same name (a sub-project left behind stays registered, state blocked — the retry joins it) or free the name (remove its dir + its line in .pi-supervisor/node.json), and run ralph.sh in this project`, (o) => done(o));
         }
         return done({ next: "idle", reason: standalone ? "standalone-done" : "root-done" });
       }
@@ -456,7 +469,7 @@ async function stepCore(projectDir, windowDir, cfg, log, standalone) {
           clearActiveSlots(projectDir, windowDir);
           if (spawnRejected) {
             return haltBlocked(projectDir, nodePath, windowDir, log,
-              `spawn request rejected (${spawnRejected}) — the node is deadline-expired with no window left to carry it — manual attention`, (o) => done(o));
+              `spawn request rejected (${spawnRejected}) — the node is deadline-expired with no window left to carry it — manual attention: the invariant deadline has passed (it never moves) — re-spawn under a fresh name with a later --deadline, or remove the node dir + registry line to free the name`, (o) => done(o));
           }
           return done({ next: "idle", reason: standalone ? "standalone-deadline-expired" : "root-deadline-expired" });
         }
@@ -681,6 +694,19 @@ async function processSpawnRequest(projectDir, parentNodePath2, windowDir, req, 
     }
     return fail(`cannot size window 1: ${b.why} — pass --deadline or --runtime to the spawn`);
   }
+  // v0.29.2 (run34): the SAME rule launch.mjs applies at its wall clock —
+  // sizeDeadline() needs strictly more work minutes than the finalize
+  // reservation. Enforced HERE, before the sub-project scaffolding exists, so
+  // an infeasible-by-sizing request rejects with NO partial state. run34:
+  // --runtime 10 sized a 10min window; launch reserved 10min for finalization
+  // and rejected — after the node was already registered.
+  {
+    const finalizeMin = Number(cfg?.launch?.finalizeMin) || 10;
+    const sized = sizeDeadline({ ts: new Date(b.deadlineMs), finalizeMin, now: new Date() });
+    if (!sized.ok) {
+      return fail(`${sized.why} — re-request with a larger --runtime or a later --deadline`);
+    }
+  }
   fs.mkdirSync(path.join(subDir, ".pi-supervisor", "runs"), { recursive: true });
   fs.writeFileSync(path.join(subDir, "TASK.md"), taskText); // the sub-project's task file
   ensureStateMdAt(path.join(subDir, "STATE.md"), nm);
@@ -712,6 +738,12 @@ async function processSpawnRequest(projectDir, parentNodePath2, windowDir, req, 
 async function openChildWindow(projectDir, nodePath, brief, budget, cfg, windowDir, log, childPath) {
   const opened = await openWithRetryName({ projectDir, nodePath, brief, budget, cfg, windowDir, log });
   if (!opened.ok) {
+    // v0.29.2 (run34): the sub-project exists now (TASK.md, STATE.md,
+    // node.json, the registry line) but its first window never launched —
+    // the node says blocked, not active. A re-spawn under the same name
+    // joins this node (a fresh window); removing the dir + registry line
+    // frees the name.
+    try { setNodeState(projectDir, nodePath, "blocked"); } catch { /* best effort */ }
     return { ok: false, reason: `launch failed: ${opened.error}`, node: childName(nodePath), at: new Date().toISOString() };
   }
   setNodeState(projectDir, nodePath, "active");

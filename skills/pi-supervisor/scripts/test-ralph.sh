@@ -414,6 +414,38 @@ RC=$?
   && ok "S14: spawn in a standalone v2 root → allowed (request written)" \
   || bad "S14: rc=$RC $(head -5 $T/S14.log)"
 
+# S15 (v0.29.2, run34): an infeasible budget (only 5min until the deadline, 10min
+# reserved for finalization) → the receipt WARNS and still writes the request —
+# the chain step stays the authority; the child can re-issue with a bigger budget.
+mkdir -p $T/projS15/.pi-supervisor/runs/run-1
+echo '{"v":2,"name":"(root)","path":"(root)","parent":null,"state":"active","children":[]}' > $T/projS15/.pi-supervisor/node.json
+echo "# root task" > $T/projS15/TASK.md
+echo "# sub task" > $T/spawn-task-S15.md
+D15="$(date -u -d '+5 minutes' +%Y-%m-%dT%H:%M:%SZ)"   # supported formats: ISO|HH:MM|epoch
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$T/projS15/.pi-supervisor/runs/run-1 ralph.sh spawn \
+  --name slow --task $T/spawn-task-S15.md --deadline "$D15" --runtime 1 > $T/S15.log 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && grep -q "spawn budget warning" $T/S15.log \
+  && [ -f $T/projS15/.pi-supervisor/runs/run-1/spawn-request.json ] \
+  && ok "S15: infeasible spawn → receipt WARNS, request still written" \
+  || bad "S15: rc=$RC $(head -8 $T/S15.log)"
+grep -q "leaves no work time" $T/S15.log && ok "S15b: warning names the sizing rule" || bad "S15b: $(head -8 $T/S15.log)"
+[ ! -d $T/projS15/slow ] && ok "S15c: spawn side never creates the sub-project" || bad "S15c: sub dir exists"
+
+# S16: a feasible budget → clean green receipt, no warning
+mkdir -p $T/projS16/.pi-supervisor/runs/run-1
+echo '{"v":2,"name":"(root)","path":"(root)","parent":null,"state":"active","children":[]}' > $T/projS16/.pi-supervisor/node.json
+echo "# root task" > $T/projS16/TASK.md
+echo "# sub task" > $T/spawn-task-S16.md
+D16="$(date -u -d '+120 minutes' +%Y-%m-%dT%H:%M:%SZ)"
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$T/projS16/.pi-supervisor/runs/run-1 ralph.sh spawn \
+  --name fast --task $T/spawn-task-S16.md --deadline "$D16" --runtime 30 > $T/S16.log 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && grep -q "spawn request written" $T/S16.log \
+  && ! grep -q "spawn budget warning" $T/S16.log \
+  && ok "S16: feasible spawn → green receipt, no warning" \
+  || bad "S16: rc=$RC $(head -8 $T/S16.log)"
+
 echo ""
 echo "=== $PASS passed, $FAIL failed (sandbox: $T) ==="
 pkill -f "sleep 600" 2>/dev/null

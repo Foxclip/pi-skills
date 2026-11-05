@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.29.0: run a supervised child with zero arguments.
+# ralph.sh — v0.29.2: run a supervised child with zero arguments.
+# (v0.29.2 = run34 spawn-budget fixes: an infeasible spawn request is rejected
+#  with NO partial state (the launch's exact sizeDeadline rule is enforced
+#  before the sub-project scaffolding exists, and in launchWindow for every
+#  path); the `spawn` receipt warns when the budget leaves no work time instead
+#  of a silent green ✓; a launch-failed sub-project's node is marked blocked,
+#  not active; a fresh launch refreshes a PAST invariant deadline; the
+#  manual-attention messages name the concrete recovery steps)
+# (v0.29.1 = umask-independent child read on the owner package checkout)
 # (v0.29.0 = the child user's pi package: ralph.sh (via protect_apply) syncs the
 #  repo in the CHILD home from the owner's canonical checkout before every
 #  protected bootstrap — fresh/attach/repair — and child-wrapper.mjs re-syncs
@@ -402,6 +410,33 @@ USAGE
     SP_RUNTIME_SEC="$(dur_sec "$SP_RUNTIME")" \
       || { saye "${C_R}✗${C_N} spawn: bad --runtime \"${SP_RUNTIME}\" — use bare minutes (90) or a duration (45s/90m/2h/1h30m)"; exit 2; }
     SP_RUNTIME_MIN=$(( (SP_RUNTIME_SEC + 59) / 60 ))
+  fi
+  # v0.29.2 (run34): receipt pre-check — the EXACT sizing the chain step will
+  # apply (windowBudget + launch.mjs's sizeDeadline rule). A WARNING, not a
+  # refusal: the request is still written as-is, but the child sees the
+  # infeasibility BEFORE it ends its turn and can re-issue with a bigger
+  # budget (run34: --runtime 10 got a green receipt, then the launch died).
+  SP_PROJ="${SP_PROJ:-${PI_SUP_TREE_ROOT:-}}"
+  if [ -n "$SP_PROJ" ]; then
+    SP_FEAS="$(SP_PNJ="$SP_PROJ/.pi-supervisor/node.json" \
+               SP_SNJ="$SP_PROJ/${SP_NAME}/.pi-supervisor/node.json" \
+               SP_DL="$SP_DEADLINE" SP_RT="$SP_RUNTIME_MIN" SP_FZ="${FINALIZE:-10}" \
+      node --input-type=module -e '
+import fs from "fs";
+const { windowBudget } = await import(process.argv[1]);
+const { sizeDeadline } = await import(process.argv[2]);
+const j = (p) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } };
+const pd = j(process.env.SP_PNJ)?.deadline || null;
+const sd = j(process.env.SP_SNJ)?.deadline || null;
+const childDeadline = process.env.SP_DL || pd || null;
+const b = windowBudget({ nodeDeadline: sd || childDeadline, runtimeMin: process.env.SP_RT ? Number(process.env.SP_RT) : null, now: new Date() });
+if (!b.ok) { process.stdout.write((b.expired ? "deadline expired (" : "no budget can be sized (") + b.why + ")"); process.exit(0); }
+const s = sizeDeadline({ ts: new Date(b.deadlineMs), finalizeMin: Number(process.env.SP_FZ) || 10, now: new Date() });
+if (!s.ok) process.stdout.write(s.why);
+' "file://$HERE/lib/node.mjs" "file://$HERE/lib/deadline.mjs" 2>/dev/null || true)"
+    if [ -n "$SP_FEAS" ]; then
+      saye "${C_Y}⚠${C_N} spawn budget warning: ${SP_FEAS} — the chain step will REJECT this launch when the window ends. Re-issue with a larger --runtime or a later --deadline before ending your turn (the request below is written as-is).${C_N}"
+    fi
   fi
   SP_REQ="${PI_SUP_RUN_DIR}/spawn-request.json"
   SP_REQ_JSON="$(SP_NAME="$SP_NAME" SP_TASK_ABS="$SP_TASK_ABS" SP_DEADLINE="$SP_DEADLINE" SP_RUNTIME_MIN="$SP_RUNTIME_MIN" SP_REASON="$SP_REASON" SP_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" node -e '

@@ -323,6 +323,54 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T14 fresh node starts at run-1", b.window === "run-1", b.window);
 }
 
+// ============ T15 — v0.29.2 (run34): infeasible-by-sizing spawn → rejected BEFORE side effects
+// windowBudget gives 1min of work, but the 10min finalize reservation leaves none —
+// the sizeDeadline rule launch.mjs applies. run34's request died at the launch, AFTER
+// the node was registered; now it dies here, with nothing written.
+{
+  const p = mkproj("t15-sizing");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
+  const taskFile = path.join(T, "t15-task.md");
+  fs.writeFileSync(taskFile, "sized out\n");
+  const w = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" });
+  fs.writeFileSync(path.join(w, "spawn-request.json"), JSON.stringify({
+    kind: "spawn", node: "tight", task: taskFile, runtime_min: 1, deadline: null, reason: "r", at: ISO(Date.now()),
+  }));
+  const r = await step(p, w, CFG);
+  const d = JSON.parse(fs.readFileSync(path.join(w, "spawn-decision.json"), "utf8"));
+  ok("T15 rejected (no work time after finalize)", d.ok === false && /leaves no work time/i.test(d.reason), JSON.stringify(d));
+  ok("T15 rejected spawn escalates (halted)", r.outcome?.next === "halted" && /spawn request rejected/i.test(r.outcome?.reason ?? ""), JSON.stringify(r.outcome));
+  ok("T15 no sub-project (no partial state)", !fs.existsSync(path.join(p, "tight")));
+  const rnj15 = readJsonFile(path.join(p, ".pi-supervisor", "node.json"));
+  ok("T15 no registry entry", !(rnj15.children || []).some((c) => c.name === "tight"), JSON.stringify(rnj15.children));
+  ok("T15 root blocked (human attention)", nodeState(p, "(root)") === "blocked");
+}
+
+// ============ T16 — v0.29.2 (run34): launch failure on the spawn path → sub node BLOCKED
+// (not active). The sub-project + registry line stay (join-able); a re-spawn under
+// the same name joins the blocked node instead of duplicating it.
+{
+  const p = mkproj("t16-spawnlaunchfail");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
+  const taskFile = path.join(T, "t16-task.md");
+  fs.writeFileSync(taskFile, "will not launch\n");
+  // the stub launch refuses when <subproject>/.pi-supervisor/launch-fail exists
+  fs.mkdirSync(path.join(p, "sick", ".pi-supervisor"), { recursive: true });
+  fs.writeFileSync(path.join(p, "sick", ".pi-supervisor", "launch-fail"), "1");
+  const w = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" });
+  fs.writeFileSync(path.join(w, "spawn-request.json"), JSON.stringify({
+    kind: "spawn", node: "sick", task: taskFile, runtime_min: 30, deadline: null, reason: "r", at: ISO(Date.now()),
+  }));
+  const r = await step(p, w, CFG);
+  const snj = readJsonFile(path.join(p, "sick", ".pi-supervisor", "node.json"));
+  ok("T16 sub node exists (join-able)", snj && snj.name === "sick", JSON.stringify(snj));
+  ok("T16 sub node state blocked (not active)", snj && snj.state === "blocked", JSON.stringify(snj));
+  const rnj16 = readJsonFile(path.join(p, ".pi-supervisor", "node.json"));
+  ok("T16 registry line kept", (rnj16.children || []).some((c) => c.name === "sick"), JSON.stringify(rnj16.children));
+  ok("T16 outcome halted + root blocked", r.outcome?.next === "halted" && nodeState(p, "(root)") === "blocked", JSON.stringify(r.outcome));
+  ok("T16 no window left behind", !fs.existsSync(path.join(p, "sick", ".pi-supervisor", "runs", "run-1")));
+}
+
 // ================= S1 — v2: spawn creates a PROJECT-LEVEL dir (plan §4)
 // A fresh project has no dot-dir node.json → S0 materializes the root;
 // the spawn then creates P/<name>/ as a nested sub-project (NOT under runs/).
