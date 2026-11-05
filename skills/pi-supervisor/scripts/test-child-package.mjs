@@ -74,6 +74,8 @@ section("P1 — resolution + graceful skips");
   ok(r.ok === false && /not a git worktree/.test(r.reason), "owner dir without .git → ok:false with reason", JSON.stringify(r));
   r = syncChildPackage({ ownerRepo: notGit, asUser });
   ok(r.ok === false && /no user/.test(r.reason), "missing user → ok:false", JSON.stringify(r));
+  r = syncChildPackage({ user: "no-such-user-xyz-12345", ownerRepo: path.join(root, "repo"), asUser });
+  ok(r.ok === false && /no such user/.test(r.reason), "unknown user → ok:false (getent)", JSON.stringify(r));
   const fakeLib = path.join(root, "repo", "skills", "pi-supervisor", "scripts", "lib");
   mkdirSync(fakeLib, { recursive: true });
   ok(deriveOwnerRepo(fakeLib) === path.join(root, "repo"), "deriveOwnerRepo walks 4 levels up from scripts/lib");
