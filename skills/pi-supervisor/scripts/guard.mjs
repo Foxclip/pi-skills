@@ -1016,7 +1016,17 @@ let turnStallBudgetWarned = false;
 async function promptChild(text) {
   turnActive = true;
   turnStartAt = Date.now();
-  return client.prompt(text);
+  try {
+    return await client.prompt(text);
+  } catch (e) {
+    // run1 2026-11-04 21:20Z: turnActive read false while the child was
+    // actually mid-generation — prompt() rejected with "Agent is already
+    // processing..." and the steer-inbox nudge was lost. steer() is the
+    // queueing path and works mid-turn; fall back to it instead of dropping
+    // the message.
+    if (e && /already processing/i.test(String(e.message))) return client.steer(text);
+    throw e;
+  }
 }
 async function deliverToChild(text) {
   return turnActive ? client.steer(text) : promptChild(text);

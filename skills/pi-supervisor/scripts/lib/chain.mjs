@@ -455,6 +455,11 @@ async function stepCore(projectDir, windowDir, cfg, log, standalone) {
       appendState(projectDir, nodePath,
         `- [${new Date().toISOString()}] window ${path.basename(windowDir)} completed — node done`);
       if (isRoot) { clearActiveSlots(projectDir, windowDir); return done({ next: "idle", reason: standalone ? "standalone-done" : "root-done" }); }
+      // The re-entry launches the PARENT's window (launch.mjs writes that slot);
+      // without this clear, this window's own project slot (written by launch.mjs
+      // when it launched) is never cleared — a stale active.json with a dead
+      // guard_pid (e2e-final 2026-11-04: the sub project's slot survived the run).
+      clearActiveSlots(projectDir, windowDir);
       return await reentry(parentName, projectDir, nodePath, windowDir, cfg, log, "done", (o) => done(o));
     }
 
@@ -465,6 +470,9 @@ async function stepCore(projectDir, windowDir, cfg, log, standalone) {
         appendState(projectDir, nodePath,
           `- [${new Date().toISOString()}] window ${path.basename(windowDir)} used its budget and the node deadline has passed — deadline-expired`);
         if (isRoot) { clearActiveSlots(projectDir, windowDir); return done({ next: "idle", reason: standalone ? "standalone-deadline-expired" : "root-deadline-expired" }); }
+        // Same stale-slot clear as the completed path above (the re-entry
+        // launches the parent's window; this window's slots must go).
+        clearActiveSlots(projectDir, windowDir);
         return await reentry(parentName, projectDir, nodePath, windowDir, cfg, log, "deadline-expired", (o) => done(o));
       }
       // continuation of the same node

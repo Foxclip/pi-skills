@@ -66,6 +66,11 @@ class RpcClient {
   async prompt(text) {
     this.prompts.push(text);
     try { aws("pi-test-prompts.txt", "===PROMPT===\\n" + text + "\\n", "utf8"); } catch {}
+    // spec.rejectPromptsAfter: reject prompt #N+1 and later with the real pi
+    // "already processing" error (tests guard.mjs promptChild → steer fallback).
+    if (spec.rejectPromptsAfter !== undefined && this.prompts.length > spec.rejectPromptsAfter) {
+      throw new Error(spec.rejectPromptMessage || "Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.");
+    }
     const id = "user-" + this.entries.length;
     const last = this.entries[this.entries.length - 1];
     this.entries.push({ type: "message", id, parentId: last ? last.id : null, message: { role: "user", content: [{ type: "text", text }] } });
@@ -898,6 +903,28 @@ run({
     { path: "pi-child-result.json", expect: ['"parentSteers": 1'] },
     { path: ".steer-inbox/processed/steer-test.txt", expect: ["PARENT_STEER_SENTINEL"] },
     { path: "pi-test-prompts.txt", expect: ["PARENT_STEER_SENTINEL"] },
+  ],
+});
+
+run({
+  name: "prompt rejected 'already processing' → steer fallback delivers (run1 21:20Z regression)",
+  args: [TASK],
+  // spec.rejectPromptsAfter=0: the fake's prompt() rejects with pi's real
+  // "already processing" error. promptChild (guard.mjs) must fall back to
+  // client.steer() — the queueing path — instead of dropping the task. The
+  // steer replays this single phase; without the fallback the run could not
+  // complete (the task would never reach the child).
+  phases: [
+    [...tool("bash", { cmd: "work" }), ...done("Done. Report written to report.md.")],
+  ],
+  extra: { rejectPromptsAfter: 0 },
+  expect: ["\"status\":\"completed\"", "\"exitReason\":\"completed\""],
+  expectExit: 0,
+  assertFiles: [
+    // Task was attempted as a prompt (logged before the reject) and then
+    // actually DELIVERED via steer — without the fallback, no ===STEER===
+    // line would exist.
+    { path: "pi-test-prompts.txt", expect: ["===PROMPT===", "===STEER===", TASK] },
   ],
 });
 
