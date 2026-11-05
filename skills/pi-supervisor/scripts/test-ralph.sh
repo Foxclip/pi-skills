@@ -446,6 +446,53 @@ RC=$?
   && ok "S16: feasible spawn → green receipt, no warning" \
   || bad "S16: rc=$RC $(head -8 $T/S16.log)"
 
+# S17 (v0.29.3, run35): a re-run of an EXISTING tree with a FUTURE --deadline
+# refreshes the root's PAST invariant via the S0 gate and unblocks it. run35
+# froze exactly here: the gate used to call ensureRootNode only when node.json
+# was missing, so the refresh was dead code on every re-run.
+mkproj $T/projS17 && cd $T/projS17
+mkdir -p .pi-supervisor/runs/run-1
+PAST17=$(date -u -d '-2 hours' '+%Y-%m-%dT%H:%M:%SZ')
+echo "{\"v\":2,\"name\":\"(root)\",\"path\":\"(root)\",\"parent\":null,\"state\":\"blocked\",\"children\":[],\"deadline\":\"$PAST17\"}" > .pi-supervisor/node.json
+DL17=$(( $(date +%s) + 7200 ))
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh --deadline $DL17 > $T/S17.log 2>&1 &
+sleep 4
+ND17=$(node -e 'try{console.log(new Date(require("./.pi-supervisor/node.json").deadline).getTime()/1000)}catch{console.log("")}' 2>/dev/null)
+[ -n "$ND17" ] && [ "$ND17" -ge $((DL17-5)) ] && [ "$ND17" -le $((DL17+5)) ] \
+  && ok "S17: re-run with future --deadline refreshes the past invariant" \
+  || bad "S17: node deadline='$ND17' want ≈$DL17 $(head -8 $T/S17.log)"
+ST17=$(node -e 'try{console.log(require("./.pi-supervisor/node.json").state)}catch{console.log("?")}' 2>/dev/null)
+[ "$ST17" = "active" ] && ok "S17: the refresh also unblocks the root (was blocked)" || bad "S17: state='$ST17'"
+stoprun $T/projS17 > $T/S17.stop 2>&1
+
+# S17b: a FUTURE invariant never moves — a launch deadline earlier than the
+# existing one leaves node.json untouched.
+mkproj $T/projS17b && cd $T/projS17b
+mkdir -p .pi-supervisor/runs/run-1
+INV17B=$(date -u -d '+3 hours' '+%Y-%m-%dT%H:%M:%SZ')
+echo "{\"v\":2,\"name\":\"(root)\",\"path\":\"(root)\",\"parent\":null,\"state\":\"blocked\",\"children\":[],\"deadline\":\"$INV17B\"}" > .pi-supervisor/node.json
+DL17B=$(( $(date +%s) + 1800 ))
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh --deadline $DL17B > $T/S17b.log 2>&1 &
+sleep 4
+ND17B=$(node -e 'try{console.log(require("./.pi-supervisor/node.json").deadline)}catch{console.log("")}' 2>/dev/null)
+[ "$ND17B" = "$INV17B" ] && ok "S17b: a future invariant is never moved by a launch" \
+  || bad "S17b: invariant moved to '$ND17B' want '$INV17B'"
+stoprun $T/projS17b > $T/S17b.stop 2>&1
+
+# S17c: an HH:MM launch deadline is normalized to ISO before it touches
+# node.json (the old gate stored the raw string — a bare 'HH:MM' invariant).
+mkproj $T/projS17c && cd $T/projS17c
+HH17C=$(date -d '+1 hour' '+%H:%M')
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh --deadline $HH17C > $T/S17c.log 2>&1 &
+sleep 4
+ND17C=$(node -e 'try{console.log(require("./.pi-supervisor/node.json").deadline || "")}catch{console.log("")}' 2>/dev/null)
+case "$ND17C" in
+  "") bad "S17c: no deadline in node.json $(head -8 $T/S17c.log)" ;;
+  *T*) [ "$ND17C" != "$HH17C" ] && ok "S17c: HH:MM launch deadline stored as ISO ($ND17C)" || bad "S17c: raw HH:MM stored: '$ND17C'" ;;
+  *) bad "S17c: non-ISO deadline stored: '$ND17C'" ;;
+esac
+stoprun $T/projS17c > $T/S17c.stop 2>&1
+
 echo ""
 echo "=== $PASS passed, $FAIL failed (sandbox: $T) ==="
 pkill -f "sleep 600" 2>/dev/null

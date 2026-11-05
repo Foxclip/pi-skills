@@ -93,6 +93,29 @@ section("N2b — v0.29.2 (run34): a PAST invariant deadline is refreshed by a fu
 }
 
 // --------------------------------------------------------------------------
+section("N2c — v0.29.3 (run35): a refresh also unblocks a halted (blocked) root");
+{
+  const past = new Date(Date.now() - 3600e3).toISOString();
+  const future = new Date(Date.now() + 3600e3).toISOString();
+  // run35: the chain halt parked the root as blocked; a fresh launch is the
+  // human attention it was waiting for — refresh AND unblock together
+  const p = proj("p-root-blocked");
+  ensureRootNode(p, { deadline: past });
+  const nj = J(supNodePath(p)); nj.state = "blocked"; writeNode(p, nj);
+  ensureRootNode(p, { deadline: future });
+  const after = J(supNodePath(p));
+  ok(after.deadline === future && after.state === "active", "the refresh refreshes the deadline AND unblocks");
+  // a FUTURE invariant still never moves — and no refresh happens, so the
+  // blocked marker stays until the deadline actually runs past
+  const p2 = proj("p-root-blocked-fut");
+  ensureRootNode(p2, { deadline: future });
+  const nj2 = J(supNodePath(p2)); nj2.state = "blocked"; writeNode(p2, nj2);
+  ensureRootNode(p2, { deadline: new Date(Date.now() + 7200e3).toISOString() });
+  const after2 = J(supNodePath(p2));
+  ok(after2.deadline === future && after2.state === "blocked", "a future invariant never moves (and stays blocked)");
+}
+
+// --------------------------------------------------------------------------
 section("N3 — parent registry (registerChild)");
 {
   const p = proj("p-reg");

@@ -238,12 +238,17 @@ export function ensureRootNode(projectDir, { deadline = null, state = "active" }
     // re-run of the project used to freeze the whole spawn tree. A fresh
     // launch with a FUTURE deadline refreshes a past (or unparseable) one;
     // a FUTURE invariant deadline still never moves.
+    // v0.29.3 (run35): a refresh ALSO unblocks — a root marked blocked by a
+    // chain halt is waiting for exactly this human attention (a fresh
+    // launch); leaving it blocked contradicts the launch. (State is an
+    // informational marker; the functional freeze was the past deadline.)
     const fresh = parseDeadline(String(deadline));
     const old = nj.deadline ? parseDeadline(nj.deadline) : null;
     if (!nj.deadline
       || (fresh.ok && fresh.ts.getTime() > Date.now()
       && (!old.ok || old.ts.getTime() <= Date.now()))) {
       nj.deadline = String(deadline);
+      nj.state = "active";
       writeJson(p, nj);
     }
   }
