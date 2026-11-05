@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.26.2: run a supervised child with zero arguments.
+# ralph.sh — v0.27.0: run a supervised child with zero arguments.
+# (v0.27.0 = sub-runs as projects: a NESTED sub-project refuses FRESH launches
+#  — its windows are launched by the parent tree's chain step; attach/stop/
+#  repair on its own run tree are unchanged; spawn is refused up front in a
+#  DETACHED project (node.json parent == null); the tree banner also lights
+#  on the v2 node.json at .pi-supervisor/node.json)
 # (v0.26.0 = sub-runs + kernel protection: the child's pi — and the monitor's
 #  parent judgment/final-report sessions, via lib/pi-as-child.sh — run as a
 #  dedicated OS user; see SKILL.md "Kernel protection")
@@ -321,11 +326,13 @@ if [ "${1:-}" = "spawn" ]; then
       --reason=*)  SP_REASON=${1#*=}; shift ;;
       -h|--help)
         cat <<'USAGE'
-ralph.sh spawn — request a sub-run (a sub-project node) from inside a window
-  ralph.sh spawn --name <node> --task <file> [--deadline <ISO|HH:MM|epoch>]
+ralph.sh spawn — request a sub-run (a sub-project) from inside a window
+  ralph.sh spawn --name <subproject-dir> --task <file> [--deadline <ISO|HH:MM|epoch>]
                  [--runtime <duration>] [--reason <text>]
+--name names the sub-project DIR (created next to your project, in your
+parent's project — the chain step creates it when this window ends).
 Writes spawn-request.json into this window's run dir and prints a receipt.
-It NEVER launches: the chain step launches the child node when this window
+It NEVER launches: the chain step launches the child when this window
 ends, and re-enters this node afterwards. END YOUR TURN after spawning —
 direct launches are denied for child sessions (the PI_SUP_CHILD gate).
 USAGE
@@ -345,6 +352,21 @@ USAGE
   case "$SP_TASK" in /*) SP_TASK_ABS=$SP_TASK ;; *) SP_TASK_ABS="$PWD/$SP_TASK" ;; esac
   [ -f "$SP_TASK_ABS" ] || { saye "${C_R}✗${C_N} spawn: task file not found: $SP_TASK_ABS"; exit 2; }
   [ -s "$SP_TASK_ABS" ] || { saye "${C_R}✗${C_N} spawn: task file is empty: $SP_TASK_ABS"; exit 2; }
+  # v0.27.0 (plan §5): a DETACHED project (its own node.json says parent ==
+  # null AND it is not a root — the tree moved away, the chain demoted it,
+  # keeping its non-root name/path) cannot spawn: there is no parent tree to
+  # hand the child back to; its final report IS the deliverable. A genuine
+  # standalone root (name "(root)", parent null — never had a parent) spawns
+  # normally: its own chain step is the handler.
+  SP_PROJ="$(node --input-type=module -e 'const { windowProjectOf } = await import(process.argv[1]); process.stdout.write(windowProjectOf(process.argv[2]) || "");' "file://$HERE/lib/node.mjs" "$PI_SUP_RUN_DIR" 2>/dev/null || true)"
+  if [ -n "$SP_PROJ" ] && [ -f "$SP_PROJ/.pi-supervisor/node.json" ]; then
+    SP_NP="$(node -e 'try{const n=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(n.name+"|"+String(n.parent))}catch{process.stdout.write("|")}' "$SP_PROJ/.pi-supervisor/node.json" 2>/dev/null || true)"
+    if [ "${SP_NP#*|}" = "null" ] && [ "${SP_NP%%|*}" != "(root)" ]; then
+      saye "${C_R}✗${C_N} spawn: this project is DETACHED (no parent tree — node.json parent == null, name '${SP_NP%%|*}')"
+      sayc "${C_D}there is nothing to hand a sub-run back to — complete the task and end with a final report instead.${C_N}"
+      exit 1
+    fi
+  fi
   SP_RUNTIME_MIN=""
   if [ -n "$SP_RUNTIME" ]; then
     SP_RUNTIME_SEC="$(dur_sec "$SP_RUNTIME")" \
@@ -655,8 +677,8 @@ if [ $# -ge 1 ]; then
   fi
   RALPH_MODE=attach   # the banner prints before the monitor starts
   MONITOR_ARGS=(--run-dir "$RUN_DIR" "${ralph_flags[@]}" "${EXTRA[@]}")
-  if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
-    SUBRUNS_ATTACH_TREE=1   # v0.26.0: sub-runs project → the tree banner is the view
+  if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/node.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
+    SUBRUNS_ATTACH_TREE=1   # v0.26.0: sub-runs project → the tree banner is the view (v0.27.0: also the v2 node.json)
   fi
 fi
 
@@ -738,6 +760,32 @@ AJEOF
         idle) saye "${C_G}✓${C_N} the chain finished — root node done (windows under .pi-supervisor/runs/)"; exit 0 ;;
         *)    saye "${C_R}✗${C_N} the chain is not running — last step: ${AJ_OUTCOME:-no outcome recorded} (inspect .pi-supervisor/runs/)"; exit 1 ;;
       esac
+    fi
+    # v0.27.0 (plan §5): a NESTED sub-project never gets a FRESH launch — its
+    # windows are launched by the parent tree's chain step. Everything that
+    # attaches to an EXISTING live window above already ran, so reaching here
+    # means a fresh allocation → refuse, pointing at the parent tree.
+    NESTED_PARENT="$(node --input-type=module -e 'const { nestedParent } = await import(process.argv[1]); process.stdout.write(nestedParent(process.argv[2]) || "");' "file://$HERE/lib/node.mjs" "$PROJECT_DIR" 2>/dev/null || true)"
+    if [ -n "$NESTED_PARENT" ]; then
+      saye "${C_R}✗${C_N} fresh launches are refused here: this project is NESTED inside the tree at ${NESTED_PARENT}"
+      sayc "${C_D}windows in a nested project are launched by the parent's chain step — spawn from inside a window (ralph.sh spawn …), or run ralph.sh in the parent tree. Attach/view/stop still work: ralph.sh <run-dir>${C_N}"
+      exit 1
+    fi
+    # v0.27.0 (plan §4 S0): a FRESH launch materializes the v2 root node (the
+    # dot-dir node.json) so the FIRST spawn lands as a sub-project with a
+    # registry entry — otherwise the first chain step would see a legacy
+    # shape and materialize the v0.26 root in runs/. Idempotent; and only
+    # when no legacy v0.26 root exists (runs/node.json — those trees stay
+    # legacy, "finish in place", plan §8). Best effort: a failed materialize
+    # never blocks the launch (the chain step re-derives).
+    if [ ! -f "$PROJECT_DIR/.pi-supervisor/node.json" ] && [ ! -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
+      node --input-type=module -e '
+const { ensureRootNode } = await import(process.argv[1]);
+let dl = process.argv[3] || null;
+if (dl && /^\d+$/.test(dl)) dl = new Date(Number(dl) * 1000).toISOString();
+else if (dl && !/\d{4}-\d{2}-\d{2}T/.test(dl)) dl = null; // HH:MM — leave for the chain step
+try { ensureRootNode(process.argv[2], { deadline: dl }); } catch {}
+' "file://$HERE/lib/node.mjs" "$PROJECT_DIR" "${DEADLINE_EPOCH:-}" 2>/dev/null || true
     fi
     mkdir -p "$RUNROOT"
     n=0
@@ -825,8 +873,8 @@ AJEOF
       [ -n "$iso" ] && DEADLINE_EPOCH="$iso"
     fi
     RALPH_MODE=attach
-    if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
-      SUBRUNS_ATTACH_TREE=1   # v0.26.0: sub-runs project → the tree banner is the view
+    if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/node.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
+      SUBRUNS_ATTACH_TREE=1   # v0.26.0: sub-runs project → the tree banner is the view (v0.27.0: also the v2 node.json)
     fi
     if [ -n "$PI_PROTECT_USER" ]; then
       ralph_flags+=(--pi "$HERE/lib/pi-as-child.sh")

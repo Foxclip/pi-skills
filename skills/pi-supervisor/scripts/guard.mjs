@@ -1012,11 +1012,24 @@ function checkInvariants() {
 // agent_settled). turnActive is set at every prompt site, cleared at settle.
 let turnActive = false;
 let turnStartAt = Date.now(); // v0.22.0: reset at every prompt (single prompt site)
+let selfAbortAt = 0; // run32 2026-11-05: wall time of the last self-abort (fork/rewind);
+// its agent_settled always lands AFTER the re-prompt (the event loop is
+// suspended while the fork re-prompts) and must not clear the new turn's state.
 let turnStallBudgetWarned = false;
 async function promptChild(text) {
   turnActive = true;
   turnStartAt = Date.now();
-  return client.prompt(text);
+  try {
+    return await client.prompt(text);
+  } catch (e) {
+    // run1 2026-11-04 21:20Z: turnActive read false while the child was
+    // actually mid-generation — prompt() rejected with "Agent is already
+    // processing..." and the steer-inbox nudge was lost. steer() is the
+    // queueing path and works mid-turn; fall back to it instead of dropping
+    // the message.
+    if (e && /already processing/i.test(String(e.message))) return client.steer(text);
+    throw e;
+  }
 }
 async function deliverToChild(text) {
   return turnActive ? client.steer(text) : promptChild(text);
@@ -1149,7 +1162,7 @@ function handleEvent(ev) {
     lastToolStartedAt = Date.now();
     logSup(`[child tool: ${ev.toolName}] ${JSON.stringify(ev.args ?? {}).slice(0, 200)}`);
     writeStatus("running");
-    openCalls.push({ tool: ev.toolName, args: JSON.stringify(ev.args ?? {}).slice(0, 300) });
+    openCalls.push({ tool: ev.toolName, args: JSON.stringify(ev.args ?? {}).slice(0, 300), callId: ev.toolCallId ?? null });
     const sig = ev.toolName + "\x1f" + JSON.stringify(ev.args ?? {});
     if (sig === lastSig) loopCount++;
     else {
@@ -1161,7 +1174,13 @@ function handleEvent(ev) {
     }
   } else if (ev.type === "tool_execution_end") {
     if (toolDepth > 0) toolDepth--;
-    const c = openCalls.pop();
+    // run32 2026-11-05: LIFO pop mispairs args/results when tools run in
+    // parallel (start A, start B, end A, end B → end A paired with B). pi's
+    // events carry toolCallId; pair by ID, LIFO fallback when absent.
+    const c =
+      (ev.toolCallId ? openCalls.find((o) => o.callId === ev.toolCallId) : undefined) ??
+      (openCalls.length > 0 ? openCalls[openCalls.length - 1] : undefined);
+    if (c) openCalls.splice(openCalls.indexOf(c), 1);
     if (c) {
       c.isError = !!ev.isError;
       if (ev.durationMs !== undefined) c.durationMs = ev.durationMs;
@@ -1237,6 +1256,7 @@ async function doFork(reason) {
   pendingLoop = null;
   logSup(`[guard] L2 fork #${forksUsed}/${maxForks}: ${reason}`);
   abortedByMe = true;
+  selfAbortAt = Date.now(); // the aborted turn's settle lands after the re-prompt below
   toolDepth = 0;
   resetAttemptCounters();
   steersThisAttempt = 0;
@@ -1298,6 +1318,7 @@ async function doRewind(reason) {
   pendingLoop = null;
   logSup(`[guard] L1.5 rewind #${rewindsUsed}/${maxRewinds}: ${reason}`);
   abortedByMe = true;
+  selfAbortAt = Date.now(); // the aborted turn's settle lands after the re-prompt below
   toolDepth = 0;
   resetAttemptCounters();
   steersThisAttempt = 0;
@@ -1838,6 +1859,17 @@ try {
     if (ev) {
       lastEventAt = now;
       if (ev.type === "agent_settled") {
+        // run32 2026-11-05 07:19Z: a settle for a turn the guard itself
+        // aborted (fork/rewind) is ALWAYS consumed after the re-prompt, so
+        // with a live turn it can never be the current turn's settle. The old
+        // code cleared turnActive here anyway: the re-prompted turn went
+        // unsupervised (L0 stall-detection blind) and mid-turn messages were
+        // prompt()ed into the generating child ("Agent is already processing"
+        // — run32's 90% budget warning was dropped exactly this way).
+        if (ev.aborted && abortedByMe && turnActive && selfAbortAt > 0 && turnStartAt >= selfAbortAt) {
+          plog(`[settled] ${new Date().toISOString()} aborted=yes (late — the aborted turn; current turn preserved)\n`);
+          continue;
+        }
         turnActive = false; // the turn is over — prompt() is safe again
         plog(`[settled] ${new Date().toISOString()} aborted=${ev.aborted ? "yes" : "no"}\n`);
         // v0.6.0: the child's own words at settle — the one-line status surface
@@ -2258,10 +2290,15 @@ try {
     // final status is durable and BEFORE exit; a chain failure must NEVER
     // change this window's own exit code (plan §5.4). Only for windows
     // launched with a project (PI_SUP_PROJECT set by launch.mjs).
+    // v0.27.0: the step runs at the SCHEDULER ROOT (PI_SUP_TREE_ROOT, set by
+    // launch.mjs; defaults to this window's own project) — in a v2 tree a
+    // sub-project window is decided by its tree root. A root whose
+    // .pi-supervisor is gone (the tree moved) is NOT an error here: the chain
+    // degrades to standalone mode inside step() (plan §4).
     try {
       if (process.env.PI_SUP_PROJECT) {
         const { step: chainStep } = await import("./lib/chain.mjs");
-        await chainStep(process.env.PI_SUP_PROJECT, outDir, {
+        await chainStep(process.env.PI_SUP_TREE_ROOT || process.env.PI_SUP_PROJECT, outDir, {
           repair: false,
           launch: {
             provider: provider || undefined,

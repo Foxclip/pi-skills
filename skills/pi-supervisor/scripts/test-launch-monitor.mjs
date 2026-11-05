@@ -16,6 +16,11 @@
 //   T5 stale     a v:1 file with an old `at` → reason=liveness (status-stale)
 //
 // Run:  node test-launch-monitor.mjs [--keep]
+// Sanitize: must run from INSIDE a supervised window too — inherited PI_SUP_*
+// would flip the guard into protected-child mode (PI_SUP_CHILD_USER ⇒ exit 49
+// verification abort) and point window logic at the outer run dir.
+for (const k of ["PI_SUP_RUN_DIR", "PI_SUP_CHILD", "PI_SUP_PROJECT", "PI_SUP_NODE", "PI_SUP_CHILD_USER"]) delete process.env[k];
+
 import { spawnSync, execSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync, readFileSync, existsSync as existsSync0, readdirSync as readdirSync0 } from "node:fs";
 import os from "node:os";

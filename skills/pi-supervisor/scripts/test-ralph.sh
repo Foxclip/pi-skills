@@ -6,6 +6,11 @@
 # Note: a foreground `ralph.sh` blocks while it monitors — cases that launch
 # run it backgrounded and assert on its log, then stop it via the pointer.
 set -u
+# Sanitize the inherited environment: this suite must work even when run FROM
+# INSIDE a supervised window (a child inherits PI_SUP_CHILD, PI_SUP_RUN_DIR,
+# PI_SUP_PROJECT, PI_SUP_NODE, ...). Each case below sets exactly what it needs.
+unset PI_SUP_RUN_DIR PI_SUP_CHILD PI_SUP_CHILD_USER PI_SUP_PROJECT PI_SUP_NODE \
+      PI_PROTECT_USER PI_SUP_PROTECT_USER DEADLINE
 # Kernel protection (v0.26.0) is covered by test-protect.mjs (it creates real
 # users + sudoers state); the ralph-level suites run unprotected.
 export PI_SUP_NO_PROTECT=1
@@ -366,6 +371,48 @@ grep -q "last step: halted" $T/S11.log && ! grep -q "no outcome recorded" $T/S11
   && ok "S11: outcome read from nested .outcome (not 'no outcome recorded')" \
   || bad "S11: $(grep -F 'chain is not running' $T/S11.log || tail -3 $T/S11.log)"
 [ "$S11RC" -eq 1 ] && ok "S11: halted chain → exit 1" || bad "S11: rc=$S11RC"
+
+# ---- v0.27.0: nested sub-project launch refusal + detached spawn refusal --------
+# S12: a FRESH zero-arg launch inside a NESTED sub-project must refuse — its
+# windows are launched by the parent tree's chain step (plan §5). No run dir.
+mkdir -p $T/projS12/.pi-supervisor $T/projS12/auth/.pi-supervisor
+echo "# root task" > $T/projS12/TASK.md
+echo "# auth task" > $T/projS12/auth/TASK.md
+cd $T/projS12/auth
+PATH="$T/sandbox/scripts:$PATH" DEADLINE=$DEADLINE PI=$T/pi-OK ralph.sh > $T/S12.log 2>&1
+RC=$?
+[ "$RC" -eq 1 ] && grep -q "NESTED" $T/S12.log \
+  && [ -z "$(ls -A .pi-supervisor/runs 2>/dev/null)" ] && [ ! -f .pi-supervisor/active.json ] \
+  && ok "S12: nested sub-project → fresh launch refused (exit 1, no run dir)" \
+  || bad "S12: rc=$RC $(head -5 $T/S12.log)"
+
+# S13: spawn inside a DETACHED project (its own node.json says parent == null —
+# the tree moved away, there is no parent to hand back to) → refused up front.
+mkdir -p $T/projS13/.pi-supervisor/runs/run-1
+echo '{"v":2,"name":"moved","path":"auth","parent":null,"state":"active","children":[]}' > $T/projS13/.pi-supervisor/node.json
+echo "# detached task" > $T/projS13/TASK.md
+echo "# sub task" > $T/spawn-task-S13.md
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$T/projS13/.pi-supervisor/runs/run-1 ralph.sh spawn \
+  --name sub-c --task $T/spawn-task-S13.md > $T/S13.log 2>&1
+RC=$?
+[ "$RC" -eq 1 ] && grep -q "DETACHED" $T/S13.log && [ ! -f $T/projS13/.pi-supervisor/runs/run-1/spawn-request.json ] \
+  && ok "S13: spawn in a detached project → refused (exit 1, no request file)" \
+  || bad "S13: rc=$RC $(head -5 $T/S13.log)"
+
+# S14: spawn in a GENUINE standalone v2 ROOT (name "(root)", parent null —
+# never had a parent) must NOT be refused — its own chain step is the handler.
+# Regression guard: the detached refusal is keyed on non-root name, not just
+# parent==null (e2e-2 2026-11-05: a real standalone root was refused).
+mkdir -p $T/projS14/.pi-supervisor/runs/run-1
+echo '{"v":2,"name":"(root)","path":"(root)","parent":null,"state":"active","children":[]}' > $T/projS14/.pi-supervisor/node.json
+echo "# root task" > $T/projS14/TASK.md
+echo "# sub task" > $T/spawn-task-S14.md
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$T/projS14/.pi-supervisor/runs/run-1 ralph.sh spawn \
+  --name beta --task $T/spawn-task-S14.md > $T/S14.log 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && [ -f $T/projS14/.pi-supervisor/runs/run-1/spawn-request.json ] \
+  && ok "S14: spawn in a standalone v2 root → allowed (request written)" \
+  || bad "S14: rc=$RC $(head -5 $T/S14.log)"
 
 echo ""
 echo "=== $PASS passed, $FAIL failed (sandbox: $T) ==="
