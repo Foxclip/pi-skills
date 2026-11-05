@@ -54,7 +54,7 @@ try {
 console.log(JSON.stringify({ launched: true, pid: s.pid }));
 `);
 const { step, reentry } = await import(pathToFileURL(path.join(S, "lib", "chain.mjs")).href);
-const { allocWindow, readNode, activePath, ensureRootNode, registerChild } = await import(pathToFileURL(path.join(S, "lib", "node.mjs")).href);
+const { allocWindowIn, readNode, activePath, ensureRootNode, registerChild } = await import(pathToFileURL(path.join(S, "lib", "node.mjs")).href);
 const readJsonFile = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
 
 // ---------- harness ----------
@@ -73,7 +73,7 @@ function mkproj(name) {
   fs.mkdirSync(path.join(p, ".pi-supervisor", "runs"), { recursive: true });
   return p;
 }
-const R = (p, rel) => path.join(p, ".pi-supervisor/runs", rel);
+const R = (p, rel) => rel ? path.join(p, ".pi-supervisor/runs", rel) : path.join(p, ".pi-supervisor/runs");
 function mkWindow(proj, rel, st) { // rel is under the runs root: "run-1" | "auth/run-1"
   const dir = R(proj, rel);
   fs.mkdirSync(dir, { recursive: true });
@@ -82,13 +82,35 @@ function mkWindow(proj, rel, st) { // rel is under the runs root: "run-1" | "aut
   fs.writeFileSync(path.join(dir, "pi-child-status.json"), JSON.stringify({ ...base, ...st }, null, 2));
   return dir;
 }
-function mkNode(proj, nodePath, extra = {}) { // root: "(root)" → runs/node.json
-  const runs = path.join(proj, ".pi-supervisor", "runs");
-  const parts = nodePath === "(root)" ? [] : String(nodePath).split("/");
-  const dir = path.join(runs, ...parts);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "node.json"), JSON.stringify({ v: 1, nodePath, state: "active", ...extra }, null, 2));
+function mkNode(proj, nodePath, extra = {}) { // v2: the root node.json is in the
+  // project dot dir; a child path registers nested sub-projects (dir = name)
+  if (nodePath === "(root)") {
+    ensureRootNode(proj, { deadline: extra.deadline ?? null });
+    if (extra.state) {
+      const njP = path.join(proj, ".pi-supervisor", "node.json");
+      const nj = readJsonFile(njP);
+      nj.state = extra.state;
+      fs.writeFileSync(njP, JSON.stringify(nj, null, 2));
+    }
+    return;
+  }
+  const parts = String(nodePath).split("/");
+  let dir = proj;
+  for (const part of parts) {
+    registerChild(dir, part, part);
+    dir = path.join(dir, part);
+    fs.mkdirSync(path.join(dir, ".pi-supervisor"), { recursive: true });
+  }
+  if (extra.deadline || extra.state) {
+    const nj = readJsonFile(path.join(dir, ".pi-supervisor", "node.json"))
+      || { v: 2, name: nodePath, path: nodePath, parent: null, deadline: null, state: "active", children: [], createdAt: ISO(Date.now()) };
+    if (extra.deadline) nj.deadline = extra.deadline;
+    if (extra.state) nj.state = extra.state;
+    fs.writeFileSync(path.join(dir, ".pi-supervisor", "node.json"), JSON.stringify(nj, null, 2));
+  }
 }
+// the windows dir of a node (v2: <node-project>/.pi-supervisor/runs)
+const NR = (proj, nodePath) => path.join(proj, ...String(nodePath).split("/"), ".pi-supervisor", "runs");
 const readMarker = (dir) => JSON.parse(fs.readFileSync(path.join(dir, "chain-done.json"), "utf8"));
 const nodeState = (proj, nodePath) => readNode(proj, nodePath)?.state ?? null;
 const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(proj), "utf8")); } catch { return null; } };
@@ -122,13 +144,13 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const d = JSON.parse(fs.readFileSync(path.join(w, "spawn-decision.json"), "utf8"));
   ok("T2 decision ok", d.ok === true, JSON.stringify(d));
   ok("T2 child window 1 dir", d.window === "run-1" && fs.existsSync(d.run_dir));
-  ok("T2 child node dir + task.md", fs.existsSync(R(p, "auth/node.json"))
-    && fs.readFileSync(R(p, "auth/task.md"), "utf8").includes("auth sub-project"));
+  ok("T2 child node dir + TASK.md", fs.existsSync(path.join(p, "auth", ".pi-supervisor", "node.json"))
+    && fs.readFileSync(path.join(p, "auth", "TASK.md"), "utf8").includes("auth sub-project"));
   ok("T2 child TASK.md is a sub brief", fs.readFileSync(path.join(d.run_dir, "TASK.md"), "utf8").includes("auth"));
   ok("T2 parent paused(waiting:auth)", nodeState(p, "(root)") === "paused(waiting:auth)");
   ok("T2 child node active", nodeState(p, "auth") === "active");
-  const act = active(p);
-  ok("T2 active.json → child window", act && act.node === "auth" && act.window === "run-1");
+  const act = active(path.join(p, "auth"));
+  ok("T2 active.json → child window (in the sub-project)", act && act.node === "auth" && act.window === "run-1");
   ok("T2 child got deadline ≤ parent deadline", d.deadline <= ISO(inMin(31)) && d.deadline > ISO(inMin(20)), d.deadline);
 }
 
@@ -147,9 +169,9 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const r2 = await step(p, w2, CFG);
   ok("T3 first spawn ok", r1.outcome?.next === "spawned" && r1.outcome.window === "run-1", JSON.stringify(r1.outcome));
   ok("T3 second spawn ok", r2.outcome?.next === "spawned" && r2.outcome.window === "run-2", JSON.stringify(r2.outcome));
-  const wins = fs.readdirSync(R(p, "shared")).filter((f) => /^run-\d+$/.test(f)).sort();
+  const wins = fs.readdirSync(NR(p, "shared")).filter((f) => /^run-\d+$/.test(f)).sort();
   ok("T3 one node, two windows", JSON.stringify(wins) === JSON.stringify(["run-1", "run-2"]), JSON.stringify(wins));
-  ok("T3 joined brief is continuation-style", fs.readFileSync(R(p, "shared/run-2/TASK.md"), "utf8").includes("Task (the node's task file, unchanged)"));
+  ok("T3 joined brief is continuation-style", fs.readFileSync(path.join(NR(p, "shared"), "run-2", "TASK.md"), "utf8").includes("Task (the node's task file, unchanged)"));
 }
 
 // ================= T4 — sub completed → node done + parent RE-ENTRY launched
@@ -158,8 +180,9 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
   mkNode(p, "auth", { deadline: ISO(inMin(90)) });
   mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" }); // root's spawn window
-  mkWindow(p, "auth/run-1", { status: "completed", exitReason: "completed-finalized" });
-  const w = R(p, "auth/run-1");
+  fs.mkdirSync(path.join(NR(p, "auth"), "run-1"), { recursive: true });
+  fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  const w = path.join(NR(p, "auth"), "run-1");
   const r = await step(p, w, CFG);
   ok("T4 reentry launched", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
   ok("T4 root re-entry window run-2", r.outcome?.window === "run-2" && fs.existsSync(R(p, "run-2")));
@@ -188,7 +211,9 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:db)" });
   mkNode(p, "db", { deadline: ISO(Date.now() - 30000) });
   mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" }); // root's spawn window
-  const w = mkWindow(p, "db/run-1", { status: "completed", exitReason: "hard-timeout" });
+  fs.mkdirSync(path.join(NR(p, "db"), "run-1"), { recursive: true });
+  fs.writeFileSync(path.join(NR(p, "db"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "hard-timeout", guardPid: deadPid(), deadlineIso: ISO(Date.now() - 30000) }, null, 2));
+  const w = path.join(NR(p, "db"), "run-1");
   const r = await step(p, w, CFG);
   ok("T6 deadline-expired → reentry", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
   ok("T6 db deadline-expired", nodeState(p, "db") === "deadline-expired");
@@ -237,8 +262,10 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const r = await step(p, w, CFG);
   const d = JSON.parse(fs.readFileSync(path.join(w, "spawn-decision.json"), "utf8"));
   ok("T10 decision rejected", d.ok === false && /task file missing/i.test(d.reason), JSON.stringify(d));
-  ok("T10 fallthrough: root done + idle", r.outcome?.next === "idle" && nodeState(p, "(root)") === "done");
-  ok("T10 no child dir", !fs.existsSync(R(p, "ghost")));
+  ok("T10 rejected spawn escalates (halted, not silent idle)", r.outcome?.next === "halted" && /spawn request rejected/i.test(r.outcome?.reason ?? ""), JSON.stringify(r.outcome));
+  ok("T10 root blocked (human attention)", nodeState(p, "(root)") === "blocked");
+  ok("T10 marker says why", /rejected/i.test(String(readMarker(w).outcome?.reason ?? "")), JSON.stringify(readMarker(w).outcome));
+  ok("T10 no child dir (rejection left no side effects)", !fs.existsSync(path.join(p, "ghost")));
 }
 
 // ============ T11 — spawn with an already-expired deadline → rejected
@@ -254,7 +281,8 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const r = await step(p, w, CFG);
   const d = JSON.parse(fs.readFileSync(path.join(w, "spawn-decision.json"), "utf8"));
   ok("T11 rejected (deadline expired)", d.ok === false && /deadline expired/i.test(d.reason), JSON.stringify(d));
-  ok("T11 terminal table applied (idle)", r.outcome?.next === "idle");
+  ok("T11 rejected spawn escalates (halted)", r.outcome?.next === "halted" && /deadline expired/i.test(r.outcome?.reason ?? ""), JSON.stringify(r.outcome));
+  ok("T11 root blocked (human attention)", nodeState(p, "(root)") === "blocked");
 }
 
 // ================= T12 — idempotency: second step on the same window is a no-op
@@ -287,11 +315,11 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const p = mkproj("t14-alloc");
   fs.mkdirSync(R(p, "run-1"), { recursive: true });
   fs.mkdirSync(R(p, "run-5"), { recursive: true });
-  const a = allocWindow(p, "(root)");
+  const a = allocWindowIn(R(p));
   ok("T14 gap preserved (run-6, not run-2)", a.window === "run-6", a.window);
-  const a2 = allocWindow(p, "(root)");
+  const a2 = allocWindowIn(R(p));
   ok("T14 monotonic (run-7)", a2.window === "run-7", a2.window);
-  const b = allocWindow(p, "db");
+  const b = allocWindowIn(NR(p, "db"));
   ok("T14 fresh node starts at run-1", b.window === "run-1", b.window);
 }
 
@@ -439,7 +467,7 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("S5 project NOT re-created", !fs.existsSync(path.join(p, "auth")));
   const entry = readJsonFile(rnjPath)?.children?.find((c) => c.name === "auth");
   ok("S5 entry now stamped detached", entry && typeof entry.detached === "string", JSON.stringify(entry));
-  ok("S5 falls through to terminal table (root done/idle)", r.outcome?.next === "idle" && nodeState(p, "(root)") === "done", JSON.stringify(r.outcome));
+  ok("S5 escalated (halted/blocked, not silent idle)", r.outcome?.next === "halted" && /rejected/i.test(r.outcome?.reason ?? "") && nodeState(p, "(root)") === "blocked", JSON.stringify(r.outcome));
 }
 
 // ================= S8 — v2: nested spawn chain (root → auth → db) and the re-entry climbs one level

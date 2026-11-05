@@ -30,11 +30,17 @@ check("empty: renders root line", /\(root\)/.test(t) && /UNKNOWN/i.test(t), t);
 }
 
 // Fixture: root active, auth has a LIVE run-1 (guardPid = this test process,
-// which is alive), docs is paused waiting on root.
-M.ensureNode(projectDir, "", { deadline: DL, name: "(root)" });
-M.ensureNode(projectDir, "auth", { deadline: DL, name: "auth" });
-M.ensureNode(projectDir, "docs", { deadline: DL, name: "docs", state: "paused(waiting:root)" });
-const wd = path.join(M.nodeDir(projectDir, "auth"), "run-1");
+// which is alive), docs is paused waiting on root. (v2: sub-runs are
+// projects — the registry entries live in the root's dot-dir node.json, the
+// per-node state in each sub-project's own node.json.)
+M.ensureRootNode(projectDir, { deadline: DL });
+M.registerChild(projectDir, "auth", "auth");
+M.registerChild(projectDir, "docs", "docs");
+fs.mkdirSync(path.join(projectDir, "auth", ".pi-supervisor"), { recursive: true });
+fs.mkdirSync(path.join(projectDir, "docs", ".pi-supervisor"), { recursive: true });
+fs.writeFileSync(path.join(projectDir, "auth", ".pi-supervisor", "node.json"), JSON.stringify({ v: 2, name: "auth", path: "auth", parent: "(root)", deadline: DL, state: "active", children: [], createdAt: "x" }));
+fs.writeFileSync(path.join(projectDir, "docs", ".pi-supervisor", "node.json"), JSON.stringify({ v: 2, name: "docs", path: "docs", parent: "(root)", deadline: DL, state: "paused(waiting:root)", children: [], createdAt: "x" }));
+const wd = path.join(projectDir, "auth", ".pi-supervisor", "runs", "run-1");
 fs.mkdirSync(wd, { recursive: true });
 fs.writeFileSync(path.join(wd, "pi-child-status.json"), JSON.stringify({ guardPid: process.pid, at: new Date(NOW - 2 * 3600e3).toISOString(), phase: "running" }));
 
@@ -64,8 +70,8 @@ check("fixture: node order root,auth,docs (bookkeep order)", (() => {
 check("fixture: every row inside the box", t.split("\n").every((l, i) => (i === 0 || i === t.split("\n").length - 1) ? !l.startsWith("│") : l.startsWith("│")));
 
 // A node with >1 windows and no live one shows the window count.
-M.allocWindow(projectDir, "docs"); // creates run-1
-fs.mkdirSync(path.join(M.nodeDir(projectDir, "docs"), "run-2"));
+fs.mkdirSync(path.join(projectDir, "docs", ".pi-supervisor", "runs", "run-1"), { recursive: true });
+fs.mkdirSync(path.join(projectDir, "docs", ".pi-supervisor", "runs", "run-2"), { recursive: true });
 t = M.renderTree(projectDir, { now: NOW });
 check("windows: docs line shows '2 windows'", (() => {
   const l = t.split("\n").find((l) => l.includes("docs"));

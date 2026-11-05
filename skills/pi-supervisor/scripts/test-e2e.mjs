@@ -54,6 +54,7 @@ fs.writeFileSync(path.join(out, "pi-child-status.json"), JSON.stringify({
   deadlineIso: new Date(dl * 1000).toISOString(),
 }, null, 2));
 const base = path.basename(out);
+// v2: --project is the WINDOW's own project — the pointer goes there
 fs.writeFileSync(path.join(project, ".pi-supervisor", "active.json"), JSON.stringify({
   run_dir: out, node, guard_pid: s.pid, window: /^run-\\d+$/.test(base) ? base : null,
   started_at: new Date().toISOString(), deadline: new Date(dl * 1000).toISOString(),
@@ -68,11 +69,12 @@ const proj = path.join(root, "proj");
 mkdirSync(path.join(proj, "tasks"), { recursive: true });
 const taskFile = path.join(proj, "tasks", "auth-task.md");
 writeFileSync(taskFile, "AUTH_TASK_BODY — implement the auth sub-project (stub goal).");
-const runs = M.runsRoot(proj);
+const runs = M.runsRoot(proj);           // the root's windows dir
 const DL_ROOT = new Date(Date.now() + 2 * 3600e3).toISOString();
-M.ensureNode(proj, M.ROOT, { deadline: DL_ROOT });
+M.ensureRootNode(proj, { deadline: DL_ROOT });
 const DL_AUTH = new Date(Date.now() + 3600e3).toISOString();
-const active = () => M.activePath(proj);
+const projOf = (nodePath) => nodePath === M.ROOT ? proj : M.projectOfNode(proj, nodePath).dir;
+const active = (nodePath) => M.activePath(projOf(nodePath));
 const jread = (p) => { try { return JSON.parse(readFileSync(p, "utf8")); } catch { return null; } };
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const CFG = {   // mirrors the guard hook's cfg (guard.mjs v0.26.0 block)
@@ -102,15 +104,16 @@ function endChild(wdir, { request = null, report = null } = {}) {
 }
 
 // ================= W1: root/run-1 spawns auth =================
-const { window: w1, dir: w1d } = M.allocWindow(proj, M.ROOT);
+const wa1 = M.allocWindowIn(runs);
+const w1 = wa1.window; const w1d = path.join(runs, w1);
 launch(w1d, M.ROOT, "ROOT_TASK_BODY — parent's work; spawn the auth sub-project when ready.", Math.floor(Date.now() / 1000) + 7200);
 endChild(w1d, {
   request: { kind: "spawn", node: "auth", task: taskFile, deadline: DL_AUTH },
   report: "Parent window 1: paused to spawn auth. Parent work so far recorded in STATE.md.",
 });
 const step1 = await step(proj, w1d, CFG);
-const authDir = M.nodeDir(proj, "auth");
-const authW1 = path.join(authDir, "run-1");
+const authDir = M.projectOfNode(proj, "auth").dir;
+const authW1 = path.join(authDir, ".pi-supervisor", "runs", "run-1");
 const authBrief = existsSync(path.join(authW1, "TASK.md")) ? readFileSync(path.join(authW1, "TASK.md"), "utf8") : "";
 r("W1 step → spawned auth/run-1", step1?.outcome?.next === "spawned" && step1.outcome.node_path === "auth" && step1.outcome.window === "run-1" && step1.outcome.run_dir === authW1,
   JSON.stringify(step1?.outcome ?? step1));
@@ -119,13 +122,13 @@ r("W1 auth/run-1 sub brief: header + task verbatim + sub rules + budget",
   authBrief.split("\n")[0] || "(missing)");
 const dec1 = jread(path.join(w1d, "spawn-decision.json"));
 r("W1 spawn-decision.json ok (node auth, deadline ≈ request)", Boolean(dec1?.ok) && dec1.node_path === "auth" && dec1.window === "run-1", JSON.stringify(dec1 || null).slice(0, 140));
-const rootNode1 = jread(path.join(runs, "node.json"));
+const rootNode1 = jread(path.join(proj, ".pi-supervisor", "node.json"));
 r("W1 root node paused(waiting:auth)", rootNode1?.state === "paused(waiting:auth)", `state=${rootNode1?.state}`);
-const act1 = jread(active());
-r("W1 active.json → auth/run-1 (live guard)", act1?.run_dir === authW1 && act1?.node === "auth" && alive(act1?.guard_pid), JSON.stringify(act1 || null).slice(0, 140));
-const stRoot1 = readFileSync(path.join(runs, "STATE.md"), "utf8");
+const act1 = jread(active("auth"));
+r("W1 active.json → auth/run-1 (live guard, in the sub-project)", act1?.run_dir === authW1 && act1?.node === "auth" && alive(act1?.guard_pid), JSON.stringify(act1 || null).slice(0, 140));
+const stRoot1 = readFileSync(path.join(proj, "STATE.md"), "utf8");
 r("W1 root STATE.md spawn entry", /child auth spawned — window run-1 launched/.test(stRoot1), stRoot1.trim().split("\n").slice(-1)[0]?.slice(0, 120));
-const authNode1 = jread(path.join(authDir, "node.json"));
+const authNode1 = jread(path.join(authDir, ".pi-supervisor", "node.json"));
 r("W1 auth node exists, deadline inherited from request", authNode1 && authNode1.state === "active" && new Date(authNode1.deadline).getTime() === new Date(DL_AUTH).getTime(), JSON.stringify(authNode1 || null).slice(0, 140));
 
 // ================= W2: auth/run-1 meets the goal =================
@@ -136,31 +139,31 @@ const reentryBrief = existsSync(path.join(rootW2, "TASK.md")) ? readFileSync(pat
 r("W2 step → reentry root/run-2", step2?.outcome?.next === "reentry" && step2.outcome.node_path === M.ROOT && step2.outcome.window === "run-2" && step2.outcome.run_dir === rootW2, JSON.stringify(step2?.outcome ?? step2));
 r("W2 re-entry brief embeds auth's FINAL-REPORT (AUTH-GOAL-MET)", reentryBrief.includes("# RE-ENTRY") && reentryBrief.includes("AUTH-GOAL-MET") && /child node `auth` has ended \(state: done\)/.test(reentryBrief), reentryBrief.split("\n").slice(0, 4).join(" | ").slice(0, 160));
 r("W2 re-entry brief embeds the spawn decision that launched auth", reentryBrief.includes('"node_path": "auth"') && reentryBrief.includes('"window": "run-1"'), (reentryBrief.match(/spawn decision[\s\S]{0,120}/) || ["(no decision section)"])[0].slice(0, 160));
-const authNode2 = jread(path.join(authDir, "node.json"));
+const authNode2 = jread(path.join(authDir, ".pi-supervisor", "node.json"));
 r("W2 auth node done + STATE.md trail", authNode2?.state === "done" && /window run-1 completed — node done/.test(readFileSync(path.join(authDir, "STATE.md"), "utf8")), `state=${authNode2?.state}`);
-const act2 = jread(active());
+const act2 = jread(active(M.ROOT));
 r("W2 active.json → root/run-2 (live guard)", act2?.run_dir === rootW2 && alive(act2?.guard_pid), JSON.stringify(act2 || null).slice(0, 140));
 r("W2 harvest ran (RUN-REPORT + INDEX) without clobbering FINAL-REPORT",
   existsSync(path.join(authW1, "RUN-REPORT.md"))
   && readFileSync(path.join(authW1, "FINAL-REPORT.md"), "utf8").includes("AUTH-GOAL-MET")
-  && existsSync(path.join(runs, "auth", "INDEX.json")),
-  `RUN-REPORT=${existsSync(path.join(authW1, "RUN-REPORT.md"))} INDEX(auth)=${existsSync(path.join(runs, "auth", "INDEX.json"))}`);
+  && existsSync(path.join(authDir, ".pi-supervisor", "runs", "INDEX.json")),
+  `RUN-REPORT=${existsSync(path.join(authW1, "RUN-REPORT.md"))} INDEX(auth)=${existsSync(path.join(authDir, ".pi-supervisor", "runs", "INDEX.json"))}`);
 
 // ================= W3: root/run-2 declares the node done =================
 endChild(rootW2, { report: "Re-entry: auth outcome distilled into STATE.md. Node (root) declares done.\nROOT-DONE" });
 const step3 = await step(proj, rootW2, CFG);
 r("W3 step → idle (root-done)", step3?.outcome?.next === "idle" && step3.outcome.reason === "root-done", JSON.stringify(step3?.outcome ?? step3));
-r("W3 active.json cleared (unlinked)", !existsSync(active()), existsSync(active()) ? "still present" : "gone");
-const rootNode3 = jread(path.join(runs, "node.json"));
-r("W3 root node done + STATE.md trail", rootNode3?.state === "done" && /window run-2 completed — node done/.test(readFileSync(path.join(runs, "STATE.md"), "utf8")), `state=${rootNode3?.state}`);
+r("W3 active.json cleared (unlinked)", !existsSync(active(M.ROOT)), existsSync(active(M.ROOT)) ? "still present" : "gone");
+const rootNode3 = jread(path.join(proj, ".pi-supervisor", "node.json"));
+r("W3 root node done + STATE.md trail", rootNode3?.state === "done" && /window run-2 completed — node done/.test(readFileSync(path.join(proj, "STATE.md"), "utf8")), `state=${rootNode3?.state}`);
 
 // ================= invariants: idempotency, INDEX, tree =================
 const s1b = await step(proj, w1d, CFG);
 const s2b = await step(proj, authW1, CFG);
 r("re-step is a no-op (chain-done marker, both windows)", s1b?.skipped === "chain-done" && s2b?.skipped === "chain-done", JSON.stringify({ s1b, s2b }));
 const idxRoot = existsSync(path.join(runs, "INDEX.json")) ? readFileSync(path.join(runs, "INDEX.json"), "utf8") : "";
-const idxAuth = existsSync(path.join(runs, "auth", "INDEX.json")) ? readFileSync(path.join(runs, "auth", "INDEX.json"), "utf8") : "";
-r("INDEX.json: runs/ has run-1+run-2, runs/auth/ has run-1",
+const idxAuth = existsSync(path.join(authDir, ".pi-supervisor", "runs", "INDEX.json")) ? readFileSync(path.join(authDir, ".pi-supervisor", "runs", "INDEX.json"), "utf8") : "";
+r("INDEX.json: runs/ has run-1+run-2, the auth sub-project has run-1",
   /run-1/.test(idxRoot) && /run-2/.test(idxRoot) && /run-1/.test(idxAuth), `root=${idxRoot.length}B auth=${idxAuth.length}B`);
 const tree = M.renderTree(proj, { now: new Date() });
 console.log("\n" + tree + "\n");

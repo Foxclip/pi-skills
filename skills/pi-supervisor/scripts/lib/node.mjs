@@ -1,6 +1,7 @@
-// lib/node.mjs — the sub-runs node model (v0.27.0 — sub-runs as projects).
+// lib/node.mjs — the sub-runs node model (v0.28.0 — sub-runs as projects;
+// the v2 shape is the ONLY shape).
 //
-// v2 layout: a node is a PROJECT. The root node is the project itself; a
+// Layout: a node is a PROJECT. The root node is the project itself; a
 // child node is a subfolder that is a project in its own right:
 //   <project>/
 //     TASK.md  STATE.md
@@ -11,10 +12,12 @@
 //     auth/                    ← child node (a sub-project — registered in this
 //       …                      ← node.json's children: [{name, dir}])
 //
-// Legacy v0.26 trees keep the old layout (runs/<path>/node.json, the root
-// node = the runs/ folder). The mode is decided per project root (modeOf):
-// runs/node.json present and no .pi-supervisor/node.json → legacy; a fresh
-// project (neither) is v2. New spawns never create legacy nodes.
+// The legacy v0.26 shape (root node = the runs/ folder, sub-runs as node
+// folders under runs/, a runs/node.json registry) was removed in v0.28.0:
+// those files are inert garbage the code never reads. A project that carries
+// an old runs/ tree is simply adopted as the v2 root — its run-N windows
+// already live in .pi-supervisor/runs/ and keep counting; old node folders
+// and the old registry are ignored.
 //
 // Rules (plan §2):
 //   - node = project identity. Join-or-create: a name that exists under the
@@ -26,9 +29,9 @@
 //   - the node's deadline is INVARIANT across its windows; a window's budget
 //     is min(runtime, nodeDeadline − now).
 //
-// Allocation (ensureNode / allocWindow / withLock) must run under the project
-// lock (withLock). The pure readers (nodeState, deriveTree, liveWindowIn) do
-// not require the lock — they only read.
+// Allocation (ensureRootNode / registerChild / allocWindowIn / withLock)
+// must run under the project lock (withLock). The pure readers (nodeState,
+// deriveTree, liveWindowIn) do not require the lock — they only read.
 
 import fs from "fs";
 import path from "path";
@@ -45,24 +48,8 @@ export function runsRoot(projectDir) { return path.join(supRoot(projectDir), "ru
 export function activePath(projectDir) { return path.join(supRoot(projectDir), "active.json"); }
 export function lockPath(projectDir) { return path.join(supRoot(projectDir), ".lock"); }
 
-// nodePath: "(root)" | "auth" | "auth/deeper" (forward-slash, relative to runs/)
-export function nodeDir(projectDir, nodePath) {
-  if (!nodePath || nodePath === ROOT) return runsRoot(projectDir);
-  const parts = String(nodePath).split("/").filter((p) => p.length && p !== "." && p !== "..");
-  if (!parts.length) return runsRoot(projectDir);
-  return path.join(runsRoot(projectDir), ...parts);
-}
-
-// Inverse of nodeDir — null when the dir is outside the run tree.
-export function nodePathOf(projectDir, dir) {
-  const root = runsRoot(projectDir);
-  const d = path.resolve(dir);
-  if (d === root) return ROOT;
-  const rel = path.relative(root, d);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) return null;
-  return rel.split(path.sep).join("/");
-}
-
+// nodePath: "(root)" | "auth" | "auth/deeper" (forward-slash, relative to
+// the tree root).
 export function parentNodePath(nodePath) {
   if (!nodePath || nodePath === ROOT) return null;
   const parts = String(nodePath).split("/").filter(Boolean);
@@ -75,53 +62,33 @@ export function childName(nodePath) {
   return parts.length ? parts[parts.length - 1] : null;
 }
 
-// ---------- v0.27.0 layout — sub-runs as projects ---------------------------
-// The v2 node file lives in the node's OWN project dot dir (root and
+// ---------- layout — sub-runs as projects (the only shape) ------------------
+// The node file lives in the node's OWN project dot dir (root and
 // sub-projects alike) and travels with the folder. The parent's registry
 // (children: [{name, dir}]) maps a node name → dir relative to the parent
-// project. A node's windows are always <project>/.pi-supervisor/runs/run-N
-// (legacy: inside the node folder under runs/).
+// project. A node's windows are always <project>/.pi-supervisor/runs/run-N.
 
 export function supNodePath(projectDir) { return path.join(supRoot(projectDir), "node.json"); }
 
-// "v2" | "legacy" — decided per project root (plan §2): the v2 node file wins,
-// then a legacy runs/node.json marks a v0.26 tree, and a fresh project is v2.
-export function modeOf(projectDir) {
-  if (fs.existsSync(supNodePath(projectDir))) return "v2";
-  if (fs.existsSync(path.join(runsRoot(projectDir), "node.json"))) return "legacy";
-  return "v2";
-}
-
 /**
- * Resolve a node to its project dir.
- *   v2: registry walk from rootProject (the root node → rootProject itself).
- *   legacy: the old nodeDir derivation.
- * Returns { dir, entry, stale, mode }. dir is null when the node is unknown
- * (no registry entry) or STALE (entry exists, its dir is gone — a move-out).
+ * Resolve a node to its project dir: registry walk from rootProject (the
+ * root node → rootProject itself). Returns { dir, entry, stale } — dir is
+ * null when the node is unknown (no registry entry) or STALE (entry exists,
+ * its dir is gone — a move-out).
  */
 export function projectOfNode(rootProject, nodePath) {
   const full = !nodePath || nodePath === ROOT ? ROOT : nodePath;
-  const mode = modeOf(rootProject);
-  // legacy: the root node IS the runs/ folder itself; v2: the project dir.
-  if (full === ROOT) {
-    return mode === "legacy"
-      ? { dir: nodeDir(rootProject, ROOT), entry: null, stale: false, mode }
-      : { dir: rootProject, entry: null, stale: false, mode };
-  }
-  if (mode === "legacy") {
-    const d = nodeDir(rootProject, full);
-    return { dir: fs.existsSync(d) ? d : null, entry: null, stale: false, mode };
-  }
+  if (full === ROOT) return { dir: rootProject, entry: null, stale: false };
   let dir = rootProject;
   let entry = null;
   for (const part of full.split("/").filter(Boolean)) {
     const nj = readJson(supNodePath(dir)) || {};
     entry = (Array.isArray(nj.children) ? nj.children : []).find((c) => c && c.name === part) || null;
-    if (!entry) return { dir: null, entry: null, stale: false, mode };
+    if (!entry) return { dir: null, entry: null, stale: false };
     dir = path.join(dir, String(entry.dir));
   }
   const exists = fs.existsSync(dir);
-  return { dir: exists ? dir : null, entry, stale: !exists, mode };
+  return { dir: exists ? dir : null, entry, stale: !exists };
 }
 
 // Inverse of projectOfNode (v2): which node path resolves to projectDir.
@@ -131,7 +98,6 @@ export function projectOfNode(rootProject, nodePath) {
 export function nodePathOfProject(rootProject, projectDir) {
   const target = path.resolve(projectDir);
   if (path.resolve(rootProject) === target) return ROOT;
-  if (modeOf(rootProject) === "legacy") return null;
   const queue = [[rootProject, ROOT]];
   let guard = 0;
   while (queue.length && guard++ < 10000) {
@@ -175,28 +141,23 @@ export function nestedParent(projectDir) {
   return null;
 }
 
-// ---------- mode-aware node file locations ----------------------------------
-// The node's node.json — v2: in the node's project dot dir; legacy: in the
-// node folder under runs/. null when the node resolves to nothing.
+// ---------- node file locations ---------------------------------------------
+// The node's node.json — in the node's project dot dir. null when the node
+// resolves to nothing.
 export function nodeJsonAt(rootProject, nodePath) {
-  const { dir, mode } = projectOfNode(rootProject, nodePath);
-  if (mode === "legacy") return nodeJsonPath(nodeDir(rootProject, nodePath));
+  const { dir } = projectOfNode(rootProject, nodePath);
   return dir ? supNodePath(dir) : null;
 }
 
-// The window home within the node — v2: <project>/.pi-supervisor/runs;
-// legacy: the node folder itself.
+// The window home within the node: <project>/.pi-supervisor/runs.
 export function nodeRunsDir(rootProject, nodePath) {
-  const { dir, mode } = projectOfNode(rootProject, nodePath);
-  if (mode === "legacy") return nodeDir(rootProject, nodePath);
+  const { dir } = projectOfNode(rootProject, nodePath);
   return dir ? path.join(supRoot(dir), "runs") : null;
 }
 
-// STATE.md — v2: the project root (uniform for root and sub-projects);
-// legacy: the node folder.
+// STATE.md — the project root (uniform for root and sub-projects).
 export function stateFileOf(rootProject, nodePath) {
-  const { dir, mode } = projectOfNode(rootProject, nodePath);
-  if (mode === "legacy") return path.join(nodeDir(rootProject, nodePath), "STATE.md");
+  const { dir } = projectOfNode(rootProject, nodePath);
   return dir ? path.join(dir, "STATE.md") : null;
 }
 
@@ -249,64 +210,6 @@ export function ensureStateMdAt(p, name) {
     "- next: (none yet)",
     "",
   ].join("\n"));
-}
-
-function ensureStateMd(dir, name) {
-  ensureStateMdAt(path.join(dir, "STATE.md"), name);
-}
-
-/**
- * Join-or-create a node. A name that exists under the same parent IS that
- * node — this never creates a second one. Materializes the folder, node.json
- * (deadline taken only at creation — invariant afterwards) and STATE.md, and
- * registers the child under its parent's children list (parents materialized
- * lazily up to the root).
- *
- * Returns { node, dir, created, joined }. Throws on an invalid name.
- * Caller: hold the lock (ensureNode writes).
- */
-export function ensureNode(projectDir, nodePath, { deadline = null, state = "active" } = {}) {
-  const full = !nodePath || nodePath === ROOT ? ROOT : nodePath;
-  if (full !== ROOT) { // the root node is the one name that needs no validation
-    for (const part of full.split("/").filter(Boolean)) {
-      const v = validNodeName(part);
-      if (!v.ok) throw new Error(v.why);
-    }
-  }
-  const dir = nodeDir(projectDir, full);
-  fs.mkdirSync(dir, { recursive: true });
-  const p = nodeJsonPath(dir);
-  let nj = readJson(p);
-  const created = !nj;
-  if (created) {
-    nj = {
-      v: 1,
-      name: full === ROOT ? ROOT : childName(full),
-      parent: parentNodePath(full),
-      deadline: deadline ? String(deadline) : null,
-      state,
-      children: [],
-      createdAt: new Date().toISOString(),
-    };
-    writeJson(p, nj);
-  } else if (!nj.deadline && deadline) {
-    // adopt a deadline only while the node has none (the invariant is "the
-    // node holds the sub-project deadline" — once set, it does not move)
-    nj.deadline = String(deadline);
-    writeJson(p, nj);
-  }
-  ensureStateMd(dir, nj.name);
-  const pp = parentNodePath(full);
-  if (pp) {
-    const pnj = ensureNode(projectDir, pp, {}).node;
-    if (!Array.isArray(pnj.children)) pnj.children = [];
-    const nm = childName(full);
-    if (!pnj.children.includes(nm)) {
-      pnj.children.push(nm);
-      writeJson(nodeJsonPath(nodeDir(projectDir, pp)), pnj);
-    }
-  }
-  return { node: readJson(p), dir, created, joined: !created };
 }
 
 // ---------- v2 materialization + the parent registry ------------------------
@@ -399,25 +302,11 @@ export function newestWindow(dir) {
   return w.length ? w[w.length - 1] : null;
 }
 
-/**
- * Allocate the next free window in a node: max(run-N) + 1 — never reuses a
- * number, and an unharvested window dir counts as occupied (it exists).
- * Caller: hold the lock.
- */
-export function allocWindow(projectDir, nodePath, { deadline = null } = {}) {
-  ensureNode(projectDir, nodePath, { deadline });
-  const dir = nodeDir(projectDir, nodePath);
-  const n = listWindows(dir).reduce((m, w) => Math.max(m, Number(w.slice(4))), 0);
-  const name = `run-${n + 1}`;
-  const wdir = path.join(dir, name);
-  fs.mkdirSync(wdir, { recursive: true });
-  return { window: name, dir: wdir, nodeDir: dir, nodePath: nodePath || ROOT };
-}
-
-// The next free window in an explicit runs dir (v2: <project>/.pi-supervisor/
+// The next free window in an explicit runs dir (<project>/.pi-supervisor/
 // runs/ — the node is already materialized, and the alloc runs under the
-// sub-project's own lock nested under the root lock — plan §3). Same
-// never-reuse rule as allocWindow.
+// sub-project's own lock nested under the root lock — plan §3): max(run-N) +
+// 1, never reusing a number; an unharvested window dir counts as occupied
+// (it exists). Caller: hold the lock.
 export function allocWindowIn(runsDir) {
   fs.mkdirSync(runsDir, { recursive: true });
   const n = listWindows(runsDir).reduce((m, w) => Math.max(m, Number(w.slice(4))), 0);
@@ -446,10 +335,9 @@ export function liveWindowIn(dir) {
 // True when the node already has a live window — "do NOT relaunch into the
 // same tree".
 export function nodeBusy(rootProject, nodePath) {
-  const { dir, mode } = projectOfNode(rootProject, nodePath);
+  const { dir } = projectOfNode(rootProject, nodePath);
   if (!dir) return false;
-  const runs = mode === "legacy" ? dir : path.join(supRoot(dir), "runs");
-  return liveWindowIn(runs) !== null;
+  return liveWindowIn(path.join(supRoot(dir), "runs")) !== null;
 }
 
 // ---------- active slot -----------------------------------------------------
@@ -513,7 +401,7 @@ export function windowBudget({ nodeDeadline = null, runtimeMin = null, now = new
  */
 export function nodeState(rootProject, nodePath) {
   const full = nodePath || ROOT;
-  const { dir, mode, entry } = projectOfNode(rootProject, full);
+  const { dir, entry } = projectOfNode(rootProject, full);
   if (!dir) {
     // Unknown, or a registry entry whose dir is gone (the DETACHED row).
     return {
@@ -530,8 +418,8 @@ export function nodeState(rootProject, nodePath) {
       detached: entry?.detached ?? null,
     };
   }
-  const runs = mode === "legacy" ? dir : path.join(supRoot(dir), "runs");
-  const nj = mode === "legacy" ? readJson(nodeJsonPath(dir)) : readJson(supNodePath(dir));
+  const runs = path.join(supRoot(dir), "runs");
+  const nj = readJson(supNodePath(dir));
   const live = liveWindowIn(runs);
   let state;
   if (live) state = "active";
