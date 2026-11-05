@@ -239,7 +239,12 @@ function ensureGitConfig(user, dirs) {
     if (!d || !fs.existsSync(d)) continue;
     const have = sudoAs(user, `git config --global --get-all safe.directory 2>/dev/null | grep -Fxq ${sq(d)}`, atRoot);
     if (have.code === 0) continue;
-    r = sudoAs(user, `git config --global safe.directory ${sq(d)}`, atRoot);
+    // --add, not a plain write: a plain `git config key value` refuses when
+    // the key already holds multiple values ("cannot overwrite multiple
+    // values with a single value") — hit on 2026-11-05 (TestProject run).
+    // The `have` check above guarantees d is new, so --add can never
+    // duplicate.
+    r = sudoAs(user, `git config --global --add safe.directory ${sq(d)}`, atRoot);
     if (r.code !== 0) return { ok: false, detail: `git safe.directory ${d}: ${r.err}` };
     added.push(d);
   }
