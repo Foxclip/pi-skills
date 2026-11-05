@@ -993,5 +993,56 @@ run({
   }
 }
 
+// sticky-abortedByMe regression: the self-fork's LATE settle is consumed
+// (skipped) after the re-prompt. The "expecting my own settle" state must not
+// survive that consumption — a LATER external abort (host repetition guard;
+// the fake's abortSettled) must take the external-abort recovery path. Pre-fix
+// abortedByMe stayed true, the external settle was mis-skipped as "late", and
+// recovery happened only via L0 (wrong fork reason; no "aborted mid-run by the host").
+run({
+  name: "external abort after a self-fork takes the external-abort path (sticky abortedByMe)",
+  args: [TASK, "--turn-stall", "1"],
+  phases: [
+    [say("t1"), { pauseMs: 1500 }, { abortSettled: true }], // turn 1: L0 aborts at ~1s; this settle is the LATE one
+    [say("t2"), { pauseMs: 700 }, { abortSettled: true }], // turn 2: host abort at ~t2+0.7 (before L0 at ~t2+1.0)
+    done("Recovered from the external abort."),
+  ],
+  expect: ["L0 turn-stall", "aborted mid-run by the host", "L2 fork #2", "\"status\":\"completed\""],
+  assertFiles: [{ path: "pi-child-progress.log", expect: ["late — the aborted turn"] }],
+});
+
+// openCalls-clear regression: a tool call in flight when the guard forks belongs
+// to the dead turn. Its START was already logged, but it must not leak into the
+// new attempt's state: the fork clears openCalls and the stale end (whose ID
+// matches nothing) is DROPPED instead of paired + recorded. Pre-fix the start
+// stayed in openCalls → the stale end paired → phantom bash entry in the
+// manifest's recentToolCalls.
+{
+  const r = run({
+    name: "fork clears openCalls: the aborted turn's stale tool end is dropped (not recorded)",
+    args: [TASK, "--turn-stall", "1"],
+    phases: [
+      [
+        { msg: [{ toolCall: "bash", args: { cmd: "long-job" } }] }, // in flight when L0 forks at ~1s
+        { pauseMs: 1500 },
+        { toolEnd: { result: "STALE-RES", durationMs: 1500 } }, // stale end after the fork
+      ],
+      [say("t2"), { pauseMs: 800 }, { settled: {} }], // turn 2 settles normally before its L0
+    ],
+    expect: ["L0 turn-stall", "L2 fork #1", "\"status\":\"completed\""],
+  });
+  let okm = false;
+  try {
+    const m = JSON.parse(readFileSync(join(r.dir, "pi-child-result.json"), "utf8"));
+    const rc = m?.result?.recentToolCalls ?? [];
+    okm = rc.length === 0;
+  } catch { okm = false; }
+  if (okm) { passCount++; console.log("PASS: fork clears openCalls (no stale tool in manifest)"); }
+  else {
+    failCount++;
+    console.log("FAIL: fork clears openCalls (no stale tool in manifest)");
+  }
+}
+
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);
 process.exit(failCount === 0 ? 0 : 1);
