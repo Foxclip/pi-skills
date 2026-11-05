@@ -132,6 +132,27 @@ setTimeout(() => {}, 300000);
   c = asUser(TEST_USER, `cd / && test -f $HOME/.gitconfig && git config --global user.name`);
   ok(c.out.includes(TEST_USER), "child git identity configured");
 
+  // ---- S2b: safe.directory multi-value regression ----------------------------
+  // (2026-11-05, TestProject) The child's global config already held multiple
+  // safe.directory values; ensureGitConfig then wrote a plain single value,
+  // which git refuses when the key has multiple values ("cannot overwrite
+  // multiple values with a single value") — every protected run for a NEW
+  // project hard-failed in preflight. The write must be `git config --add`
+  // (the have-check above guarantees the value is new, so no duplicates).
+  {
+    const safeA = path.join(SB, "safe-a"), safeB = path.join(SB, "safe-b");
+    fs.mkdirSync(safeA, { recursive: true });
+    fs.mkdirSync(safeB, { recursive: true });
+    asUser(TEST_USER, `cd / && git config --global --unset-all safe.directory 2>/dev/null; git config --global --add safe.directory ${sq(safeA)} && git config --global --add safe.directory ${sq(safeB)}`);
+    const g0 = asUser(TEST_USER, `cd / && git config --global --get-all safe.directory 2>/dev/null | wc -l`);
+    ok(g0.out.trim() === "2", "fixture: multi-value safe.directory (2 values, project absent)");
+    r = sh(NODE, [PROTECT, ...applyArgs()]);
+    let a3 = j(r.out);
+    ok(a3.ok === true, `apply with multi-value safe.directory ok (${a3.error || ""})`);
+    const g1 = asUser(TEST_USER, `cd / && git config --global --get-all safe.directory | grep -Fx ${sq(proj)} | wc -l`);
+    ok(g1.out.trim() === "1", "project dir appended to multi-value safe.directory exactly once");
+  }
+
   // ---- S3: kernel protection holds -----------------------------------------
   console.log("S3: kernel protection");
   c = asUser(TEST_USER, `rm -rf ${sq(proj)}/.pi-supervisor; echo rc=$?`);
