@@ -1176,10 +1176,12 @@ function handleEvent(ev) {
     if (toolDepth > 0) toolDepth--;
     // run32 2026-11-05: LIFO pop mispairs args/results when tools run in
     // parallel (start A, start B, end A, end B → end A paired with B). pi's
-    // events carry toolCallId; pair by ID, LIFO fallback when absent.
-    const c =
-      (ev.toolCallId ? openCalls.find((o) => o.callId === ev.toolCallId) : undefined) ??
-      (openCalls.length > 0 ? openCalls[openCalls.length - 1] : undefined);
+    // events carry toolCallId; pair by ID. An end whose ID matches nothing
+    // belongs to a dead (forked/aborted) turn — drop it; the LIFO fallback is
+    // only for legacy events carrying no ID.
+    const c = ev.toolCallId
+      ? openCalls.find((o) => o.callId === ev.toolCallId)
+      : openCalls.length > 0 ? openCalls[openCalls.length - 1] : undefined;
     if (c) openCalls.splice(openCalls.indexOf(c), 1);
     if (c) {
       c.isError = !!ev.isError;
@@ -1258,6 +1260,7 @@ async function doFork(reason) {
   abortedByMe = true;
   selfAbortAt = Date.now(); // the aborted turn's settle lands after the re-prompt below
   toolDepth = 0;
+  openCalls.length = 0; // the aborted turn's in-flight calls are dead — don't leak them into this attempt's manifest
   resetAttemptCounters();
   steersThisAttempt = 0;
   sensorHold = null;
@@ -1320,6 +1323,7 @@ async function doRewind(reason) {
   abortedByMe = true;
   selfAbortAt = Date.now(); // the aborted turn's settle lands after the re-prompt below
   toolDepth = 0;
+  openCalls.length = 0; // the aborted turn's in-flight calls are dead — don't leak them into this attempt's manifest
   resetAttemptCounters();
   steersThisAttempt = 0;
   sensorHold = null;
@@ -1868,6 +1872,12 @@ try {
         // — run32's 90% budget warning was dropped exactly this way).
         if (ev.aborted && abortedByMe && turnActive && selfAbortAt > 0 && turnStartAt >= selfAbortAt) {
           plog(`[settled] ${new Date().toISOString()} aborted=yes (late — the aborted turn; current turn preserved)\n`);
+          // One self-abort produces exactly one settle — this is it, so the
+          // "expecting my own settle" state must not survive the skip: a
+          // LATER external abort (host repetition guard) would otherwise be
+          // misclassified as late and skipped until the idle/L0 sensors fired.
+          abortedByMe = false;
+          selfAbortAt = 0;
           continue;
         }
         turnActive = false; // the turn is over — prompt() is safe again
