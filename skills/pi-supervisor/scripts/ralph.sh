@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.27.0: run a supervised child with zero arguments.
+# ralph.sh — v0.28.0: run a supervised child with zero arguments.
+# (v0.28.0 = sub-runs as projects is the ONLY layout — the v0.26 runs/ node-folder
+#  shape is removed; a rejected spawn escalates the node to blocked/halted, never
+#  a silent idle; the spawn budget is validated before any side effect)
 # (v0.27.0 = sub-runs as projects: a NESTED sub-project refuses FRESH launches
 #  — its windows are launched by the parent tree's chain step; attach/stop/
 #  repair on its own run tree are unchanged; spawn is refused up front in a
@@ -677,8 +680,8 @@ if [ $# -ge 1 ]; then
   fi
   RALPH_MODE=attach   # the banner prints before the monitor starts
   MONITOR_ARGS=(--run-dir "$RUN_DIR" "${ralph_flags[@]}" "${EXTRA[@]}")
-  if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/node.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
-    SUBRUNS_ATTACH_TREE=1   # v0.26.0: sub-runs project → the tree banner is the view (v0.27.0: also the v2 node.json)
+  if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/node.json" ]; then
+    SUBRUNS_ATTACH_TREE=1   # sub-runs project → the tree banner is the view
   fi
 fi
 
@@ -773,12 +776,9 @@ AJEOF
     fi
     # v0.27.0 (plan §4 S0): a FRESH launch materializes the v2 root node (the
     # dot-dir node.json) so the FIRST spawn lands as a sub-project with a
-    # registry entry — otherwise the first chain step would see a legacy
-    # shape and materialize the v0.26 root in runs/. Idempotent; and only
-    # when no legacy v0.26 root exists (runs/node.json — those trees stay
-    # legacy, "finish in place", plan §8). Best effort: a failed materialize
-    # never blocks the launch (the chain step re-derives).
-    if [ ! -f "$PROJECT_DIR/.pi-supervisor/node.json" ] && [ ! -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
+    # registry entry. Idempotent. Best effort: a failed materialize never
+    # blocks the launch (the chain step re-derives).
+    if [ ! -f "$PROJECT_DIR/.pi-supervisor/node.json" ]; then
       node --input-type=module -e '
 const { ensureRootNode } = await import(process.argv[1]);
 let dl = process.argv[3] || null;
@@ -873,8 +873,8 @@ try { ensureRootNode(process.argv[2], { deadline: dl }); } catch {}
       [ -n "$iso" ] && DEADLINE_EPOCH="$iso"
     fi
     RALPH_MODE=attach
-    if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/node.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/runs/node.json" ]; then
-      SUBRUNS_ATTACH_TREE=1   # v0.26.0: sub-runs project → the tree banner is the view (v0.27.0: also the v2 node.json)
+    if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/node.json" ]; then
+      SUBRUNS_ATTACH_TREE=1   # sub-runs project → the tree banner is the view
     fi
     if [ -n "$PI_PROTECT_USER" ]; then
       ralph_flags+=(--pi "$HERE/lib/pi-as-child.sh")
