@@ -16,6 +16,9 @@
 // Signal contract: SIGTERM/SIGINT on us → forwarded (as the child user, via
 // sudo kill, and as the owner for the owner-owned group leader) to the child
 // process group, then we exit with the conventional code.
+//
+// v0.29.0: before the spawn we sync the child home's pi package clone from the
+// owner's canonical repo (lib/child-package.mjs) — best effort, offline-detect.
 
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -28,10 +31,30 @@ if (!user || !realCli) {
 }
 
 const args = process.argv.slice(2);
+
+// v0.29.0: sync the child user's pi package clone from the owner's canonical
+// repo before every spawn, so the child runs (out of the CHILD home) the exact
+// committed code the orchestrator runs. Best effort — a failure never blocks
+// the launch (pi's own online session-start check then covers the clone).
+// A VERIFIED sync flips PI_OFFLINE=1 so pi's start-up check cannot re-align
+// the clone to the remote mid-run (crosses the sudo env_reset via env_keep).
+let childEnv = process.env;
+try {
+  const { syncChildPackage } = await import("./child-package.mjs");
+  const r = syncChildPackage({ user, log: (s) => console.error("child-package: " + s) });
+  if (r.ok) {
+    childEnv = { ...process.env, PI_OFFLINE: "1" };
+  } else if (r.reason) {
+    console.error("child-package: " + r.reason);
+  }
+} catch (e) {
+  console.error("child-package: " + (e && e.message ? e.message : e));
+}
+
 const child = spawn(
   "sudo",
   ["-n", "-u", user, process.execPath, realCli, ...args],
-  { stdio: "inherit", detached: true }
+  { stdio: "inherit", detached: true, env: childEnv }
 );
 
 // Record the child's process-group pid + user so stop.mjs can signal and

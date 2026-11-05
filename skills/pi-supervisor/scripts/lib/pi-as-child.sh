@@ -17,4 +17,7 @@ if [ -z "$abs" ]; then
   exit 69
 fi
 bindir="$(dirname "$abs")"
-exec sudo -n -u "$u" /bin/sh -c "export PATH=\"$bindir\":\$PATH; exec \"$abs\" \"\$@\"" _ "$@"
+# v0.29.0: PI_OFFLINE=1 — the child home's pi package clone is synced from the
+# owner's canonical repo at session start (child-package.mjs); keep pi's own
+# session-start package check from re-aligning it to the remote mid-run.
+exec sudo -n -u "$u" /bin/sh -c "export PATH=\"$bindir\":\$PATH; export PI_OFFLINE=1; exec \"$abs\" \"\$@\"" _ "$@"

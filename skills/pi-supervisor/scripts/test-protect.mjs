@@ -191,6 +191,13 @@ setTimeout(() => {}, 300000);
   console.log("S5: env_keep");
   c = sh("sudo", ["-n", "-u", TEST_USER, "/bin/sh", "-c", "echo v=$PI_SUP_CHILD"], { env: { ...process.env, PI_SUP_CHILD: "1" } });
   ok(c.out.trim() === "v=1", "PI_SUP_CHILD crosses sudo (env_keep)");
+  // v0.29.0: PI_OFFLINE must cross too (child-wrapper sets it after a verified
+  // child package sync so pi's own session-start check stays off).
+  c = sh("sudo", ["-n", "-u", TEST_USER, "/bin/sh", "-c", "echo v=$PI_OFFLINE"], { env: { ...process.env, PI_OFFLINE: "1" } });
+  ok(c.out.trim() === "v=1", "PI_OFFLINE crosses sudo (env_keep)");
+  let dp0 = sh("sudo", ["-n", "cat", dropin]).out;
+  ok(/\/usr\/bin\/git \*|\/usr\/local\/bin\/git \*|\/bin\/git \*/.test(dp0), "drop-in Cmnd_Alias includes the git binary (child package sync)");
+  ok(dp0.includes("PI_OFFLINE"), "drop-in env_keep lists PI_OFFLINE");
 
   // ---- S5b: --sudo grant (opt-in child root) --------------------------------
   console.log("S5b: --sudo");
