@@ -59,18 +59,20 @@ export function syncChildPackage(opts = {}) {
   const { user, ownerRepo, target: targetOpt, asUser, log = () => {} } = opts;
   const notOk = (reason, extra = {}) => Object.assign({ ok: false, offline: false, reason }, extra);
   if (!user) return notOk("no user");
+  // getent, not os.userInfo(): Node's passwd lookup returned the CALLER's
+  // homedir for an existing user on this host (pichild → /home/foxclip),
+  // which would silently sync the wrong directory. getent is the pattern
+  // protect.mjs already trusts (homeOf).
+  const pw = sh("getent", ["passwd", user]);
+  const fields = pw.code === 0 ? pw.out.trim().split(":") : [];
+  const childHome = fields.length > 5 ? fields[5] : null;
+  if (!childHome) return notOk(`no such user (getent): ${user}`);
+
   const ownerRepoPath = path.resolve(ownerRepo || process.env.PI_SUP_OWNER_PKG || deriveOwnerRepo());
   if (!fs.existsSync(path.join(ownerRepoPath, ".git"))) return notOk(`owner repo is not a git worktree: ${ownerRepoPath}`);
   const owner = sh("git", ["-C", ownerRepoPath, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
   if (owner.code !== 0 || !owner.out.trim()) return notOk(`cannot read owner HEAD in ${ownerRepoPath}: ${owner.out.trim()}`);
   const ownerHead = owner.out.trim();
-
-  let childHome;
-  try {
-    childHome = os.userInfo({ username: user }).homedir;
-  } catch {
-    return notOk(`no such user: ${user}`);
-  }
   const ownerHome = os.userInfo().homedir;
   const target = path.resolve(
     targetOpt ||
@@ -87,14 +89,18 @@ export function syncChildPackage(opts = {}) {
     return notOk(`cannot run git as '${user}' (no passwordless root) — the child's pi will self-sync online at start`);
   }
 
-  if (!fs.existsSync(path.join(target, ".git"))) {
-    try {
-      fs.mkdirSync(path.dirname(target), { recursive: true });
-    } catch {
-      /* fall through to clone failure below */
-    }
+  // The existence probe must run AS THE CHILD — the owner process cannot see
+  // into a 700 child home (fs.existsSync would say "missing" and the clone
+  // into the non-empty dir would then fail on the child side).
+  const probe = run("sh", ["-c", `[ -d "${target}/.git" ] && echo repo || { [ -e "${target}" ] && echo exists || echo missing; }`], []);
+  const probeState = probe.code === 0 ? probe.out.trim().split("\n").pop() : "";
+  if (probeState === "missing") {
+    const mk = run("sh", ["-c", `mkdir -p "${path.dirname(target)}"`], []);
+    if (mk.code !== 0) return notOk(`mkdir -p ${path.dirname(target)} failed as '${user}'`);
     const clone = run("git", ["clone", "--quiet", ownerRepoPath, target]);
     if (clone.code !== 0) return notOk(`clone failed: ${clone.out.trim().slice(0, 200)}`);
+  } else if (probeState !== "repo") {
+    return notOk(`target exists but is not a git repo (a pi install in progress?): ${target}`);
   }
   const headNow = git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], target);
   if (headNow.code !== 0 || !headNow.out.trim()) return notOk(`target is not a git worktree: ${target}`);
