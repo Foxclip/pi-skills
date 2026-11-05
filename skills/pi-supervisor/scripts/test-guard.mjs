@@ -53,6 +53,8 @@ class RpcClient {
     this.abortCalls = 0;
     this.steers = [];
     this.prompts = [];
+    this.tcSeq = 0;
+    this.openToolIds = [];
   }
   onEvent(cb) { this.handlers.push(cb); }
   emit(ev) { for (const h of this.handlers) h(ev); }
@@ -112,14 +114,22 @@ class RpcClient {
           this.emit({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: b.text } });
         }
         if (b.toolCall !== undefined) {
-          blocks.push({ type: "toolCall", id: "tc-" + Math.random().toString(36).slice(2), name: b.toolCall, arguments: b.args });
-          this.emit({ type: "tool_execution_start", toolName: b.toolCall, args: b.args ?? {} });
+          // Deterministic ids (tc-1, tc-2, ...) so a script can reference the
+          // id in a later toolEnd item; toolCallId is carried on both events,
+          // like pi's real tool_execution_start/end.
+          const tcId = "tc-" + ++this.tcSeq;
+          blocks.push({ type: "toolCall", id: tcId, name: b.toolCall, arguments: b.args });
+          this.openToolIds.push(tcId);
+          this.emit({ type: "tool_execution_start", toolCallId: tcId, toolName: b.toolCall, args: b.args ?? {} });
         }
       }
       const last = this.entries[this.entries.length - 1];
       this.entries.push({ type: "message", id: "asst-" + this.entries.length, parentId: last ? last.id : null, message: { role: "assistant", content: blocks } });
     } else if (ev.toolEnd) {
-      this.emit({ type: "tool_execution_end", isError: !!ev.toolEnd.isError, durationMs: ev.toolEnd.durationMs ?? 5, result: ev.toolEnd.result ?? "ok" });
+      // toolEnd.id (optional): end a specific open call (parallel-tool
+      // scripts); default: LIFO (calls end in reverse start order).
+      const tcId = ev.toolEnd.id ?? this.openToolIds.pop();
+      this.emit({ type: "tool_execution_end", toolCallId: tcId, isError: !!ev.toolEnd.isError, durationMs: ev.toolEnd.durationMs ?? 5, result: ev.toolEnd.result ?? "ok" });
     } else if (ev.writeFile) {
       wfs(ev.writeFile, "artifact\\n", "utf8");
     } else if (ev.settled) {
@@ -927,6 +937,61 @@ run({
     { path: "pi-test-prompts.txt", expect: ["===PROMPT===", "===STEER===", TASK] },
   ],
 });
+
+// run32 2026-11-05 07:19Z: the settle of the turn the guard itself aborted
+// (L0 → L2 fork) is ALWAYS consumed AFTER the fork's re-prompt (the event
+// loop is suspended while doFork re-prompts). The old settle handler cleared
+// turnActive anyway — the re-prompted turn went unsupervised (L0 blind) and
+// the second turn-stall never fired. With the late-settle guard the second
+// fork fires and the run completes. Pre-fix, this run hangs (no settle ever
+// lands for the live turn) and fails on the harness timeout.
+run({
+  name: "late settle of aborted turn does not desync turn tracking (run32 07:19Z regression)",
+  args: [TASK, "--turn-stall", "1"],
+  phases: [
+    [say("degenerate"), { pauseMs: 1500 }, { abortSettled: true }],
+    [say("degenerate again"), { pauseMs: 1500 }, { abortSettled: true }],
+    done("Recovery complete."),
+  ],
+  expect: ["L0 turn-stall", "L2 fork #1", "L2 fork #2", "\"status\":\"completed\""],
+  assertFiles: [
+    { path: "pi-child-progress.log", expect: ["late — the aborted turn"] },
+  ],
+});
+
+// run32 2026-11-05: the manifest's recentToolCalls was args/result-mispaired
+// for parallel tool calls (the open-calls stack was popped LIFO). pi's events
+// carry toolCallId — pair by ID. Pre-fix, bash carried fetch's result.
+{
+  const r = run({
+    name: "parallel tool calls: recentToolCalls paired by toolCallId (run32 regression)",
+    args: [TASK],
+    phases: [
+      [
+        { msg: [{ toolCall: "bash", args: { cmd: "ls" } }, { toolCall: "fetch_content", args: { url: "u" } }] },
+        { toolEnd: { id: "tc-1", result: "RES-A", durationMs: 7 } },
+        { toolEnd: { id: "tc-2", result: "RES-B", durationMs: 9 } },
+        ...done("Done with both."),
+      ],
+    ],
+    expect: ["\"status\":\"completed\""],
+  });
+  let okm = false;
+  try {
+    const m = JSON.parse(readFileSync(join(r.dir, "pi-child-result.json"), "utf8"));
+    const rc = m?.result?.recentToolCalls ?? [];
+    const bash = rc.find((c) => c.tool === "bash");
+    const fetch = rc.find((c) => c.tool === "fetch_content");
+    okm =
+      bash?.callId === "tc-1" && bash?.args.includes('"cmd":"ls"') && bash?.result === "RES-A" &&
+      fetch?.callId === "tc-2" && fetch?.args.includes('"url":"u"') && fetch?.result === "RES-B";
+  } catch { okm = false; }
+  if (okm) { passCount++; console.log("PASS: recentToolCalls pairing fields"); }
+  else {
+    failCount++;
+    console.log("FAIL: recentToolCalls pairing fields");
+  }
+}
 
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);
 process.exit(failCount === 0 ? 0 : 1);
