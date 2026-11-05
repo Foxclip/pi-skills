@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# ralph.sh — v0.29.2: run a supervised child with zero arguments.
+# ralph.sh — v0.29.3: run a supervised child with zero arguments.
+# (v0.29.3 = run35 fix: the S0 gate used to call ensureRootNode ONLY when
+#  node.json was missing, so the v0.29.2 past-deadline refresh was dead code
+#  on a re-run of an existing tree — the root kept its past invariant, the
+#  chain's re-entry halted, and the tree stayed frozen. The call now runs on
+#  EVERY fresh launch and a refreshed root is unblocked (blocked → active))
 # (v0.29.2 = run34 spawn-budget fixes: an infeasible spawn request is rejected
 #  with NO partial state (the launch's exact sizeDeadline rule is enforced
 #  before the sub-project scaffolding exists, and in launchWindow for every
@@ -840,15 +845,22 @@ AJEOF
     # dot-dir node.json) so the FIRST spawn lands as a sub-project with a
     # registry entry. Idempotent. Best effort: a failed materialize never
     # blocks the launch (the chain step re-derives).
-    if [ ! -f "$PROJECT_DIR/.pi-supervisor/node.json" ]; then
-      node --input-type=module -e '
+    # v0.29.3 (run35): the call now runs on EVERY fresh launch, not only when
+    # node.json is missing — the old [ ! -f ] guard made the v0.29.2 past-
+    # deadline refresh (ensureRootNode's existing-node branch) unreachable in
+    # the common case: a re-run of a stalled tree kept its past invariant and
+    # the chain's re-entry into the root halted. ensureRootNode is join-or-
+    # create, so the existing node is exactly the case to reach. The launch
+    # deadline passes through in whatever form it is (ISO | HH:MM | epoch),
+    # is normalized to ISO here, and unparseable input degrades to a plain
+    # materialize (no deadline adopted).
+    node --input-type=module -e '
 const { ensureRootNode } = await import(process.argv[1]);
-let dl = process.argv[3] || null;
-if (dl && /^\d+$/.test(dl)) dl = new Date(Number(dl) * 1000).toISOString();
-else if (dl && !/\d{4}-\d{2}-\d{2}T/.test(dl)) dl = null; // HH:MM — leave for the chain step
-try { ensureRootNode(process.argv[2], { deadline: dl }); } catch {}
-' "file://$HERE/lib/node.mjs" "$PROJECT_DIR" "${DEADLINE_EPOCH:-}" 2>/dev/null || true
-    fi
+const { parseDeadline } = await import(process.argv[2]);
+let dl = process.argv[4] || null;
+if (dl) { const p = parseDeadline(dl); dl = p.ok ? p.ts.toISOString() : null; }
+try { ensureRootNode(process.argv[3], { deadline: dl }); } catch {}
+' "file://$HERE/lib/node.mjs" "file://$HERE/lib/deadline.mjs" "$PROJECT_DIR" "${DEADLINE_EPOCH:-}" 2>/dev/null || true
     mkdir -p "$RUNROOT"
     n=0
     for d in "$RUNROOT"/run*; do
