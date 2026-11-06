@@ -15,6 +15,8 @@
 //
 // Asserts (per the plan): node tree, STATE.md trails, spawn decisions,
 // INDEX.json, the active.json lifecycle, idempotent re-step.
+// v0.30.0: the re-entry RESUMES root's pre-spawn session (launch-args
+// carry --session, the brief is the resume hand-off, not bookkeeping).
 //
 // Run:  node test-e2e.mjs [--keep]
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -46,6 +48,7 @@ const dl = Number(get("--deadline"));
 fs.writeFileSync(path.join(out, "launch-args.json"), JSON.stringify({
   taskFile: get("--task-file"), node, deadline: get("--deadline"),
   idleTimeout: get("--idle-timeout"), turnStall: get("--turn-stall"), finalize: get("--finalize"),
+  session: get("--session"),
 }, null, 2));
 const s = spawn("sleep", ["300"], { detached: true, stdio: "ignore" }); s.unref();
 fs.writeFileSync(path.join(out, "pi-child-status.json"), JSON.stringify({
@@ -107,6 +110,15 @@ function endChild(wdir, { request = null, report = null } = {}) {
 const wa1 = M.allocWindowIn(runs);
 const w1 = wa1.window; const w1d = path.join(runs, w1);
 launch(w1d, M.ROOT, "ROOT_TASK_BODY — parent's work; spawn the auth sub-project when ready.", Math.floor(Date.now() / 1000) + 7200);
+// v0.30.0: simulate the guard recording this window's session file (small —
+// under the resume gate), so the re-entry after auth has something to resume.
+const sessRoot1 = path.join(w1d, "pi-child-session.jsonl");
+writeFileSync(sessRoot1, JSON.stringify({ type: "message", role: "assistant", content: "root run-1 session marker" }) + "\n");
+{
+  const st = jread(path.join(w1d, "pi-child-status.json"));
+  st.sessionFile = sessRoot1; st.sessionId = "e2e-root-run-1";
+  writeFileSync(path.join(w1d, "pi-child-status.json"), JSON.stringify(st, null, 2));
+}
 endChild(w1d, {
   request: { kind: "spawn", node: "auth", task: taskFile, deadline: DL_AUTH },
   report: "Parent window 1: paused to spawn auth. Parent work so far recorded in STATE.md.",
@@ -137,6 +149,10 @@ const step2 = await step(proj, authW1, CFG);
 const rootW2 = path.join(runs, "run-2");
 const reentryBrief = existsSync(path.join(rootW2, "TASK.md")) ? readFileSync(path.join(rootW2, "TASK.md"), "utf8") : "";
 r("W2 step → reentry root/run-2", step2?.outcome?.next === "reentry" && step2.outcome.node_path === M.ROOT && step2.outcome.window === "run-2" && step2.outcome.run_dir === rootW2, JSON.stringify(step2?.outcome ?? step2));
+const reLaunch = jread(path.join(rootW2, "launch-args.json"));
+r("W2 re-entry RESUMED root's pre-spawn session (v0.30.0)", reLaunch?.session === sessRoot1, JSON.stringify(reLaunch || null).slice(0, 160));
+r("W2 re-entry brief is the resume hand-off (full context, no bookkeeping-only rule)", reentryBrief.includes("RE-ENTRY (resume)") && reentryBrief.includes("RESUMES your own session") && !reentryBrief.includes("BOOKKEEPING"), reentryBrief.split("\n")[0] || "(missing)");
+r("W2 outcome flags resumed (v0.30.0)", step2?.outcome?.resumed === true, JSON.stringify(step2?.outcome ?? {}));
 r("W2 re-entry brief embeds auth's FINAL-REPORT (AUTH-GOAL-MET)", reentryBrief.includes("# RE-ENTRY") && reentryBrief.includes("AUTH-GOAL-MET") && /child node `auth` has ended \(state: done\)/.test(reentryBrief), reentryBrief.split("\n").slice(0, 4).join(" | ").slice(0, 160));
 r("W2 re-entry brief embeds the spawn decision that launched auth", reentryBrief.includes('"node_path": "auth"') && reentryBrief.includes('"window": "run-1"'), (reentryBrief.match(/spawn decision[\s\S]{0,120}/) || ["(no decision section)"])[0].slice(0, 160));
 const authNode2 = jread(path.join(authDir, ".pi-supervisor", "node.json"));
