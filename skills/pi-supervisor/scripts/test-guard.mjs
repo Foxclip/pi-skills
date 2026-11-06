@@ -55,6 +55,7 @@ class RpcClient {
     this.prompts = [];
     this.tcSeq = 0;
     this.openToolIds = [];
+    try { wfs("pi-test-args.json", JSON.stringify(opts.args)); } catch {}
   }
   onEvent(cb) { this.handlers.push(cb); }
   emit(ev) { for (const h of this.handlers) h(ev); }
@@ -232,6 +233,19 @@ const tool = (name, args, isError = false) => [
 const think = (t) => ({ msg: [{ thinking: t }] });
 const say = (t) => ({ msg: [{ text: t }] });
 const done = (t = "Done.") => [say(t), { settled: {} }];
+
+// 0. v0.30.0 P2: --session passthrough — the chain's resume launch passes the
+// guard --session <sessionFile>; the guard must hand pi --session (the resume
+// flag), not --session-id (that would start a FRESH session with the same ID).
+run({
+  name: "v0.30.0: --session passthrough reaches pi as --session (resume)",
+  args: [TASK, "--session", "/tmp/chain-resume-session.jsonl"],
+  phases: [done("Done. Report written to report.md.")],
+  expect: ["\"status\":\"completed\""],
+  assertFiles: [
+    { path: "pi-test-args.json", expect: ["--session", "/tmp/chain-resume-session.jsonl"] },
+  ],
+});
 
 // 1. External abort (host repetition guard) → L2 fork → completed
 run({

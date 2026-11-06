@@ -53,7 +53,7 @@ try {
 } catch { /* best effort */ }
 console.log(JSON.stringify({ launched: true, pid: s.pid }));
 `);
-const { step, reentry, appendTolerant } = await import(pathToFileURL(path.join(S, "lib", "chain.mjs")).href);
+const { step, reentry, appendTolerant, sessionGate } = await import(pathToFileURL(path.join(S, "lib", "chain.mjs")).href);
 const { allocWindowIn, readNode, activePath, ensureRootNode, registerChild } = await import(pathToFileURL(path.join(S, "lib", "node.mjs")).href);
 const readJsonFile = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
 
@@ -594,6 +594,103 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T17 step completed despite 0444 STATE.md", r.outcome?.next === "idle", JSON.stringify(r.outcome));
   ok("T17 step appended to 0444 STATE.md", /completed/i.test(fs.readFileSync(stf, "utf8")), JSON.stringify(fs.readFileSync(stf, "utf8").slice(-200)));
   fs.chmodSync(stf, 0o644); // let the summary cleanup run clean
+}
+
+// ============ T18 — v0.30.0 P2/P4: continuation RESUMES the window's session
+{
+  const p = mkproj("t18-cont-resume");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
+  const sess = path.join(T, "sess-t18.jsonl");
+  fs.writeFileSync(sess, JSON.stringify({ t: 1 }) + "\n");
+  mkWindow(p, "run-1", { status: "completed", exitReason: "hard-timeout", deadlineIso: ISO(Date.now() - 5000), sessionFile: sess, sessionId: "t18" });
+  const r = await step(p, R(p, "run-1"), CFG);
+  ok("T18 continuation launched", r.outcome?.next === "continuation" && r.outcome?.window === "run-2", JSON.stringify(r.outcome));
+  const args = fs.readFileSync(R(p, "run-2/launch-args.txt"), "utf8");
+  ok("T18 --session passed through", args.includes(`--session ${sess}`), args);
+  const brief = fs.readFileSync(R(p, "run-2/TASK.md"), "utf8");
+  ok("T18 resume brief (nudge, not handoff)", brief.includes("CONTINUATION (resume)") && brief.includes("RESUMES that session"), brief.slice(0, 200));
+  ok("T18 outcome flags resume", r.outcome?.resumed === true, JSON.stringify(r.outcome));
+}
+
+// ============ T19 — v0.30.0 P4: over the gate → fresh session + handoff brief
+{
+  const p = mkproj("t19-cont-gate");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
+  const sess = path.join(T, "sess-t19.jsonl");
+  fs.writeFileSync(sess, "x".repeat(3_500_000)); // > 3MB default threshold
+  mkWindow(p, "run-1", { status: "completed", exitReason: "hard-timeout", deadlineIso: ISO(Date.now() - 5000), sessionFile: sess });
+  const r = await step(p, R(p, "run-1"), CFG);
+  ok("T19 continuation still launched", r.outcome?.next === "continuation", JSON.stringify(r.outcome));
+  const args = fs.readFileSync(R(p, "run-2/launch-args.txt"), "utf8");
+  ok("T19 NO --session over the gate", !args.includes("--session"), args);
+  const brief = fs.readFileSync(R(p, "run-2/TASK.md"), "utf8");
+  ok("T19 fresh handoff brief stands", brief.includes("CONTINUATION") && !brief.includes("(resume)") && brief.includes("Previous window's final report"), brief.slice(0, 160));
+  ok("T19 outcome flags fresh", r.outcome?.resumed === false, JSON.stringify(r.outcome));
+}
+
+// ============ T20 — v0.30.0 P3: re-entry RESUMES the parent's pre-spawn session
+{
+  const p = mkproj("t20-reentry-resume");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  mkNode(p, "auth", { deadline: ISO(inMin(90)) });
+  const sess = path.join(T, "sess-t20.jsonl");
+  fs.writeFileSync(sess, JSON.stringify({ t: 2 }) + "\n");
+  const rw = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized", sessionFile: sess });
+  fs.writeFileSync(path.join(rw, "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run-1" }));
+  fs.mkdirSync(path.join(NR(p, "auth"), "run-1"), { recursive: true });
+  fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  const r = await step(p, path.join(NR(p, "auth"), "run-1"), CFG);
+  ok("T20 reentry launched", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
+  const args = fs.readFileSync(R(p, "run-2/launch-args.txt"), "utf8");
+  ok("T20 --session = parent's pre-spawn session", args.includes(`--session ${sess}`), args);
+  const brief = fs.readFileSync(R(p, "run-2/TASK.md"), "utf8");
+  ok("T20 resume brief: full context, no bookkeeping-only rule", brief.includes("RE-ENTRY (resume)") && brief.includes("RESUMES your own session") && !brief.includes("BOOKKEEPING"), brief.slice(0, 220));
+  ok("T20 child report + spawn decision still embedded", brief.includes("Child's final report") && brief.includes('"node_path": "auth"'), brief.slice(0, 120));
+  ok("T20 outcome flags resume", r.outcome?.resumed === true, JSON.stringify(r.outcome));
+  ok("T20 STATE.md line says resumed", /resumed session/.test(fs.readFileSync(path.join(p, "STATE.md"), "utf8")), fs.readFileSync(path.join(p, "STATE.md"), "utf8").trim().split("\n").slice(-1)[0]);
+}
+
+// ============ T21 — v0.30.0 P3: re-entry FRESH (no session recorded)
+{
+  const p = mkproj("t21-reentry-fresh");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  mkNode(p, "auth", { deadline: ISO(inMin(90)) });
+  mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" }); // no sessionFile
+  fs.mkdirSync(path.join(NR(p, "auth"), "run-1"), { recursive: true });
+  fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  const r = await step(p, path.join(NR(p, "auth"), "run-1"), CFG);
+  ok("T21 reentry launched", r.outcome?.next === "reentry", JSON.stringify(r.outcome));
+  const args = fs.readFileSync(R(p, "run-2/launch-args.txt"), "utf8");
+  ok("T21 NO --session (nothing to resume)", !args.includes("--session"), args);
+  const brief = fs.readFileSync(R(p, "run-2/TASK.md"), "utf8");
+  ok("T21 bookkeeping brief stands", brief.includes("RE-ENTRY") && brief.includes("BOOKKEEPING"), brief.slice(0, 160));
+  ok("T21 outcome flags fresh", r.outcome?.resumed === false, JSON.stringify(r.outcome));
+}
+
+// ============ T22 — v0.30.0 P2: sessionGate unit cases
+{
+  const p = mkproj("t22-gate");
+  const small = path.join(T, "sess-t22.jsonl");
+  fs.writeFileSync(small, "x".repeat(1000));
+  const big = path.join(T, "sess-t22-big.jsonl");
+  fs.writeFileSync(big, "x".repeat(4 * 1048576));
+  const g0 = sessionGate(path.join(p, "none"), CFG);
+  ok("T22 no status → fresh", g0.resume === false && /no session recorded/.test(g0.why), JSON.stringify(g0));
+  const w1 = mkWindow(p, "run-1", { sessionFile: small, sessionId: "id1" });
+  const g1 = sessionGate(w1, CFG);
+  ok("T22 small sessionFile → resume (path preferred over ID)", g1.resume === true && g1.ref === small, JSON.stringify(g1));
+  mkWindow(p, "run-2", { sessionFile: big });
+  const g2 = sessionGate(path.join(p, ".pi-supervisor", "runs", "run-2"), CFG);
+  ok("T22 over threshold → fresh", g2.resume === false && /threshold/.test(g2.why), JSON.stringify(g2));
+  mkWindow(p, "run-3", { sessionId: "bare-id" });
+  const g3 = sessionGate(path.join(p, ".pi-supervisor", "runs", "run-3"), CFG);
+  ok("T22 bare sessionId (unsizable) → fresh", g3.resume === false && /not a file path/.test(g3.why), JSON.stringify(g3));
+  mkWindow(p, "run-4", { sessionFile: path.join(p, "gone.jsonl") });
+  const g4 = sessionGate(path.join(p, ".pi-supervisor", "runs", "run-4"), CFG);
+  ok("T22 unreadable session → fresh", g4.resume === false && /unreadable/.test(g4.why), JSON.stringify(g4));
+  mkWindow(p, "run-5", { sessionFile: small });
+  const g5 = sessionGate(path.join(p, ".pi-supervisor", "runs", "run-5"), { launch: { ...CFG.launch, overflowThresholdMb: 1 } });
+  ok("T22 threshold configurable (1MB → small file now passes)", g5.resume === true, JSON.stringify(g5));
 }
 
 // ---------- summary ----------
