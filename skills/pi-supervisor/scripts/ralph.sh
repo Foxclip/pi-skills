@@ -589,6 +589,18 @@ harvest() { # $1=run-dir $2=interrupted(0|1) $3=monitor exit code (best effort)
 # drowned the terminal, and the paths it carries are already on the lines
 # before and after. Digest: outcome, how, and whether guard + child are
 # confirmed dead.
+# v0.30.1: an explicit user stop is USER INTENT — record it on the run dir
+# before the group kill, so the chain step classifies the window "stopped"
+# (halt, no auto-next) instead of misreading the graceful kill's terminal
+# status "error/killed-SIGTERM" as an abnormal end (blocked + "human
+# attention needed"). Only user paths write the marker: this script's signal
+# trap (Ctrl-C) and the `stop` subcommand. A guard SIGKILL, an external kill
+# or a reboot leaves no marker and still classifies as blocked.
+mark_user_stop() { # $1=run-dir; $2=source
+  local d="${1:-}" src="${2:-stop}"
+  [ -n "$d" ] || return 0
+  printf '{"ts":"%s","source":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$src" > "$d/user-stop.json" 2>/dev/null || true
+}
 stop_and_report() { # $1=run-dir; remaining args → stop.mjs (e.g. --force)
   local d="$1"; shift
   local out rc=0 line
@@ -676,6 +688,7 @@ if [ "${1:-}" = "stop" ]; then
       return 0
     fi
     saye "${C_D}·${C_N} stopping $d"
+    mark_user_stop "$d" "stop-cmd"
     stop_and_report "$d" "${STOP_ARGS[@]}" || rc=$?
     node "$HERE/lib/harvest.mjs" "$d" 0 "$rc" 2>/dev/null || true
     saye "${C_G}✓${C_N} preserved — report: $d/RUN-REPORT.md"
@@ -792,7 +805,13 @@ if [ "$ATTACHED" -eq 0 ]; then
     elif [ -n "$aj_dir" ] && [ -d "$aj_dir" ] && [ -f "$aj_dir/pi-child-status.json" ] && [ ! -f "$aj_dir/chain-done.json" ]; then
       saye "${C_Y}!${C_N} $(basename "$aj_dir") ended without its chain step (reboot/crash?) — running the missing step"
       AJ_REPAIRED=1
-      node --input-type=module -e 'const { step } = await import(process.argv[1]); await step(process.argv[2], process.argv[3]);' "file://$HERE/lib/chain.mjs" "$PROJECT_DIR" "$aj_dir" \
+      # v0.30.1: repair: true — this step runs AFTER the guard is gone (the
+      # window is dead), so the repair classification table applies (stale
+      # running / dead status = user stop or reboot → "stopped"). Before the
+      # flag, the S0 call ran the guard-driven table, where a graceful
+      # Ctrl-C kill ("error/killed-SIGTERM") misread as "blocked" + "human
+      # attention needed" — the opposite of the §5.3 table's user-stop row.
+      node --input-type=module -e 'const { step } = await import(process.argv[1]); await step(process.argv[2], process.argv[3], { repair: true });' "file://$HERE/lib/chain.mjs" "$PROJECT_DIR" "$aj_dir" \
         || saye "${C_Y}!${C_N} repair step failed — the window is preserved; re-run to retry"
       if [ -f "$aj_dir/chain-done.json" ]; then
         # The record NESTS the outcome: {v, at, kind, outcome:{next, reason?,
@@ -826,9 +845,15 @@ AJEOF
   if [ -z "$RUN_DIR" ]; then
     if [ "$AJ_REPAIRED" -eq 1 ]; then
       node "$HERE/lib/node.mjs" tree "$PROJECT_DIR"
+      # v0.30.1: a repaired halt is reported, never a refusal. Principle
+      # (Launch): a human re-run ALWAYS starts a new run (or attaches if a
+      # run is live) — a launch is never blocked by state. The halt stays on
+      # disk (node.json, STATE.md, chain.log, chain-done.json); this launch
+      # proceeds to the fresh allocation below, where ensureRootNode
+      # (unblock: true) flips a halted root back to active.
       case "$AJ_NEXT" in
-        idle) saye "${C_G}✓${C_N} the chain finished — root node done (windows under .pi-supervisor/runs/)"; exit 0 ;;
-        *)    saye "${C_R}✗${C_N} the chain is not running — last step: ${AJ_OUTCOME:-no outcome recorded} (inspect .pi-supervisor/runs/)"; exit 1 ;;
+        idle) saye "${C_Y}!${C_N} the chain finished before this launch — root node done (windows under .pi-supervisor/runs/); starting a new run of the project" ;;
+        *)    saye "${C_Y}!${C_N} the chain halted before this launch — last step: ${AJ_OUTCOME:-no outcome recorded} (on disk: .pi-supervisor/runs/ + chain.log); the re-run starts a new run — that is the attention the halt was waiting for" ;;
       esac
     fi
     # v0.27.0 (plan §5): a NESTED sub-project never gets a FRESH launch — its
@@ -859,7 +884,7 @@ const { ensureRootNode } = await import(process.argv[1]);
 const { parseDeadline } = await import(process.argv[2]);
 let dl = process.argv[4] || null;
 if (dl) { const p = parseDeadline(dl); dl = p.ok ? p.ts.toISOString() : null; }
-try { ensureRootNode(process.argv[3], { deadline: dl }); } catch {}
+try { ensureRootNode(process.argv[3], { deadline: dl, unblock: true }); } catch {}
 ' "file://$HERE/lib/node.mjs" "file://$HERE/lib/deadline.mjs" "$PROJECT_DIR" "${DEADLINE_EPOCH:-}" 2>/dev/null || true
     mkdir -p "$RUNROOT"
     n=0
@@ -1017,7 +1042,10 @@ stop_for_signal() { # $1 = exit code (130 INT / 143 TERM)
     wait "$MON_PID" 2>/dev/null || true   # reap it
   fi
   if [ -n "${RUN_DIR:-}" ] && [ -f "$RUN_DIR/pi-child-status.json" ]; then
+    local sig
+    case "$1" in 130) sig=SIGINT ;; *) sig=SIGTERM ;; esac
     saye "${C_Y}!${C_N} stopping the run — guard + child (graceful, escalating to SIGKILL)"
+    mark_user_stop "$RUN_DIR" "$sig"
     stop_and_report "$RUN_DIR" || true
   fi
   exit "$1"

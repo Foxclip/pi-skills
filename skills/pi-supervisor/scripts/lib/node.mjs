@@ -216,7 +216,7 @@ export function ensureStateMdAt(p, name) {
 // Lazily materialize the ROOT node (v2): node.json in the project's dot dir,
 // STATE.md at the project root. Deadline is adopted only while unset (the
 // invariant: once set, it does not move). Caller: hold the project lock.
-export function ensureRootNode(projectDir, { deadline = null, state = "active" } = {}) {
+export function ensureRootNode(projectDir, { deadline = null, state = "active", unblock = false } = {}) {
   const p = supNodePath(projectDir);
   let nj = readJson(p);
   const created = !nj;
@@ -232,7 +232,7 @@ export function ensureRootNode(projectDir, { deadline = null, state = "active" }
       createdAt: new Date().toISOString(),
     };
     writeJson(p, nj);
-  } else if (deadline) {
+  } else {
     // v0.29.2 (run34): a PAST invariant deadline can only reject — every
     // spawn from this node inherits it and dies in windowBudget, and a plain
     // re-run of the project used to freeze the whole spawn tree. A fresh
@@ -242,12 +242,22 @@ export function ensureRootNode(projectDir, { deadline = null, state = "active" }
     // chain halt is waiting for exactly this human attention (a fresh
     // launch); leaving it blocked contradicts the launch. (State is an
     // informational marker; the functional freeze was the past deadline.)
-    const fresh = parseDeadline(String(deadline));
+    // v0.30.1: unblock decoupled from the refresh — a fresh launch unblocks
+    // a blocked root even when the deadline must not move (the v0.29.3
+    // rationale "the fresh launch IS the human attention" no longer rides on
+    // a deadline being past). The chain step's materialization call
+    // (ensureRootNode(dir, {})) passes neither deadline nor unblock, so it
+    // never touches state.
+    const fresh = deadline ? parseDeadline(String(deadline)) : null;
     const old = nj.deadline ? parseDeadline(nj.deadline) : null;
-    if (!nj.deadline
+    const refresh = Boolean(deadline) && (
+      !nj.deadline
       || (fresh.ok && fresh.ts.getTime() > Date.now()
-      && (!old.ok || old.ts.getTime() <= Date.now()))) {
-      nj.deadline = String(deadline);
+      && (!old.ok || old.ts.getTime() <= Date.now())));
+    // both HALT classes wait for the same human attention (blocked = abnormal
+    // end, stopped = user stop) — a fresh launch is that attention for both
+    if (refresh || (unblock && ["blocked", "stopped"].includes(nj.state))) {
+      if (refresh) nj.deadline = String(deadline);
       nj.state = "active";
       writeJson(p, nj);
     }

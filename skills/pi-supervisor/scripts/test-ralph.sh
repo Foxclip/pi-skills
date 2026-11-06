@@ -346,10 +346,15 @@ grep -q -- "--sudo" $T/S9.log && ok "S9b: --help documents --sudo" || bad "S9b: 
 # every judgment spawn died at EACCES and the monitor was blind for the whole run)
 [ -x "$T/sandbox/scripts/lib/pi-as-child.sh" ] && ok "S10: lib/pi-as-child.sh is executable" || bad "S10: lib/pi-as-child.sh missing or not executable (run27 regression)"
 
-# S11: zero-arg attach to a run that ended WITHOUT its chain step (the repair
-# path, run27): the missing step() must run, AND its outcome must be read from
-# chain-done.json's NESTED .outcome — status_field only reads top-level keys,
-# so "no outcome recorded" is the regression signal.
+# S11: zero-arg re-run after a run that ended WITHOUT its chain step (the
+# repair path, run27): the missing step() must run, AND its outcome must be
+# read from chain-done.json's NESTED .outcome — status_field only reads
+# top-level keys, so "no outcome recorded" is the regression signal.
+# v0.30.1: the repaired halt is reported, NEVER a refusal — the launch
+# principle (a human re-run always starts a new run) outranks the gate: the
+# re-run proceeds to a FRESH allocation (run2), the halted root is unblocked
+# (unblock: true), and `ralph.sh stop` on the new run records user intent
+# (user-stop.json) so the chain step classifies it "stopped", not "blocked".
 mkdir -p $T/projS11/.pi-supervisor/runs/run1
 echo "# Test task" > $T/projS11/TASK.md
 cat > $T/projS11/.pi-supervisor/active.json <<EOF
@@ -359,8 +364,8 @@ cat > $T/projS11/.pi-supervisor/runs/run1/pi-child-status.json <<EOF
 {"v":2,"at":"2026-11-04T00:00:01.000Z","status":"error","exitReason":"S11 test exit reason","guardPid":null,"childPid":null,"attempt":1,"rewinds":0,"toolCalls":0,"lastTool":null,"lastToolStartedAt":null,"elapsedMs":0,"deadlineIso":"2026-11-04T01:00:00.000Z"}
 EOF
 cd $T/projS11
-PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh > $T/S11.log 2>&1
-S11RC=$?
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh > $T/S11.log 2>&1 &
+sleep 6
 grep -q "ended without its chain step" $T/S11.log \
   && ok "S11: missing chain step detected — repair step ran" || bad "S11: $(tail -3 $T/S11.log)"
 [ -f $T/projS11/.pi-supervisor/runs/run1/chain-done.json ] \
@@ -369,8 +374,21 @@ grep -q "ended without its chain step" $T/S11.log \
   || bad "S11: chain-done $(cat $T/projS11/.pi-supervisor/runs/run1/chain-done.json 2>/dev/null)"
 grep -q "last step: halted" $T/S11.log && ! grep -q "no outcome recorded" $T/S11.log \
   && ok "S11: outcome read from nested .outcome (not 'no outcome recorded')" \
-  || bad "S11: $(grep -F 'chain is not running' $T/S11.log || tail -3 $T/S11.log)"
-[ "$S11RC" -eq 1 ] && ok "S11: halted chain → exit 1" || bad "S11: rc=$S11RC"
+  || bad "S11: $(grep -F 'halted before this launch' $T/S11.log || tail -3 $T/S11.log)"
+# v0.30.1: no exit — the re-run proceeds to a fresh allocation
+[ -f $T/projS11/.pi-supervisor/runs/run2/pi-child-status.json ] \
+  && ok "S11: the re-run proceeded — run2 allocated + launched (no refusal)" \
+  || bad "S11: run2 missing — gate exited before allocation? $(tail -5 $T/S11.log)"
+grep -q "run2" $T/projS11/.pi-supervisor/active.json 2>/dev/null \
+  && ok "S11: active.json re-pointed to run2" \
+  || bad "S11: active.json: $(cat $T/projS11/.pi-supervisor/active.json 2>/dev/null)"
+ST11=$(node -e 'try{console.log(require("./.pi-supervisor/node.json").state)}catch{console.log("?")}' 2>/dev/null)
+[ "$ST11" = "active" ] && ok "S11: the halted root is unblocked by the fresh launch" || bad "S11: node state='$ST11' want active"
+stoprun $T/projS11 > $T/S11.stop 2>&1
+sleep 1
+[ -f $T/projS11/.pi-supervisor/runs/run2/user-stop.json ] \
+  && ok "S11: ralph.sh stop recorded user intent (user-stop.json)" \
+  || bad "S11: no user-stop.json: $(ls $T/projS11/.pi-supervisor/runs/run2/ 2>/dev/null | tr '\n' ' ')"
 
 # ---- v0.27.0: nested sub-project launch refusal + detached spawn refusal --------
 # S12: a FRESH zero-arg launch inside a NESTED sub-project must refuse — its
@@ -466,7 +484,9 @@ ST17=$(node -e 'try{console.log(require("./.pi-supervisor/node.json").state)}cat
 stoprun $T/projS17 > $T/S17.stop 2>&1
 
 # S17b: a FUTURE invariant never moves — a launch deadline earlier than the
-# existing one leaves node.json untouched.
+# existing one leaves the deadline untouched (v0.30.1: the fresh launch's
+# unblock: true still flips the halted state — the invariant is the deadline,
+# not the halt marker).
 mkproj $T/projS17b && cd $T/projS17b
 mkdir -p .pi-supervisor/runs/run-1
 INV17B=$(date -u -d '+3 hours' '+%Y-%m-%dT%H:%M:%SZ')
@@ -477,6 +497,9 @@ sleep 4
 ND17B=$(node -e 'try{console.log(require("./.pi-supervisor/node.json").deadline)}catch{console.log("")}' 2>/dev/null)
 [ "$ND17B" = "$INV17B" ] && ok "S17b: a future invariant is never moved by a launch" \
   || bad "S17b: invariant moved to '$ND17B' want '$INV17B'"
+ST17B=$(node -e 'try{console.log(require("./.pi-supervisor/node.json").state)}catch{console.log("?")}' 2>/dev/null)
+[ "$ST17B" = "active" ] && ok "S17b: the fresh launch still unblocks the halted root (v0.30.1)" \
+  || bad "S17b: state='$ST17B' want active"
 stoprun $T/projS17b > $T/S17b.stop 2>&1
 
 # S17c: an HH:MM launch deadline is normalized to ISO before it touches

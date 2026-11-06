@@ -105,6 +105,16 @@ export function appendTolerant(file, text) {
 //     running/absent status = user stop or reboot → "stopped" (halt; a human
 //     decides whether to continue — never auto-relaunch over user intent).
 export function classifyWindow(projectDir, windowDir, st, hasFinalReport, repair) {
+  // v0.30.1: an explicit user stop (ralph.sh's Ctrl-C trap / the `stop`
+  // subcommand) writes user-stop.json before the group kill. User intent is
+  // not read from the terminal status — a graceful stop leaves
+  // "error/killed-SIGTERM", which the table below would misread as an
+  // abnormal end (blocked + "human attention needed"). The marker wins in
+  // BOTH modes; an external kill has no marker and still classifies below.
+  try {
+    fs.statSync(path.join(windowDir, "user-stop.json"));
+    return "stopped";
+  } catch { /* no user-stop marker — the table below applies */ }
   if (!repair) {
     const o = st?.exitReason;
     if (o === "completed" || o === "completed-finalized" || hasFinalReport) return "completed";

@@ -241,6 +241,28 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T8 no launch", !fs.existsSync(R(p, "run-2")));
 }
 
+// ================= T8b — v0.30.1: a graceful Ctrl-C kill (status error /
+// killed-SIGTERM) + user-stop.json marker → "stopped" (user intent wins) in
+// BOTH call modes; without the marker it still classifies as blocked.
+{
+  const p = mkproj("t8b-userstop");
+  const w = mkWindow(p, "run-1", { status: "error", exitReason: "killed-SIGTERM" });
+  fs.writeFileSync(path.join(w, "user-stop.json"), JSON.stringify({ ts: ISO(Date.now()), source: "SIGINT" }));
+  const r = await step(p, w, { ...CFG, repair: true }); // the S0 gate's call
+  ok("T8b marker → stopped (repair)", r.kind === "stopped" && r.outcome?.next === "halted" && r.outcome?.reason === "stopped", JSON.stringify(r));
+  ok("T8b root stopped", nodeState(p, "(root)") === "stopped");
+  ok("T8b no launch", !fs.existsSync(R(p, "run-2")));
+  const p2 = mkproj("t8b-userstop-nr");
+  const w2 = mkWindow(p2, "run-1", { status: "error", exitReason: "killed-SIGTERM" });
+  fs.writeFileSync(path.join(w2, "user-stop.json"), JSON.stringify({ ts: ISO(Date.now()), source: "SIGINT" }));
+  const r2 = await step(p2, w2, CFG);
+  ok("T8b marker → stopped (guard-driven call too)", r2.kind === "stopped" && r2.outcome?.next === "halted" && r2.outcome?.reason === "stopped", JSON.stringify(r2));
+  const p3 = mkproj("t8b-no-marker");
+  const w3 = mkWindow(p3, "run-1", { status: "error", exitReason: "killed-SIGTERM" });
+  const r3 = await step(p3, w3, CFG);
+  ok("T8b no marker → still blocked (external kill)", r3.kind === "blocked" && r3.outcome?.next === "halted", JSON.stringify(r3));
+}
+
 // ================= T9 — repair with FINAL-REPORT.md → completed transition
 {
   const p = mkproj("t9-repair-done");
