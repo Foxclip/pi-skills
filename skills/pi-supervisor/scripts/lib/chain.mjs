@@ -69,8 +69,32 @@ const HARVEST = path.join(LIB, "harvest.mjs");
 function clog(projectDir, windowDir, line) {
   const ts = new Date().toISOString();
   try {
-    fs.appendFileSync(path.join(windowDir, "chain.log"), `${ts} ${line}\n`);
+    appendTolerant(path.join(windowDir, "chain.log"), `${ts} ${line}\n`);
   } catch { /* best effort — the marker + decision files are the record */ }
+}
+
+// ---------- fs helpers ------------------------------------------------------
+// Append tolerating ownership drift (v0.30.0 P1, run37): if a direct append
+// fails with EACCES/EPERM — e.g. a STATE.md the child's own pi process wrote
+// (run dirs are mkdtemp, pichild-owned, so the files inside can be pichild-
+// owned too) — rename the file aside, rewrite old+new as the caller, unlink
+// the backup. Needs directory write (rename target), not file write, so it
+// works on files we do not own. The rewritten file is caller-owned: the
+// owner keeps taking back what the child touched.
+export function appendTolerant(file, text) {
+  try {
+    fs.appendFileSync(file, text);
+  } catch (err) {
+    if (err && (err.code === "EACCES" || err.code === "EPERM")) {
+      const old = fs.readFileSync(file, "utf8");
+      const bak = `${file}.bak-${Date.now()}-${process.pid}`;
+      fs.renameSync(file, bak);
+      fs.writeFileSync(file, old + text);
+      try { fs.unlinkSync(bak); } catch { /* best effort */ }
+    } else {
+      throw err;
+    }
+  }
 }
 
 // ---------- classification --------------------------------------------------
@@ -214,7 +238,7 @@ function setNodeState(projectDir, nodePath, state) {
 function appendState(projectDir, nodePath, lines) {
   const sp = stateFileOf(projectDir, nodePath);
   if (!sp) return;
-  fs.appendFileSync(sp, "\n" + lines + "\n");
+  appendTolerant(sp, "\n" + lines + "\n");
 }
 
 // Clear the active slot of the tree root AND of the window's own project when
@@ -354,7 +378,7 @@ async function stepStandalone(treeRoot, windowDir, cfg, log) {
     snj.parent = null;
     writeJson(njp, snj);
     ensureStateMdAt(path.join(wproj, "STATE.md"), snj.name || "(root)");
-    fs.appendFileSync(path.join(wproj, "STATE.md"),
+    appendTolerant(path.join(wproj, "STATE.md"),
       `\n- [${new Date().toISOString()}] tree root ${treeRoot} is gone — this project is now STANDALONE (parent demoted to null); its windows are decided by its own chain\n`);
     log(`standalone mode: demoted ${wproj} to parent:null`);
   } else {

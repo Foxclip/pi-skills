@@ -53,7 +53,7 @@ try {
 } catch { /* best effort */ }
 console.log(JSON.stringify({ launched: true, pid: s.pid }));
 `);
-const { step, reentry } = await import(pathToFileURL(path.join(S, "lib", "chain.mjs")).href);
+const { step, reentry, appendTolerant } = await import(pathToFileURL(path.join(S, "lib", "chain.mjs")).href);
 const { allocWindowIn, readNode, activePath, ensureRootNode, registerChild } = await import(pathToFileURL(path.join(S, "lib", "node.mjs")).href);
 const readJsonFile = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
 
@@ -560,6 +560,40 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("S8 db node done", readJsonFile(path.join(dproj, ".pi-supervisor", "node.json"))?.state === "done");
   ok("S8 auth active after re-entry", nodeState(p, "auth") === "active", nodeState(p, "auth"));
   ok("S8 root still paused(waiting:auth)", nodeState(p, "(root)") === "paused(waiting:auth)", nodeState(p, "(root)"));
+}
+
+// ============ T17 — v0.30.0 P1: EACCES-tolerant append (run37 ownership lockout)
+// A STATE.md the child's own pi process wrote is pichild-owned; a plain append
+// fails EACCES and the chain lost its bookkeeping. appendTolerant reclaims the
+// file via rename + rewrite (needs dir write, not file write).
+{
+  const p = mkproj("t17-eacc");
+  const f1 = path.join(p, "plain.log");
+  fs.writeFileSync(f1, "old\n");
+  appendTolerant(f1, "new\n");
+  ok("T17 direct append works", fs.readFileSync(f1, "utf8") === "old\nnew\n");
+
+  // owner read-only file — the test-side shape of a pichild-owned file:
+  // appendFileSync fails EACCES, the rename path must still land the line
+  const f2 = path.join(p, "STATE.md");
+  fs.writeFileSync(f2, "child content\n");
+  fs.chmodSync(f2, 0o444);
+  let threw = null;
+  try { appendTolerant(f2, "chain line\n"); } catch (e) { threw = e; }
+  ok("T17 read-only file: no throw", threw === null, String(threw));
+  const c2 = fs.readFileSync(f2, "utf8");
+  ok("T17 read-only file: old+new content", c2 === "child content\nchain line\n", JSON.stringify(c2));
+  ok("T17 read-only file: backup reclaimed", fs.existsSync(f2) && fs.readdirSync(p).every((f) => !String(f).startsWith("STATE.md.bak-")));
+
+  // integration: step() appends node bookkeeping to a 0444 STATE.md
+  const w = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" });
+  const stf = path.join(p, "STATE.md");
+  fs.writeFileSync(stf, "root state\n");
+  fs.chmodSync(stf, 0o444);
+  const r = await step(p, w, CFG);
+  ok("T17 step completed despite 0444 STATE.md", r.outcome?.next === "idle", JSON.stringify(r.outcome));
+  ok("T17 step appended to 0444 STATE.md", /completed/i.test(fs.readFileSync(stf, "utf8")), JSON.stringify(fs.readFileSync(stf, "utf8").slice(-200)));
+  fs.chmodSync(stf, 0o644); // let the summary cleanup run clean
 }
 
 // ---------- summary ----------
