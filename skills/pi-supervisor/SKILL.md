@@ -20,46 +20,48 @@ If the child's job is fire-and-forget with no ongoing dialogue, `acp_delegate` i
 
 ## Principles — the confirmed model (v0.30.0)
 
+These principles are the **main source of truth** for pi-supervisor. Any contradiction between the principles and the code, or between the principles and any other part of this SKILL.md, is resolved in favor of the principles. The principles may only be modified by an agent when the user asks.
+
 pi-supervisor runs a long, autonomous coding job that never stalls silently, survives crashes, reboots, and the death of its own supervisor, and can branch work into sub-projects — with a human at the boundaries.
 
-### Structure
-- **Project tree.** A root project plus nested sub-projects (sub-folders). Each project has its own task and state. A project can contain **multiple runs** over its life.
-- **Run.** A unit of work within a project. A run **owns a deadline** (invariant — only a fresh human launch moves it) and contains **one or more pi sessions** over its life.
-- **Sub-run.** A run *in a sub-project*, launched — by request through the monitor — by a run in the parent project. A sub-project is a container, not 1:1 with a run: the same session can request any number of runs in the same sub-project.
-- **Session.** The run's conversation with the model. Transcript on disk; the process is disposable. A session is finalized (process exits) and can be resumed.
+### 1. Structure
+- **1.1 Project tree.** A root project plus nested sub-projects (sub-folders). Each project has its own task and state. A project can contain **multiple runs** over its life.
+- **1.2 Run.** A unit of work within a project. A run **owns a deadline** (invariant — only a fresh human launch moves it) and contains **one or more pi sessions** over its life.
+- **1.3 Sub-run.** A run *in a sub-project*, launched — by request through the monitor — by a run in the parent project. A sub-project is a container, not 1:1 with a run: the same session can request any number of runs in the same sub-project.
+- **1.4 Session.** The run's conversation with the model. Transcript on disk; the process is disposable. A session is finalized (process exits) and can be resumed.
 
-### Launch — one primitive, two triggers
+### 2. Launch — one primitive, two triggers
 The only primitive is **starting a run in a project**.
-- A **human** does it directly (`ralph.sh`). A human re-run always starts a *new* run (or attaches if a run is already live).
-- A **run** requests it for a sub-project (a spawn request to the monitor), which performs the launch. Downward only; unlimited; recursive (a sub-run can request its own sub-runs).
-- A **new run of a run's own project** is human-only — a run can never cause the next run of its own project.
+- **2.1** A **human** does it directly (`ralph.sh`). A human re-run always starts a *new* run (or attaches if a run is already live).
+- **2.2** A **run** requests it for a sub-project (a spawn request to the monitor), which performs the launch. Downward only; unlimited; recursive (a sub-run can request its own sub-runs).
+- **2.3** A **new run of a run's own project** is human-only — a run can never cause the next run of its own project.
 
-### Worker rules
-- A run (its session) **launches nothing** — it writes requests.
-- A run works under its deadline.
+### 3. Worker rules
+- **3.1** A run (its session) **launches nothing** — it writes requests.
+- **3.2** A run works under its deadline.
 
-### Supervisor — the point is to keep the run from stalling; two layers
-- **Monitor script** (deterministic, fast) — the easy stalls: thinking loops, exact message repetition, premature stopping; mechanical retry of the request when the model server times out.
-- **Parent** (an LLM judgment, run fresh each cycle) — the generalist: catches what the script can't (inexact/semantic loops, problems with the supervisor itself) and makes the decisions — context rot (distill → new session), continue, nudge/steer, stop, and the final report when work ends.
+### 4. Supervisor — the point is to keep the run from stalling; two layers
+- **4.1 Monitor script** (deterministic, fast) — the easy stalls: thinking loops, exact message repetition, premature stopping; mechanical retry of the request when the model server times out.
+- **4.2 Parent** (an LLM judgment, run fresh each cycle) — the generalist: catches what the script can't (inexact/semantic loops, problems with the supervisor itself) and makes the decisions — context rot (distill → new session), continue, nudge/steer, stop, and the final report when work ends.
 
 The script is the fast reflex; the parent is the judgment. The parent is re-run fresh each cycle with all memory on disk, so a dead model kills one cycle, not the supervision.
 
-### Session lifecycle (within a run)
-- **Re-entry (sub-run hand-back):** the sub-run finishes → its parent side writes the final report → the monitor activates the original session (resumes it) and sends a message into it (the sub-run's final report + spawn decision) → the run continues from its full context.
-- **Continuation (budget):** a process launch's budget is used and the run's deadline hasn't been reached → the run continues in a new launch, resuming the session. Automatic (the ralph loop).
-- **Resume gate (the Box2D rule, kept):** every resume (continuation or re-entry) is gated on the session's size — before resuming, check the session file; if it's above **~50–60% of the model's context window**, do **not** resume — distill instead. (Field rule, 2026-10-19 Box2D: a 7 MB resume stalled at "EMERGENCY 99%"; a fresh distilled session fixed it in 58 min.) Current implementation: the gate is the session file's size against the overflow threshold — the guard's `--overflow-threshold-mb` knob (default 3 MB), the field rule expressed as a size knob rather than a per-model context percentage.
-- **Distill (context rot):** the run continues in a **new session** (same run, same deadline) when the resume gate trips (session > ~50–60% of context window) or the parent judges the context rotted. The state is distilled into a brief for the fresh session. The guard's automatic context-overflow distill is the last-resort safety net.
-- Sessions are always **finalized** (process exits, transcript on disk); continuing = re-activating by resume, never a kept-alive process.
+### 5. Session lifecycle (within a run)
+- **5.1 Re-entry (sub-run hand-back):** the sub-run finishes → its parent side writes the final report → the monitor activates the original session (resumes it) and sends a message into it (the sub-run's final report + spawn decision) → the run continues from its full context.
+- **5.2 Continuation (budget):** a process launch's budget is used and the run's deadline hasn't been reached → the run continues in a new launch, resuming the session. Automatic (the ralph loop).
+- **5.3 Resume gate (the Box2D rule, kept):** every resume (continuation or re-entry) is gated on the session's size — before resuming, check the session file; if it's above **~50–60% of the model's context window**, do **not** resume — distill instead. (Field rule, 2026-10-19 Box2D: a 7 MB resume stalled at "EMERGENCY 99%"; a fresh distilled session fixed it in 58 min.) Current implementation: the gate is the session file's size against the overflow threshold — the guard's `--overflow-threshold-mb` knob (default 3 MB), the field rule expressed as a size knob rather than a per-model context percentage.
+- **5.4 Distill (context rot):** the run continues in a **new session** (same run, same deadline) when the resume gate trips (session > ~50–60% of context window) or the parent judges the context rotted. The state is distilled into a brief for the fresh session. The guard's automatic context-overflow distill is the last-resort safety net.
+- **5.5** Sessions are always **finalized** (process exits, transcript on disk); continuing = re-activating by resume, never a kept-alive process.
 
-### Tree dynamics
-- Exactly **one active run** across the whole tree at a time.
-- The **terminal follows** the active run down the tree (read-only view; several terminals can attach).
-- Steering is separate: the human sends a message to a session, stops a run, or requests a spawn; the parent can nudge a session through the same channel. The display never drives.
+### 6. Tree dynamics
+- **6.1** Exactly **one active run** across the whole tree at a time.
+- **6.2** The **terminal follows** the active run down the tree (read-only view; several terminals can attach).
+- **6.3** Steering is separate: the human sends a message to a session, stops a run, or requests a spawn; the parent can nudge a session through the same channel. The display never drives.
 
-### Durability
-- Everything important is on disk and resumable: transcripts, state, reports, the tree.
-- The supervisor runs as a **separate, replaceable process** — the worker survives the supervisor's own death; a fresh supervisor re-attaches from the on-disk state.
-- The job survives a reboot.
+### 7. Durability
+- **7.1** Everything important is on disk and resumable: transcripts, state, reports, the tree.
+- **7.2** The supervisor runs as a **separate, replaceable process** — the worker survives the supervisor's own death; a fresh supervisor re-attaches from the on-disk state.
+- **7.3** The job survives a reboot.
 
 ## Quickstart — the main mode: `ralph.sh`
 
