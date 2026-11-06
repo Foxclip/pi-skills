@@ -27,7 +27,7 @@
 for (const k of ["PI_SUP_RUN_DIR", "PI_SUP_CHILD", "PI_SUP_PROJECT", "PI_SUP_NODE", "PI_SUP_CHILD_USER"]) delete process.env[k];
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync, readFileSync, mkdirSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -137,6 +137,13 @@ class RpcClient {
       this.emit({ type: "agent_settled", aborted: !!ev.settled.aborted });
     } else if (ev.abortSettled) {
       this.emit({ type: "agent_settled", aborted: true });
+    } else if (ev.errorStop !== undefined) {
+      // v0.30.0 P5b: an assistant message that settled on stopReason "error"
+      // (a provider failure that survived pi's own retries). The message text
+      // is the errorMessage (string) or { errorMessage: ... }.
+      const last = this.entries[this.entries.length - 1];
+      const errText = typeof ev.errorStop === "string" ? ev.errorStop : (ev.errorStop.errorMessage ?? "request failed");
+      this.entries.push({ type: "message", id: "asst-" + this.entries.length, parentId: last ? last.id : null, message: { role: "assistant", content: [], stopReason: "error", errorMessage: errText } });
     }
     // pauseMs is handled by replay() scheduling, not by play()
   }
@@ -158,6 +165,11 @@ class RpcClient {
     return { entries: this.entries, leafId: last ? last.id : null };
   }
   async getLastAssistantText() { return { text: this.lastText }; }
+  async getMessages() {
+    // v0.30.0 P5b: mirrors pi's RPC get_messages (session messages; assistant
+    // messages may carry stopReason/errorMessage — see the errorStop item).
+    return { sessionId: "fake-session", messages: this.entries.filter((e) => e.type === "message").map((e) => e.message) };
+  }
   async stop() {}
 }
 export { RpcClient };
@@ -1057,6 +1069,102 @@ run({
     console.log("FAIL: fork clears openCalls (no stale tool in manifest)");
   }
 }
+
+// ---------------------------------------------------------------------------
+// v0.30.0 P5a: parent-judged context rot. The parent (ralph-monitor's
+// per-cycle judgment) drops parent-distill.json in the out dir; the guard
+// consumes it (rename-aside) and runs the pivot machinery: distilled brief +
+// relaunch record + (with --pivot-relaunch) a fresh-session relay carrying
+// the remaining wall clock.
+// ---------------------------------------------------------------------------
+run({
+  name: "v0.30.0 P5a: parent-distill.json + --pivot-relaunch → relay (fresh session) completes",
+  args: [TASK, "--pivot-relaunch"],
+  phases: [
+    // consumed by the RELAY (its fresh fake client replays phase 0 at start)
+    done("Relay finished from the clean brief."),
+  ],
+  setup: (dir) => writeFileSync(join(dir, "parent-distill.json"), JSON.stringify({
+    v: 1, at: new Date().toISOString(), reason: "child is repeating a refuted premise", source: "parent-judgment", cycle: 3,
+  })),
+  expect: ["PARENT DISTILL", "spawning the relay", '"exitReason":"completed"'],
+  expectNot: ['"exitReason":"parent-distill"'],
+  expectExit: 0,
+  assertFiles: [
+    { path: "pi-child-brief.md", expect: ["ROTTED", "refuted premise", "Original task (verbatim)"] },
+    { path: "pi-child-relaunch.json", expect: ["parent-distill", "--task-file", "--relayed-from"] },
+    { path: "pi-child-result.json", expect: ['"status": "completed"', "relayedFrom"] },
+  ],
+});
+
+{
+  const r = run({
+    name: "v0.30.0 P5a: parent-distill.json without --pivot-relaunch → exit 3, request consumed once",
+    args: [TASK],
+    phases: [],
+    setup: (dir) => writeFileSync(join(dir, "parent-distill.json"), JSON.stringify({ v: 1, reason: "context rotted" })),
+    expect: ["PARENT DISTILL", '"status":"stuck"', '"exitReason":"parent-distill"'],
+    expectExit: 3,
+    assertFiles: [
+      { path: "pi-child-brief.md", expect: ["ROTTED", "context rotted"] },
+      { path: "pi-child-relaunch.json", expect: ["parent-distill"] },
+      { path: "pi-child-result.json", expect: ['"exitReason": "parent-distill"'] },
+    ],
+  });
+  // rename-aside: the request file must be GONE (consumed exactly once),
+  // preserved under a .received-<ts> suffix.
+  const gone = !existsSync(join(r.dir, "parent-distill.json"));
+  let received = false;
+  try {
+    received = readdirSync(r.dir).some((f) => f.startsWith("parent-distill.json.received-"));
+  } catch { received = false; }
+  if (gone && received) { passCount++; console.log("PASS: parent-distill request consumed (rename-aside)"); }
+  else { failCount++; console.log(`FAIL: parent-distill request consumed (gone=${gone}, received=${received})`); }
+}
+
+// ---------------------------------------------------------------------------
+// v0.30.0 P5b: model-server failure at settle. pi retries retryable provider
+// errors itself (backoff); a settle whose last assistant message carries
+// stopReason "error" means those retries were exhausted. The guard then
+// mechanically re-issues the request — transient server classes only (timeout,
+// rate limit, overload, connection); context overflow and deterministic errors
+// are NOT retried (they belong to the distill machinery / the ladder).
+// ---------------------------------------------------------------------------
+run({
+  name: "v0.30.0 P5b: server-timeout settle → mechanical retry → completed",
+  args: [TASK, "--idle-timeout", "2"],
+  phases: [
+    [{ errorStop: "request to the model server timed out after 120000ms" }, { settled: {} }],
+    done("Recovered after the server error."),
+  ],
+  expect: ["P5b error-stop retry 1/3", '"status":"completed"', '"errorRetries":1'],
+  assertFiles: [
+    { path: "pi-child-result.json", expect: ['"errorRetries": 1'] },
+    { path: "pi-child-progress.log", expect: ["[error-retry]"] },
+  ],
+});
+
+run({
+  name: "v0.30.0 P5b: --max-error-retries 0 → no retry, normal classification (degenerate → ladder)",
+  args: [TASK, "--max-error-retries", "0", "--idle-timeout", "1"],
+  phases: [
+    [{ errorStop: "request to the model server timed out after 120000ms" }, { settled: {} }],
+  ],
+  expect: ["degenerate settle"],
+  expectNot: ["P5b error-stop retry"],
+  expectExit: 3,
+});
+
+run({
+  name: "v0.30.0 P5b: context-overflow error is NOT mechanically retried",
+  args: [TASK, "--max-error-retries", "3", "--idle-timeout", "1"],
+  phases: [
+    [{ errorStop: "Context window exceeded: 150000 tokens in a 32768-token window" }, { settled: {} }],
+  ],
+  expect: ["degenerate settle"],
+  expectNot: ["P5b error-stop retry"],
+  expectExit: 3,
+});
 
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);
 process.exit(failCount === 0 ? 0 : 1);

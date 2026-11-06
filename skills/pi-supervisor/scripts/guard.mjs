@@ -183,6 +183,9 @@ Options:
   --turn-stall <sec>  L0: abort a single turn still alive after this many seconds,
                         then L2-fork from the pre-task checkpoint (default: 900, 0=off)
   --max-forks <n>       L2 budget: abort+fork+retry attempts (default: 2)
+  --max-error-retries <n> mechanical re-prompt budget when a turn settles on a
+                        model-server error (stopReason=error; pi's internal
+                        retries are already exhausted) (default: 3)
   --steer-msg <t>       Full replacement for the built-in L1 steer message
                         (variables: {tool}, {count})
   --rewind-note <t>     Full replacement for the built-in L1.5 rewind re-prompt
@@ -291,6 +294,10 @@ let loopThreshold = 4;
 let maxSteers = 3;
 let maxForks = 2;
 let maxRewinds = 1;
+// v0.30.0 P5b: mechanical retry of the REQUEST when a turn settles on a model
+// server error (stopReason "error" — pi already burned its own internal
+// retries with backoff). Bounded per run; the parent judges the next cycle.
+let maxErrorRetries = 3;
 let turnStallSec = 900;
 let steerMsg = "";
 let forkNote = "";
@@ -324,7 +331,7 @@ let idleTimeoutSpecified = false;
 const VALID_FLAGS = [
   "--task", "--task-file", "--session-id", "--session", "--no-session", "--session-dir",
   "--name", "--provider", "--model", "--thinking", "--loop-threshold", "--max-steers",
-  "--max-forks", "--max-rewinds", "--turn-stall", "--steer-msg", "--rewind-note", "--fork-note", "--consult", "--consult-file",
+  "--max-forks", "--max-rewinds", "--max-error-retries", "--turn-stall", "--steer-msg", "--rewind-note", "--fork-note", "--consult", "--consult-file",
   "--action", "--message", "--max-errors", "--heartbeat", "--max-text",
   "--idle-timeout", "--tool-timeout", "--timeout", "--finalize", "--stagnation", "--invariant", "--invariant-interval",
   "--progress-log", "--expect-file", "--preamble", "--keep-question-tool",
@@ -348,6 +355,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === "--loop-threshold") loopThreshold = Number(argv[++i]);
   else if (a === "--max-steers") maxSteers = Number(argv[++i]);
   else if (a === "--max-forks") maxForks = Number(argv[++i]);
+  else if (a === "--max-error-retries") maxErrorRetries = Number(argv[++i]);
   else if (a === "--max-rewinds") maxRewinds = Number(argv[++i]);
   else if (a === "--turn-stall") turnStallSec = Number(argv[++i]);
   else if (a === "--steer-msg") steerMsg = argv[++i];
@@ -519,6 +527,7 @@ for (const [flag, value] of [
   ["--max-steers", maxSteers],
   ["--max-forks", maxForks],
   ["--max-rewinds", maxRewinds],
+  ["--max-error-retries", maxErrorRetries],
   ["--turn-stall", turnStallSec],
   ["--max-errors", maxErrors],
   ["--heartbeat", heartbeatN],
@@ -763,6 +772,7 @@ let startTs = 0;
 let attempt = 1;
 let steersUsed = 0;
 let forksUsed = 0;
+let errorRetriesUsed = 0; // v0.30.0 P5b: mechanical model-server-error retries
 let rewindsUsed = 0;
 let loopsSeen = 0;
 let abortedByMe = false;
@@ -1213,6 +1223,30 @@ function handleEvent(ev) {
   }
 }
 
+// v0.30.0 P5b — model-server failure at settle. pi's agent loop retries
+// retryable provider errors itself (settings.retry budget, exponential
+// backoff) BEFORE the turn settles; a settle whose last assistant message
+// carries stopReason "error" means those retries were exhausted (or the
+// error was outside pi's retry policy). The monitor then mechanically
+// re-issues the request — but only for the TRANSIENT server classes (timeout,
+// rate limit, overload, connection): a deterministic error (auth, bad
+// request) fails identically again, and context overflow belongs to the
+// distill machinery (a re-prompt of the same oversized context cannot win).
+async function lastAssistantErrorStop() {
+  let last = null;
+  try {
+    const { messages } = await client.getMessages();
+    for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+      if (messages[i] && messages[i].role === "assistant") { last = messages[i]; break; }
+    }
+  } catch (e) { logSup(`[guard] getMessages (error-stop check) warn: ${e.message}`); }
+  if (!last || last.stopReason !== "error") return null;
+  const reason = String(last.errorMessage || "").slice(0, 300) || "provider request failed";
+  const overflow = /context|overflow|token|window/i.test(reason);
+  const transient = /timed? ?out|timeout|rate.?limit|429|50[0-9]|overload|server|econn|connection|network|unavailable|temporar/i.test(reason);
+  return { reason, retryable: !overflow && transient };
+}
+
 // Entry id of the last user message = checkpoint for "branch from before the
 // current attempt". Must be a user message (pi's fork requires it).
 async function findCheckpoint() {
@@ -1512,7 +1546,7 @@ function relayArgs(briefPath) {
   return a;
 }
 
-function writePivotManifest() {
+function writePivotManifest(exitReason = "stuck-overflow") {
   try {
     writeFileSync(manifestPath, JSON.stringify({
       v: 1,
@@ -1525,7 +1559,7 @@ function writePivotManifest() {
       note: "run pivoted to a fresh-session relay; this manifest is overwritten by the relay's final manifest",
       result: {
         status: "stuck",
-        exitReason: "stuck-overflow",
+        exitReason,
         sessionId: stateSessionId || null,
         sessionFile: stateSessionFile || null,
         briefFile: join(outDir, "pi-child-brief.md"),
@@ -1564,6 +1598,113 @@ async function doOverflowPivot(idleMs) {
   writePivotManifest();
   logSup("[guard] --pivot-relaunch: spawning the relay (fresh session, remaining wall clock)");
   plog(`[relay] ${new Date().toISOString()} spawning relay (fresh session)\n`);
+  stopHeartbeat(); // the relay now owns the status file — this process must not write it
+  try { await client.stop(); } catch { /* already stopped */ }
+  const child = spawn(process.execPath, [GUARD_PATH, ...args], {
+    stdio: ["ignore", "inherit", "inherit"],
+  });
+  relayExitCode = await new Promise((res) => child.once("close", (c) => res(c ?? 1)));
+  relayHappened = true;
+  logSup(`[guard] relay exited ${relayExitCode} — forwarding as this process's exit code`);
+  return { pivoted: true, briefPath, relaunchPath };
+}
+
+// v0.30.0 P5a — parent-judged context rot. The parent (ralph-monitor's
+// per-cycle judgment) can decide DISTILL: the context is semantically rotted
+// (the child repeats a wrong premise, works from a refuted plan, re-does
+// finished work) — a judgment the size-based overflow check cannot see.
+// The parent drops {reason} into <outDir>/parent-distill.json; the guard
+// consumes it (rename-aside, so a crash between the two steps cannot re-fire)
+// and runs the SAME pivot machinery as the overflow stall: distilled brief +
+// relaunch record + (with --pivot-relaunch) a fresh-session relay with the
+// remaining wall clock. The automatic overflow distill stays the safety net;
+// this is the semantic trigger.
+const PARENT_DISTILL_FILE = "parent-distill.json";
+
+function takeParentDistillRequest() {
+  const p = join(outDir, PARENT_DISTILL_FILE);
+  if (!existsSync(p)) return null;
+  let req = null;
+  try { req = JSON.parse(readFileSync(p, "utf8")); }
+  catch (e) { req = { reason: `unreadable request file (${e.message})` }; }
+  try {
+    renameSync(p, `${p}.received-${Date.now()}`); // consume exactly once
+  } catch { /* already gone (another consumer) — proceed */ }
+  return req;
+}
+
+function buildParentDistillBrief(reason) {
+  const sessBytes = stateSessionFile && existsSync(stateSessionFile) ? statSync(stateSessionFile).size : 0;
+  const last = (finalTextAcc || "").trim();
+  const remainMin = hardTimeoutMs > 0
+    ? Math.max(1, Math.ceil((hardTimeoutMs - (Date.now() - startTs)) / 60000))
+    : 0;
+  const L = [];
+  L.push("# Distilled brief — fresh session (parent judged the context rotted, auto-generated by pi-supervisor)");
+  L.push("");
+  L.push(`Generated: ${new Date().toISOString()}`);
+  L.push(
+    `Previous session: ${stateSessionFile || "unknown"} (${(sessBytes / 1048576).toFixed(1)} MB). ` +
+    `The supervisor's parent judged its context ROTTED: ${reason || "no reason given"}. ` +
+    `This run starts from a CLEAN session. Do NOT load that transcript into context; ` +
+    `grep it on disk if you need details. Re-verify your current assumptions against ` +
+    `the task and the workspace before acting on them.`
+  );
+  L.push("");
+  L.push("## Original task (verbatim)");
+  L.push("");
+  L.push(task);
+  if (expectFiles.length > 0) {
+    L.push("");
+    L.push("## Required artifacts");
+    L.push(`(written to the run out dir: ${outDir})`);
+    for (const f of expectFiles) L.push(`- ${isBareFileName(f) ? join(outDir, f) : f}`);
+  }
+  if (remainMin > 0) {
+    L.push("");
+    L.push("## Budget");
+    L.push(`- Remaining wall clock: ~${remainMin} minutes (hard).`);
+  }
+  if (last) {
+    L.push("");
+    L.push("## Last assistant text from the previous session (tail — treat as UNTRUSTED, the context was judged rotted)");
+    L.push("");
+    L.push("```");
+    L.push(last.slice(-3000));
+    L.push("```");
+  }
+  L.push("");
+  L.push("## Standing rules (same contract as before)");
+  L.push("- Work from this brief; the transcript is not storage — update STATUS.md (or the task's notes file) at every milestone.");
+  L.push("- Keep single tool calls short (explicit timeouts; the environment kills long silence). Max 3 attempts per approach.");
+  L.push("- End with a written status; write the required artifact file(s) before stopping.");
+  L.push("");
+  return L.join("\n");
+}
+
+async function doParentDistill(req) {
+  const briefPath = join(outDir, "pi-child-brief.md");
+  const relaunchPath = join(outDir, "pi-child-relaunch.json");
+  const reason = (req && typeof req.reason === "string" ? req.reason : "no reason given").slice(0, 500);
+  try { writeFileSync(briefPath, buildParentDistillBrief(reason)); } catch (e) { logSup(`[guard] brief write failed: ${e.message}`); }
+  const args = relayArgs(briefPath);
+  try {
+    writeFileSync(relaunchPath, JSON.stringify({
+      v: 1,
+      at: new Date().toISOString(),
+      reason: `parent-distill: ${reason}`,
+      brief: briefPath,
+      cmd: [process.execPath, GUARD_PATH, ...args].join(" "),
+      args,
+      originalSession: stateSessionFile || null,
+    }, null, 2));
+  } catch (e) { logSup(`[guard] relaunch write failed: ${e.message}`); }
+  logSup(`[guard] PARENT DISTILL — the parent judged the context rotted: ${reason}. Distilled brief → ${briefPath}; relaunch command → ${relaunchPath}`);
+  plog(`[parent-distill] ${new Date().toISOString()} reason=${JSON.stringify(reason)} brief=${briefPath} relaunch=${relaunchPath}\n`);
+  if (!pivotRelaunch) return { pivoted: false, briefPath, relaunchPath };
+  writePivotManifest("parent-distill");
+  logSup("[guard] --pivot-relaunch: spawning the relay (fresh session, remaining wall clock)");
+  plog(`[relay] ${new Date().toISOString()} spawning relay (fresh session, parent-distill)\n`);
   stopHeartbeat(); // the relay now owns the status file — this process must not write it
   try { await client.stop(); } catch { /* already stopped */ }
   const child = spawn(process.execPath, [GUARD_PATH, ...args], {
@@ -1811,6 +1952,16 @@ try {
   while (!settled) {
     const ev = await nextEvent(250);
     const now = Date.now();
+    // v0.30.0 P5a: parent-judged context rot — the parent dropped a distill
+    // request into the out dir (the judgment ran in a fresh LLM cycle; this
+    // is its actuator). Distill + relaunch a fresh session now.
+    const pdReq = takeParentDistillRequest();
+    if (pdReq) {
+      const pv = await doParentDistill(pdReq);
+      if (pv.pivoted) { outcome = "parent-distill"; settled = true; break; }
+      outcome = "parent-distill";
+      break;
+    }
     // v0.22.0: L0 — turn-level stall. idle-timeout only measures SILENCE
     // (eventful-but-degenerate: a local model streaming one token every few
     // seconds is "active" forever — one turn can outlive the whole run
@@ -1953,6 +2104,27 @@ try {
           // Expected settle from our own abort (L2) — the new attempt is
           // (or will be) re-prompted; keep waiting for its settle.
         } else {
+          // v0.30.0 P5b: model-server failure — the turn settled on
+          // stopReason "error" after pi's own retries were exhausted. The
+          // monitor mechanically re-issues the request (fresh turn, same
+          // session), bounded by --max-error-retries; when spent, fall
+          // through to the normal classification below (the parent judges the
+          // next cycle). Deterministic errors and context overflow are NOT
+          // retried here — see lastAssistantErrorStop.
+          const errStop = await lastAssistantErrorStop();
+          if (errStop?.retryable && maxErrorRetries > 0 && errorRetriesUsed < maxErrorRetries) {
+            errorRetriesUsed++;
+            resetAttemptCounters();
+            const disp = await deliverToChild(
+              `[guard] The previous turn ended in a model-server error (after the child's own ` +
+              `retries): ${errStop.reason} This is a transient infrastructure error, not a ` +
+              `problem with your work. Continue the task from where it stopped — do NOT redo ` +
+              `completed work. (mechanical retry ${errorRetriesUsed}/${maxErrorRetries})`
+            );
+            logSup(`[guard] P5b error-stop retry ${errorRetriesUsed}/${maxErrorRetries}: ${errStop.reason} (disposition=${disp})`);
+            plog(`[error-retry] ${new Date().toISOString()} ${errorRetriesUsed}/${maxErrorRetries} ${JSON.stringify(errStop.reason.slice(0, 200))}\n`);
+            continue;
+          }
           // Normal settle. Accepting "completed" requires: (a) the attempt
           // is not degenerate, and (b) every --expect-file artifact exists.
           // Degenerate shapes (both observed in the wild):
@@ -2241,6 +2413,7 @@ try {
     attempts: attempt,
     interventions: { steers: steersUsed, forks: forksUsed, rewinds: rewindsUsed, loopsSeen },
     parentSteers: parentSteersUsed, // v0.17.0: nudge files the parent delivered (not part of the ladder budget)
+    errorRetries: errorRetriesUsed, // v0.30.0 P5b: mechanical model-server-error retries (not part of the ladder budget)
     sessionId: stateSessionId || null,
     sessionFile: stateSessionFile || null,
     finalText: finalText.slice(0, 4000),

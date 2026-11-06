@@ -433,7 +433,17 @@ the live state, and never STOP a child that is actively working.
 Output format (STRICT): your final line must be exactly one of:
 DECISION: OK
 DECISION: NUDGE: <one-line message, specific, actionable, referencing what you saw>
+DECISION: DISTILL: <one-line reason the context has rotted>
 DECISION: STOP: <one-line reason the run cannot succeed>
+
+DISTILL is for CONTEXT ROT only: the child is confidently repeating a wrong
+premise, working from a refuted plan, or re-doing work it already did — the
+transcript itself is now the problem. It is DESTRUCTIVE and bounded: the
+child's current session is discarded and a FRESH session is relaunched with a
+distilled brief (task + artifacts + remaining wall clock). Do NOT use it for
+slow progress (NUDGE), a task that cannot succeed (STOP), or ordinary
+stuckness (NUDGE first).
+
 Any other final line is treated as OK. Do NOT end with anything after the DECISION line.`;
 
 async function llmDecide() {
@@ -777,18 +787,22 @@ for (;;) {
       const sNow = readStatus();
       const tcNow = sNow ? Number(sNow.toolCalls) : NaN;
       let stopVetoed = null;
-      if (d.decision === "STOP" && Number.isFinite(tcNow) && Number.isFinite(toolsAtJudgeStart) && tcNow > toolsAtJudgeStart) {
+      // v0.30.0: the stale-verdict veto covers DISTILL too — it is destructive
+      // (the session is discarded), so the same "the disk can invalidate a
+      // verdict" rule applies: progress while judging invalidates the snapshot.
+      if ((d.decision === "STOP" || d.decision === "DISTILL") && Number.isFinite(tcNow) && Number.isFinite(toolsAtJudgeStart) && tcNow > toolsAtJudgeStart) {
+        const vetoKind = d.decision;
         stopVetoed = { from: toolsAtJudgeStart, to: tcNow };
         d.decision = "OK";
-        glog("!", 33, `cycle=${state.cycles} STOP vetoed — child progressed while judging (toolCalls ${toolsAtJudgeStart}→${tcNow}) — stale verdict, treated as OK`);
-        flog(`cycle=${state.cycles} decision=STOP-VETOED reason=${JSON.stringify(d.detail)}`);
+        glog("!", 33, `cycle=${state.cycles} ${vetoKind} vetoed — child progressed while judging (toolCalls ${toolsAtJudgeStart}→${tcNow}) — stale verdict, treated as OK`);
+        flog(`cycle=${state.cycles} decision=${vetoKind}-VETOED reason=${JSON.stringify(d.detail)}`);
       }
       // v0.21.0: the FULL reasoning goes to ralph-monitor.log (the permanent
       // record — format unchanged); the terminal gets a scannable tick line
       // plus the reasoning in dim type.
       if (d.text) flog(`cycle=${state.cycles} parent:\n${d.text}`);
       // a judgment whose final line was not DECISION: — treat as OK, log the anomaly
-      const wasBadLine = !/^DECISION:\s*(OK|NUDGE|STOP)\b/i.test(d.raw || "");
+      const wasBadLine = !/^DECISION:\s*(OK|NUDGE|DISTILL|STOP)\b/i.test(d.raw || "");
       const reasoning = (d.text || "").replace(/\n*DECISION:[^\n]*\s*$/i, "").trimEnd();
       if (d.decision === "OK") {
         state.lastDecision = stopVetoed ? `OK (stale-STOP veto: toolCalls ${stopVetoed.from}→${stopVetoed.to})` : "OK";
@@ -806,6 +820,40 @@ for (;;) {
         if (state.interventions >= A.maxInterventions) {
           glog("✗", 31, `budget exhausted (${state.interventions}/${A.maxInterventions}) — stopping loop`);
           await writeFinalReport(`parent stop: intervention budget exhausted (${state.interventions}/${A.maxInterventions})`);
+          saveState();
+          process.exit(4);
+        }
+      } else if (d.decision === "DISTILL") {
+        // v0.30.0 P5a: context-rot judgment — the monitor's actuator is a
+        // request file in the LIVE run dir; the child's guard consumes it and
+        // distills + relaunches a fresh session (remaining wall clock). The
+        // file is per-window (each window has its own run dir), so a stale
+        // request can never land in a new window's dir.
+        state.lastDecision = `DISTILL: ${d.detail}`;
+        state.interventions += 1;
+        const reqPath = path.join(A.runDir, "parent-distill.json");
+        let distillResult = "requested";
+        try {
+          if (existsSync(reqPath)) {
+            distillResult = "pending (request already on disk — leaving it)";
+          } else {
+            writeFileSync(reqPath, JSON.stringify({
+              v: 1,
+              at: new Date().toISOString(),
+              reason: (d.detail || "no reason given").slice(0, 500),
+              source: "parent-judgment",
+              cycle: state.cycles,
+            }, null, 2));
+          }
+        } catch (e) {
+          distillResult = `write failed: ${e.message}`;
+        }
+        flog(`cycle=${state.cycles} decision=DISTILL interventions=${state.interventions} ${distillResult} reason=${JSON.stringify(d.detail)}`);
+        tick(state.cycles, "DISTILL", d.detail, reasoning);
+        tlog(`${C(2)}    ${distillResult === "requested" ? "distill request → " + reqPath : distillResult}${C(0)}`);
+        if (state.interventions >= A.maxInterventions) {
+          glog("✗", 31, `budget exhausted (${state.interventions}/${A.maxInterventions}) — stopping loop`);
+          await writeFinalReport(`parent distill: intervention budget exhausted (${state.interventions}/${A.maxInterventions})`);
           saveState();
           process.exit(4);
         }

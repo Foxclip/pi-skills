@@ -98,6 +98,9 @@ const STUB_STOP = mkStub("pi-stop.mjs", `
 import { appendFileSync } from "node:fs";
 appendFileSync(process.env.RM_INV_LOG || "/dev/null", "STOP-STUB\\n");
 console.log("DECISION: STOP: the child is hopelessly off-track");`);
+// v0.30.0 P5a: DISTILL — context rot judged by the parent.
+const STUB_DISTILL = mkStub("pi-distill.mjs", `
+console.log("DECISION: DISTILL: the child keeps working from the refuted v2 plan — the transcript is now the problem");`);
 const STUB_FLAKY = mkStub("pi-flaky.mjs", `
 import { appendFileSync, readFileSync, existsSync } from "node:fs";
 const c = process.env.RM_CALLS || "/dev/null";
@@ -972,6 +975,65 @@ const waitExit = (p, ms) => new Promise((resolve) => {
     && /handoff: r36-a → r36-b \(node auth · run-1\)/.test(logB)
     && /sub-runs/.test(term) && /│/.test(term),
     `exit=${r.status} dB-state=${existsSync(path.join(dB, "ralph-monitor-state.json"))} handoff=${logB.trim().split("\n").slice(0, 3).join(" | ").slice(0, 160)} tree=${/sub-runs/.test(term)}`);
+}
+
+// ---- R37: v0.30.0 P5a — DISTILL decision → parent-distill.json dropped in
+// the LIVE run dir (the guard's next loop tick consumes it), interventions=1
+// (it is destructive, so it costs a budget slot), exit 0 (--once)
+{
+  const d = runDir("r37");
+  mkStatus(d);
+  const r = runRm(d, STUB_DISTILL, ["--once"]);
+  const st = readState(d);
+  let req = null;
+  try { req = JSON.parse(readFileSync(path.join(d, "parent-distill.json"), "utf8")); } catch {}
+  report("R37 DISTILL → parent-distill.json in run dir, interventions=1, exit 0",
+    r.status === 0
+    && /decision=DISTILL/.test(readLog(d))
+    && req && req.v === 1 && req.reason.includes("refuted") && req.source === "parent-judgment" && req.cycle === 1
+    && st && st.interventions === 1 && /decision=DISTILL/.test(readLog(d)),
+    `exit=${r.status} req=${JSON.stringify(req)}`);
+}
+
+// ---- R38: v0.30.0 P5a — DISTILL at the budget edge → request written, then
+// budget exhausted → exit 4 (destructive decisions stop the loop, like STOP)
+{
+  const d = runDir("r38");
+  mkStatus(d);
+  writeFileSync(path.join(d, "ralph-monitor-state.json"), JSON.stringify({
+    startedAt: new Date().toISOString(), cycles: 5, interventions: 2,
+    lastToolCalls: 10, lastProgressAt: new Date().toISOString(),
+    lastDecision: "OK", llmFailStreak: 0,
+  }));
+  const r = runRm(d, STUB_DISTILL, ["--once", "--max-interventions", "3"]);
+  let req = null;
+  try { req = JSON.parse(readFileSync(path.join(d, "parent-distill.json"), "utf8")); } catch {}
+  report("R38 DISTILL at budget edge → request written + budget exhausted → exit 4",
+    r.status === 4 && req && req.reason.length > 0 && /budget exhausted/.test(readLog(d)),
+    `exit=${r.status} log=${readLog(d).trim().split("\n").slice(-2).join(" | ").slice(0, 160)}`);
+}
+
+// ---- R39: v0.30.0 P5a — stale-DISTILL veto (v0.25.1 shape, extended): the
+// child makes tool calls WHILE the parent is deciding; the destructive verdict
+// is stale → vetoed → OK → exit 0, and NO distill request may be on disk.
+{
+  const d = runDir("r39");
+  mkStatus(d, { toolCalls: 0 });
+  const stub = mkStub("pi-distill-progress.mjs", `
+import { spawnSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+spawnSync("sleep", ["3"]);   // the parent is "thinking"…
+const p = ${JSON.stringify(path.join(d, "pi-child-status.json"))};
+const s = JSON.parse(readFileSync(p, "utf8"));
+s.toolCalls = 5; s.at = new Date().toISOString();   // …and the child works
+writeFileSync(p, JSON.stringify(s, null, 2));
+console.log("DECISION: DISTILL: looks rotted");`);
+  const r = runRm(d, stub, ["--once"]);
+  const log = readLog(d);
+  report("R39 stale-DISTILL veto: child progressed while judging → DISTILL vetoed → OK → exit 0",
+    r.status === 0 && /decision=DISTILL-VETOED/.test(log)
+      && !existsSync(path.join(d, "parent-distill.json")),
+    `exit=${r.status} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);
