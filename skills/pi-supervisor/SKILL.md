@@ -18,11 +18,11 @@ A pi agent can spawn and converse with another pi agent. It is not limited to `a
 
 If the child's job is fire-and-forget with no ongoing dialogue, `acp_delegate` is usually better: clean context, async, result saved to a file.
 
-## Spec — the confirmed model (v0.30.0)
+## Spec — the confirmed model (v0.31.0)
 
 This Spec is the **main source of truth** for pi-supervisor. Any contradiction between the Spec and the code, or between the Spec and any other part of this SKILL.md, is resolved in favor of the Spec. The Spec may only be modified by an agent when the user asks.
 
-pi-supervisor runs a long, autonomous coding job that never stalls silently, survives crashes, reboots, and the death of its own supervisor, and can branch work into sub-projects — with a human at the boundaries.
+pi-supervisor runs a long, autonomous coding job that never stalls silently and can branch work into sub-projects — at a terminal, with a human at the boundaries.
 
 ### 1. Structure
 - **1.1 Project tree.** A root project plus nested sub-projects (sub-folders). Each project has its own task and state. A project can contain **multiple runs** over its life.
@@ -32,13 +32,13 @@ pi-supervisor runs a long, autonomous coding job that never stalls silently, sur
 
 ### 2. Launch — one primitive, two triggers
 The only primitive is **starting a run in a project**.
-- **2.1** A **human** does it directly (`ralph.sh`). A human re-run always starts a *new* run (or attaches if a run is already live).
+- **2.1** A **human** does it directly (`ralph.sh`). Running `ralph.sh` in a project always starts a **new** run — a dead run is never re-opened as the same run; its on-disk state is read by the new run, not resumed.
 - **2.2** A **run** requests it for a sub-project (a spawn request to the monitor), which performs the launch. Downward only; unlimited; recursive (a sub-run can request its own sub-runs).
 - **2.3** A **new run of a run's own project** is human-only — a run can never cause the next run of its own project.
 
 ### 3. Worker rules
 - **3.1** A run (its session) **launches nothing** — it writes requests.
-- **3.2** A run works under its deadline.
+- **3.2** A run works under its deadline. The run **ends** when its goal is met, its deadline is reached (its process is killed at hard timeout), or the process dies (6.3) — there is **no automatic continuation**; a new run (2.1) picks up from the on-disk state.
 
 ### 4. Supervisor — the point is to keep the run from stalling; two layers
 - **4.1 Monitor script** (deterministic, fast) — the easy stalls: thinking loops, exact message repetition, premature stopping; mechanical retry of the request when the model server times out.
@@ -48,20 +48,20 @@ The script is the fast reflex; the parent is the judgment. The parent is re-run 
 
 ### 5. Session lifecycle (within a run)
 - **5.1 Re-entry (sub-run hand-back):** the sub-run finishes → its parent side writes the final report → the monitor activates the original session (resumes it) and sends a message into it (the sub-run's final report + spawn decision) → the run continues from its full context.
-- **5.2 Continuation (budget):** a process launch's budget is used and the run's deadline hasn't been reached → the run continues in a new launch, resuming the session. Automatic (the ralph loop).
-- **5.3 Resume gate (the Box2D rule, kept):** every resume (continuation or re-entry) is gated on the session's size — before resuming, check the session file; if it's above **~50–60% of the model's context window**, do **not** resume — distill instead. (Field rule, 2026-10-19 Box2D: a 7 MB resume stalled at "EMERGENCY 99%"; a fresh distilled session fixed it in 58 min.) Current implementation: the gate is the session file's size against the overflow threshold — the guard's `--overflow-threshold-mb` knob (default 3 MB), the field rule expressed as a size knob rather than a per-model context percentage.
-- **5.4 Distill (context rot):** the run continues in a **new session** (same run, same deadline) when the resume gate trips (session > ~50–60% of context window) or the parent judges the context rotted. The state is distilled into a brief for the fresh session. The guard's automatic context-overflow distill is the last-resort safety net.
-- **5.5** Sessions are always **finalized** (process exits, transcript on disk); continuing = re-activating by resume, never a kept-alive process.
+- **5.2 Resume gate (the Box2D rule, kept):** every resume (re-entry) is gated on the session's size — before resuming, check the session file; if it's above **~50–60% of the model's context window**, do **not** resume — distill instead. (Field rule, 2026-10-19 Box2D: a 7 MB resume stalled at "EMERGENCY 99%"; a fresh distilled session fixed it in 58 min.) Current implementation: the gate is the session file's size against the overflow threshold — the guard's `--overflow-threshold-mb` knob (default 3 MB), the field rule expressed as a size knob rather than a per-model context percentage.
+- **5.3 Distill (context rot):** when the resume gate trips (session > ~50–60% of context window) or the parent judges the context rotted, the run's session is **replaced by a fresh one** carrying a distilled brief of the state (same run, same deadline). The guard's automatic context-overflow distill is the last-resort safety net.
+- **5.4** Sessions are always **finalized** (process exits, transcript on disk); continuing = re-activating by resume, never a kept-alive process.
 
 ### 6. Tree dynamics
 - **6.1** Exactly **one active run** across the whole tree at a time.
-- **6.2** The **terminal follows** the active run down the tree (read-only view; several terminals can attach).
-- **6.3** Steering is separate: the human sends a message to a session, stops a run, or requests a spawn; the parent can nudge a session through the same channel. The display never drives.
+- **6.2** A run is **owned by the terminal that launched it** and **dies with that terminal**. The owning terminal follows the active run down the tree; other terminals may attach read-only — their death is irrelevant to the run.
+- **6.3** When the owning terminal dies (close, kill, reboot), the run and its **whole owned tree** — active and paused, across sub-projects — is torn down. No orphaned processes.
+- **6.4** **Steering** is separate: the human sends a message to a session, stops a run, or requests a spawn; the parent can nudge a session through the same channel. The display never drives. **Ctrl-C in any attached terminal stops all running processes.**
 
 ### 7. Durability
 - **7.1** Everything important is on disk and resumable: transcripts, state, reports, the tree.
-- **7.2** The supervisor runs as a **separate, replaceable process** — the worker survives the supervisor's own death; a fresh supervisor re-attaches from the on-disk state.
-- **7.3** The job survives a reboot.
+- **7.2** The supervisor runs as a **separate, replaceable process** — the worker survives the supervisor's own death; a fresh supervisor re-attaches from the on-disk state. *(Holds within the owning terminal's lifetime — 6.3 is the outer boundary.)*
+- **7.3** The **on-disk state** survives a reboot, so a fresh run can pick up from it. The live run does not: a reboot kills the owning terminal's process and the run ends (6.3).
 
 ## Quickstart — the main mode: `ralph.sh`
 
