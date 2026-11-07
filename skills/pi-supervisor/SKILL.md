@@ -48,7 +48,7 @@ The script is the fast reflex; the parent is the judgment. The parent is re-run 
 
 ### 5. Session lifecycle (within a run)
 - **5.1 Re-entry (sub-run hand-back):** the sub-run finishes → its parent side writes the final report → the monitor activates the original session (resumes it) and sends a message into it (the sub-run's final report + spawn decision) → the run continues from its full context.
-- **5.2 Resume gate (the Box2D rule, kept):** every resume (re-entry) is gated on the session's size — before resuming, check the session file; if it's above **~50–60% of the model's context window**, do **not** resume — distill instead. (Field rule, 2026-10-19 Box2D: a 7 MB resume stalled at "EMERGENCY 99%"; a fresh distilled session fixed it in 58 min.) Current implementation: the gate is the session file's size against the overflow threshold — the guard's `--overflow-threshold-mb` knob (default 3 MB), the field rule expressed as a size knob rather than a per-model context percentage.
+- **5.2 Resume gate:** every resume (re-entry) is gated on the session's size — if the session file is above **~50–60% of the model's context window**, do **not** resume — distill instead (5.3).
 - **5.3 Distill (context rot):** when the resume gate trips (session > ~50–60% of context window) or the parent judges the context rotted, the run's session is **replaced by a fresh one** carrying a distilled brief of the state (same run, same deadline). The guard's automatic context-overflow distill is the last-resort safety net.
 - **5.4** Sessions are always **finalized** (process exits, transcript on disk); continuing = re-activating by resume, never a kept-alive process.
 
@@ -60,7 +60,7 @@ The script is the fast reflex; the parent is the judgment. The parent is re-run 
 
 ### 7. Durability
 - **7.1** Everything important is on disk and resumable: transcripts, state, reports, the tree.
-- **7.2** The supervisor runs as a **separate, replaceable process** — the worker survives the supervisor's own death; a fresh supervisor re-attaches from the on-disk state. *(Holds within the owning terminal's lifetime — 6.3 is the outer boundary.)*
+- **7.2** The run survives the loss of its supervising process: within the owning terminal's lifetime, supervision of a live run can be re-established. (The run does not survive the *owning terminal* — 6.3 is the outer boundary.)
 - **7.3** The **on-disk state** survives a reboot, so a fresh run can pick up from it. The live run does not: a reboot kills the owning terminal's process and the run ends (6.3).
 
 ## Quickstart — the main mode: `ralph.sh`
