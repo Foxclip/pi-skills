@@ -40,7 +40,8 @@ fs.writeFileSync(path.join(out, "pi-child-status.json"), JSON.stringify(st));
 // active.json — single-writer contract (launch.mjs at window start): the stub
 // mirrors the real launch.mjs so S11's slot assertion tests the real flow.
 const base = out.replace(/\/+$/, "").split("/").pop() || null;
-fs.writeFileSync(path.join(out, "..", "..", "active.json"), JSON.stringify({ run_dir: out, node: a[a.indexOf("--node") + 1] || "(root)", guard_pid: s.pid, window: base, started_at: new Date().toISOString(), deadline: null }));
+const ni = a.indexOf("--node");
+fs.writeFileSync(path.join(out, "..", "..", "active.json"), JSON.stringify({ run_dir: out, node: ni > 0 ? a[ni + 1] : "(root)", guard_pid: s.pid, window: base, started_at: new Date().toISOString(), deadline: null }));
 console.log(JSON.stringify({ launched: true }));
 EOF
 cat > $T/pi-OK <<'EOF'
