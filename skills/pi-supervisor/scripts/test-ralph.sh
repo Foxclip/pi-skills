@@ -37,6 +37,10 @@ fs.writeFileSync(path.join(out, "launch-args.txt"), a.join(" ") + "\n");
 const s = spawn("sleep", [600], { detached: true, stdio: "ignore" }); s.unref();
 const st = { v:2, at:new Date().toISOString(), status:"running", exitReason:null, guardPid:s.pid, childPid:s.pid, attempt:1, rewinds:0, toolCalls:0, lastTool:null, lastToolStartedAt:null, elapsedMs:0, deadlineIso:new Date(Date.now()+3600e3).toISOString() };
 fs.writeFileSync(path.join(out, "pi-child-status.json"), JSON.stringify(st));
+// active.json — single-writer contract (launch.mjs at window start): the stub
+// mirrors the real launch.mjs so S11's slot assertion tests the real flow.
+const base = out.replace(/\/+$/, "").split("/").pop() || null;
+fs.writeFileSync(path.join(out, "..", "..", "active.json"), JSON.stringify({ run_dir: out, node: a[a.indexOf("--node") + 1] || "(root)", guard_pid: s.pid, window: base, started_at: new Date().toISOString(), deadline: null }));
 console.log(JSON.stringify({ launched: true }));
 EOF
 cat > $T/pi-OK <<'EOF'

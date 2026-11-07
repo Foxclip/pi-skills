@@ -1036,6 +1036,41 @@ console.log("DECISION: DISTILL: looks rotted");`);
     `exit=${r.status} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
 }
 
+// ---- R40: v0.31.0 conform (6.2/6.3) — the handoff slot written AFTER the
+// current window went terminal must re-point the terminal, not end it.
+// run2 defect: the child finished, the guard's chain step wrote the slot in
+// the same breath, and the monitor exited "✓ done" — while the tree kept
+// running in a window nobody was watching. (R36 covers the in-loop handoff;
+// this is the stop path.) The stub plays the guard's chain step: it drops
+// active.json → r40-b on its way through the final-report pi call.
+{
+  const proj = path.join(root, "r40-proj");
+  const dA = runDir("r40-a");
+  const dB = runDir("r40-b");
+  mkStatus(dA, { status: "completed", exitReason: "completed-finalized" });
+  mkStatus(dB, { status: "running" });
+  mkdirSync(path.join(proj, ".pi-supervisor"), { recursive: true });
+  const slotPath = path.join(proj, ".pi-supervisor", "active.json");
+  const slotJson = JSON.stringify({
+    run_dir: dB, node: "auth", guard_pid: process.pid, window: "run-2",
+    started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+  });
+  const stub = mkStub("pi-r40.mjs", `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(slotPath)}, ${JSON.stringify(slotJson)});
+console.log("thinking about the child's progress...");
+console.log("DECISION: OK");`);
+  const r = runRm(dA, stub, ["--project-dir", proj, "--once"]);
+  const logA = readLog(dA);
+  const logB = readLog(dB);
+  report("R40 handoff lands while stop is in flight → terminal re-points, does NOT exit",
+    r.status === 0
+    && /pre-check STOP/.test(logA)   // the stop path was entered for r40-a
+    && /handoff: r40-a → r40-b \(node auth · run-2\)/.test(logB)   // …and the handoff landed in r40-b's log
+    && existsSync(path.join(dB, "ralph-monitor-state.json")),   // monitoring continued on the new window
+    `exit=${r.status} logA=${logA.trim().split("\n").slice(-2).join(" | ").slice(0, 140)} logB=${logB.trim().split("\n").slice(0, 3).join(" | ").slice(0, 140)}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);

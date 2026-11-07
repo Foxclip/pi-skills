@@ -611,6 +611,14 @@ let finalWaitAnnounced = false;   // v0.24.3: announce the finalization wait onc
 // the "what happened" answer, and the child is terminal here, so the model
 // slot is free for the report (a failed report never changes the exit code).
 async function stopLoop(pc) {
+  // v0.31.0 conform (6.2/6.3): the handoff slot is written by the EXITING
+  // window's own guard in its final seconds (the chain step runs after the
+  // status is durable), so it can land after the loop's own followSlot ran.
+  // Check one more time before we leave: if the chain handed off, re-point
+  // (divider + banner) and keep monitoring the new window instead of exiting
+  // (run2: the terminal exited with "✓ done" while the tree kept running).
+  saveState();
+  if (followSlot()) return;   // handoff → the loop continues on the new window
   // v0.25.4: event ordering — when the stop IS the child going terminal,
   // announce the child's state FIRST (same shape as the child beat line):
   // cause before reaction. (run11: the terminal state was first visible in
@@ -632,6 +640,9 @@ async function stopLoop(pc) {
     `pre-check STOP: ${pc.reason} (cycle=${state.cycles} interventions=${state.interventions})`);
   saveState();
   if (pc.code === 0 || pc.code === 4) await writeFinalReport(pc.reason);
+  // the slot can also land while the final report was being written (the
+  // guard's chain step runs in parallel) — one last check before we exit.
+  if (followSlot()) return;   // handoff → the loop continues on the new window
   process.exit(pc.code);
 }
 // ---- follow-the-slot (v0.26.0, plan §5.5) ----------------------------------
@@ -644,12 +655,14 @@ async function stopLoop(pc) {
 // steering stays in ralph.sh stop/spawn). Projects without an active.json:
 // no-op, so legacy runs are unchanged.
 const slotPath = A.projectDir ? path.join(A.projectDir, ".pi-supervisor", "active.json") : null;
+// Returns true when it RE-POINTED (a handoff was observed), false otherwise —
+// the stop path uses that to keep monitoring the new window instead of exiting.
 function followSlot() {
-  if (!slotPath) return;
+  if (!slotPath) return false;
   let p;
-  try { p = JSON.parse(readFileSync(slotPath, "utf8")); } catch { return; }
+  try { p = JSON.parse(readFileSync(slotPath, "utf8")); } catch { return false; }
   const rd = p && p.run_dir;
-  if (!rd || !existsSync(rd) || rd === A.runDir) return;
+  if (!rd || !existsSync(rd) || rd === A.runDir) return false;
   const from = path.basename(A.runDir);
   const to = path.basename(rd);
   A.runDir = rd;
@@ -670,6 +683,7 @@ function followSlot() {
     for (const line of renderTree(A.projectDir).split("\n")) glog("", 2, line);
   } catch { /* the tree is decoration — the re-point is the substance */ }
   flog(`handoff: ${from} → ${to} (node ${p.node || "?"} · ${p.window || "?"})`);
+  return true;
 }
 
 (async () => {
@@ -677,7 +691,7 @@ for (;;) {
   followSlot();   // v0.26.0: re-point if the chain handed off to another window
   const status = readStatus();
   const pc = preCheck(status);
-  if (pc.stop) await stopLoop(pc);
+  if (pc.stop) { await stopLoop(pc); continue; }   // stopLoop exits — or re-pointed (handoff), in which case the loop restarts on the new window
   // v0.24.3: the grace-bounded finalization wait (deadline passed, child still
   // finishing its turn) was the last silent stretch — announce entry once; the
   // 60s child beats keep the wait visible until it ends.
