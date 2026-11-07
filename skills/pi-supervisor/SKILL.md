@@ -43,8 +43,7 @@ The only primitive is **starting a run in a project**.
 ### 4. Supervisor — the point is to keep the run from stalling; two layers
 - **4.1 Monitor script** (deterministic, fast) — the easy stalls: thinking loops, exact message repetition, premature stopping; mechanical retry of the request when the model server times out.
 - **4.2 Parent** (an LLM judgment, run fresh each cycle) — the generalist: catches what the script can't (inexact/semantic loops, problems with the supervisor itself) and makes the decisions — context rot (distill → new session), continue, nudge/steer, stop, and the final report when work ends.
-
-The script is the fast reflex; the parent is the judgment. The parent is re-run fresh each cycle with all memory on disk, so a dead model kills one cycle, not the supervision.
+- **4.3** The script is the fast reflex; the parent is the judgment. The parent is re-run fresh each cycle with all memory on disk, so a dead model kills one cycle, not the supervision.
 
 ### 5. Session lifecycle (within a run)
 - **5.1 Re-entry (sub-run hand-back):** the sub-run finishes → its parent side writes the final report → the monitor activates the original session (resumes it) and sends a message into it (the sub-run's final report + spawn decision) → the run continues from its full context.
@@ -60,8 +59,7 @@ The script is the fast reflex; the parent is the judgment. The parent is re-run 
 
 ### 7. Durability
 - **7.1** Everything important is on disk and resumable: transcripts, state, reports, the tree.
-- **7.2** The run survives the loss of its supervising process: within the owning terminal's lifetime, supervision of a live run can be re-established. (The run does not survive the *owning terminal* — 6.3 is the outer boundary.)
-- **7.3** The **on-disk state** survives a reboot, so a fresh run can pick up from it. The live run does not: a reboot kills the owning terminal's process and the run ends (6.3).
+- **7.2** The **on-disk state** survives a reboot, so a fresh run can pick up from it. The live run does not: a reboot kills the owning terminal's process and the run ends (6.3).
 
 ## Quickstart — the main mode: `ralph.sh`
 
