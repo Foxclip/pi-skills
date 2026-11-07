@@ -715,6 +715,29 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T22 threshold configurable (1MB → small file now passes)", g5.resume === true, JSON.stringify(g5));
 }
 
+// ============ T23 — v0.31.0 conformity (5.1): human-root spelling (run<N>)
+// A human root launch allocates `run<N>` (no hyphen, ralph.sh S0), not the
+// chain's `run-N`. The re-entry lookups must still find that window's spawn
+// decision + session (the run2 defect: fresh session, null decision).
+{
+  const p = mkproj("t23-root-spelling");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  mkNode(p, "auth", { deadline: ISO(inMin(90)) });
+  const sess = path.join(T, "sess-t23.jsonl");
+  fs.writeFileSync(sess, JSON.stringify({ t: 2 }) + "\n");
+  const rw = mkWindow(p, "run1", { status: "completed", exitReason: "completed-finalized", sessionFile: sess });
+  fs.writeFileSync(path.join(rw, "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run1" }));
+  fs.mkdirSync(path.join(NR(p, "auth"), "run-1"), { recursive: true });
+  fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  const r = await step(p, path.join(NR(p, "auth"), "run-1"), CFG);
+  ok("T23 reentry launched (parent is a run<N> dir)", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
+  const args = fs.readFileSync(R(p, "run-2/launch-args.txt"), "utf8");
+  ok("T23 --session = parent's pre-spawn session", args.includes(`--session ${sess}`), args);
+  const brief = fs.readFileSync(R(p, "run-2/TASK.md"), "utf8");
+  ok("T23 non-null spawn decision embedded (5.1 observable)", brief.includes("RE-ENTRY (resume)") && brief.includes('"node_path": "auth"'), brief.slice(0, 220));
+  ok("T23 outcome flags resume", r.outcome?.resumed === true, JSON.stringify(r.outcome));
+}
+
 // ---------- summary ----------
 console.log(`\n=== ${passed} passed, ${failed} failed (sandbox: ${T}) ===`);
 if (failed) { console.log("failed:", fails.join(" | ")); process.exit(1); }

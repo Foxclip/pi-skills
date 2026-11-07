@@ -390,7 +390,7 @@ USAGE
   fi
   [ -n "$SP_NAME" ] || { saye "${C_R}✗${C_N} spawn: --name is required (the sub-project node name)"; exit 2; }
   [[ "$SP_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { saye "${C_R}✗${C_N} spawn: bad node name \"${SP_NAME}\" — [A-Za-z0-9][A-Za-z0-9._-]* (no slashes, spaces, or leading dots)"; exit 2; }
-  [[ "$SP_NAME" =~ ^run-[0-9]+$ ]] && { saye "${C_R}✗${C_N} spawn: node name \"${SP_NAME}\" collides with the window names (run-N)"; exit 2; }
+  [[ "$SP_NAME" =~ ^run-?[0-9]+$ ]] && { saye "${C_R}✗${C_N} spawn: node name \"${SP_NAME}\" collides with the window names (run-N)"; exit 2; }
   [ -n "$SP_TASK" ] || { saye "${C_R}✗${C_N} spawn: --task <file> is required (write the sub-project's task file first)"; exit 2; }
   case "$SP_TASK" in /*) SP_TASK_ABS=$SP_TASK ;; *) SP_TASK_ABS="$PWD/$SP_TASK" ;; esac
   [ -f "$SP_TASK_ABS" ] || { saye "${C_R}✗${C_N} spawn: task file not found: $SP_TASK_ABS"; exit 2; }

@@ -167,7 +167,7 @@ export function validNodeName(name) {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
     return { ok: false, why: `node name "${name}" must match [A-Za-z0-9][A-Za-z0-9._-]* (no slashes, dots-leading, or spaces)` };
   }
-  if (/^run-\d+$/i.test(name)) {
+  if (/^run-?\d+$/i.test(name)) {
     return { ok: false, why: `node name "${name}" collides with the window names (run-N)` };
   }
   return { ok: true };
@@ -312,7 +312,21 @@ export function commitDetached(parentProjectDir, name) {
 }
 
 // ---------- windows ---------------------------------------------------------
-const WINDOW_RE = /^run-(\d+)$/;
+// Window dirs come in two spellings: `run-N` (chain allocation — allocWindowIn)
+// and `runN` (human root launch — ralph.sh's S0 alloc). Both coexist in one
+// runs dir, and every lookup must accept both (Spec 5.1: a re-entry must find
+// the original window no matter who allocated it). The spelling is an
+// implementation detail, not a Spec concept — never rename dirs to "unify".
+export function windowNumber(name) {
+  const m = /^run-?(\d+)$/.exec(String(name ?? ""));
+  return m ? Number(m[1]) : null;
+}
+// Shared window-name check — both `run-N` (chain-allocated) and `runN`
+// (human root launch) forms.
+export function isWindowName(name) {
+  return windowNumber(name) !== null;
+}
+const WINDOW_RE = /^run-?\d+$/;
 
 export function listWindows(dir) {
   let ents;
@@ -320,7 +334,7 @@ export function listWindows(dir) {
   return ents
     .filter((e) => e.isDirectory() && WINDOW_RE.test(e.name))
     .map((e) => e.name)
-    .sort((a, b) => Number(a.slice(4)) - Number(b.slice(4)));
+    .sort((a, b) => windowNumber(a) - windowNumber(b));
 }
 
 export function newestWindow(dir) {
@@ -335,7 +349,7 @@ export function newestWindow(dir) {
 // (it exists). Caller: hold the lock.
 export function allocWindowIn(runsDir) {
   fs.mkdirSync(runsDir, { recursive: true });
-  const n = listWindows(runsDir).reduce((m, w) => Math.max(m, Number(w.slice(4))), 0);
+  const n = listWindows(runsDir).reduce((m, w) => Math.max(m, windowNumber(w)), 0);
   const name = `run-${n + 1}`;
   const wdir = path.join(runsDir, name);
   fs.mkdirSync(wdir, { recursive: true });

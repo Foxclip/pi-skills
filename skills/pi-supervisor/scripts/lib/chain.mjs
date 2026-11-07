@@ -55,6 +55,8 @@ import {
   commitDetached,
   allocWindowIn,
   writeActive,
+  isWindowName,
+  windowNumber,
 } from "./node.mjs";
 import { sizeDeadline } from "./deadline.mjs";
 
@@ -700,8 +702,8 @@ function findSpawnDecision(projectDir, parentPath, childPath) {
   const pdir = nodeRunsDir(projectDir, parentPath);
   let ents = [];
   try { ents = fs.readdirSync(pdir, { withFileTypes: true }); } catch { return null; }
-  const wins = ents.filter((e) => e.isDirectory() && /^run-\d+$/.test(e.name))
-    .map((e) => e.name).sort((a, b) => Number(b.slice(4)) - Number(a.slice(4)));
+  const wins = ents.filter((e) => e.isDirectory() && isWindowName(e.name))
+    .map((e) => e.name).sort((a, b) => windowNumber(b) - windowNumber(a));
   for (const w of wins) {
     const d = readJson(path.join(pdir, w, "spawn-decision.json"));
     if (d && d.node_path === childPath) return d;
@@ -716,8 +718,8 @@ function findSpawnWindow(projectDir, parentPath, childPath) {
   const pdir = nodeRunsDir(projectDir, parentPath);
   let ents = [];
   try { ents = fs.readdirSync(pdir, { withFileTypes: true }); } catch { return null; }
-  const wins = ents.filter((e) => e.isDirectory() && /^run-\d+$/.test(e.name))
-    .map((e) => e.name).sort((a, b) => Number(b.slice(4)) - Number(a.slice(4)));
+  const wins = ents.filter((e) => e.isDirectory() && isWindowName(e.name))
+    .map((e) => e.name).sort((a, b) => windowNumber(b) - windowNumber(a));
   for (const w of wins) {
     const d = readJson(path.join(pdir, w, "spawn-decision.json"));
     if (d && d.node_path === childPath) return w;
@@ -760,7 +762,7 @@ async function processSpawnRequest(projectDir, parentNodePath2, windowDir, req, 
   if (!req || req.kind !== "spawn") return fail("malformed request (kind != spawn)");
   const nm = String(req.node || "");
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(nm)) return fail(`bad node name "${nm}"`);
-  if (/^run-\d+$/i.test(nm)) return fail(`node name "${nm}" collides with the window names (run-N)`);
+  if (/^run-?\d+$/i.test(nm)) return fail(`node name "${nm}" collides with the window names (run-N)`);
   const taskFile = String(req.task || "");
   let taskText = null;
   try {

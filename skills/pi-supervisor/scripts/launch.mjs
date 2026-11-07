@@ -85,7 +85,7 @@ function resolvePiBinForProtection() {
   try { return join(homedir(), ".pi", "agent", "bin", "pi"); } catch { return null; }
 }
 import { parseDeadline, sizeDeadline, fmtLocal } from "./lib/deadline.mjs";
-import { activePath, writeJson } from "./lib/node.mjs";
+import { activePath, writeJson, isWindowName } from "./lib/node.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -320,7 +320,7 @@ try {
     run_dir: outDir,
     node: nodePath,
     guard_pid: child.pid,
-    window: /^run-\d+$/.test(base || "") ? base : null,
+    window: isWindowName(base || "") ? base : null,
     started_at: new Date().toISOString(),
     deadline: deadlineInfo ? deadlineInfo.deadline : null,
   });
