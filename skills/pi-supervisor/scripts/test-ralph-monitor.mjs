@@ -1071,6 +1071,68 @@ console.log("DECISION: OK");`);
     `exit=${r.status} logA=${logA.trim().split("\n").slice(-2).join(" | ").slice(0, 140)} logB=${logB.trim().split("\n").slice(0, 3).join(" | ").slice(0, 140)}`);
 }
 
+// ---- R41: v0.32.0 (5.1/7.7) — a run that PAUSES (a pending spawn request)
+// gets NO final report: the report is for the run's END, and a pausing run is
+// re-activated in the SAME window and ends there. run3 defect: a 213-second
+// FINAL-REPORT.md on a run that was about to be re-activated. The stop-exit
+// followSlot() that follows the hand-back slot is the shared line R40 tests
+// (the pending path is deliberately pi-call-free, so there is nothing in
+// stopLoop for a slot-writer stub to hook into here).
+{
+  const dA = runDir("r41-a");
+  mkStatus(dA, { status: "completed", exitReason: "completed-finalized", guardPid: null, toolCalls: 7 });
+  writeFileSync(path.join(dA, "spawn-request.json"),
+    JSON.stringify({ kind: "spawn", node: "auth", task: "tasks/auth.md" }));
+  process.env.RM_INV_LOG = path.join(root, "inv-r41.log");
+  const r = runRm(dA, STUB_INV, ["--once"]);
+  process.env.RM_INV_LOG = "";
+  const logA = readLog(dA);
+  report("R41 pending spawn request at stop → run pauses: NO FINAL-REPORT.md, no report pi call",
+    r.status === 0
+    && !existsSync(path.join(dA, "FINAL-REPORT.md"))   // 7.7: the pausing run gets no report
+    && invLog("r41") === ""                            // no REPORT — and no JUDGE — call at all
+    && /pre-check STOP: child-terminal/.test(logA)     // the stop path was entered (not trivially skipped)
+    && !/final-report/.test(logA),                      // writeFinalReport was never even started
+    `exit=${r.status} inv=${JSON.stringify(invLog("r41"))} report=${existsSync(path.join(dA, "FINAL-REPORT.md"))}`);
+}
+
+// ---- R42: v0.32.0 (5.1) — report BEFORE re-point: a sub-run window with no
+// pending spawn, and the chain step takes the hand-back slot while the final
+// report is being written. R40's scenario, with the assertion R40 was missing:
+// the report itself. Defect (hello-sub/run-1): the old order (followSlot →
+// report) skipped the report whenever the hand-back had already landed, and
+// the window ended with no FINAL-REPORT.md on disk.
+{
+  const proj = path.join(root, "r42-proj");
+  const dA = runDir("r42-a");
+  const dB = runDir("r42-b");
+  mkStatus(dA, { status: "completed", exitReason: "completed-finalized" });
+  mkStatus(dB, { status: "running" });
+  mkdirSync(path.join(proj, ".pi-supervisor"), { recursive: true });
+  const slotPath = path.join(proj, ".pi-supervisor", "active.json");
+  const slotJson = JSON.stringify({
+    run_dir: dB, node: "auth", guard_pid: process.pid, window: "run-2",
+    started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+  });
+  const stub = mkStub("pi-r42.mjs", `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(slotPath)}, ${JSON.stringify(slotJson)});
+console.log("thinking about the child's progress...");
+console.log("DECISION: OK");`);
+  const r = runRm(dA, stub, ["--project-dir", proj, "--once"]);
+  const logA = readLog(dA);
+  const logB = readLog(dB);
+  const rep = path.join(dA, "FINAL-REPORT.md");
+  report("R42 hand-back lands during the final report → FINAL-REPORT.md IS written, then re-point",
+    r.status === 0
+    && existsSync(rep)                                   // the report landed before the re-point won
+    && /thinking about the child's progress/.test(readFileSync(rep, "utf8"))
+    && /pre-check STOP/.test(logA)
+    && /handoff: r42-a → r42-b \(node auth · run-2\)/.test(logB)   // …and the hand-back was still followed
+    && existsSync(path.join(dB, "ralph-monitor-state.json")),
+    `exit=${r.status} report=${existsSync(rep)} logB=${logB.trim().split("\n").slice(0, 2).join(" | ").slice(0, 120)}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);

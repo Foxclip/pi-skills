@@ -152,6 +152,8 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const act = active(path.join(p, "auth"));
   ok("T2 active.json → child window (in the sub-project)", act && act.node === "auth" && act.window === "run-1");
   ok("T2 child got deadline ≤ parent deadline", d.deadline <= ISO(inMin(31)) && d.deadline > ISO(inMin(20)), d.deadline);
+  const idx2 = JSON.parse(fs.readFileSync(R(p, "INDEX.json"), "utf8"));
+  ok("T2 INDEX entry paused while spawning (5.1)", idx2.runs.find((e) => e.run === "run-1")?.status === "paused", JSON.stringify(idx2));
 }
 
 // ============ T3 — join-or-create: two spawns of the same name → one node, two windows
@@ -174,38 +176,46 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T3 joined brief is continuation-style", fs.readFileSync(path.join(NR(p, "shared"), "run-2", "TASK.md"), "utf8").includes("Task (the node's task file, unchanged)"));
 }
 
-// ================= T4 — sub completed → node done + parent RE-ENTRY launched
+// ================= T4 — sub completed → node done + parent run RE-ACTIVATED (2.3/5.1)
 {
   const p = mkproj("t4-reentry");
   mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
   mkNode(p, "auth", { deadline: ISO(inMin(90)) });
-  mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" }); // root's spawn window
+  const rw = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" }); // root's spawn window
+  fs.writeFileSync(path.join(rw, "chain-done.json"), JSON.stringify({ v: 1, at: ISO(Date.now() - 300000), kind: "spawned", outcome: { next: "spawned", node_path: "auth", window: "run-1" } }));
+  const origDl4 = JSON.parse(fs.readFileSync(path.join(rw, "pi-child-status.json"), "utf8")).deadlineIso;
   fs.mkdirSync(path.join(NR(p, "auth"), "run-1"), { recursive: true });
   fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
   const w = path.join(NR(p, "auth"), "run-1");
   const r = await step(p, w, CFG);
   ok("T4 reentry launched", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
-  ok("T4 root re-entry window run-2", r.outcome?.window === "run-2" && fs.existsSync(R(p, "run-2")));
-  ok("T4 re-entry brief", fs.readFileSync(R(p, "run-2/TASK.md"), "utf8").includes("RE-ENTRY"));
+  ok("T4 RE-ACTIVATES the spawn window (run-1), no run-2", r.outcome?.window === "run-1" && !fs.existsSync(R(p, "run-2")), JSON.stringify(r.outcome));
+  ok("T4 re-entry brief in RE-ENTRY.md", fs.existsSync(path.join(rw, "RE-ENTRY.md")) && fs.readFileSync(path.join(rw, "RE-ENTRY.md"), "utf8").includes("RE-ENTRY"));
+  ok("T4 original TASK.md untouched", fs.readFileSync(path.join(rw, "TASK.md"), "utf8").includes("task run-1"));
+  ok("T4 chain-done marker cleared (fresh step later)", !fs.existsSync(path.join(rw, "chain-done.json")));
+  ok("T4 original deadline unchanged", r.outcome?.deadline === origDl4, r.outcome?.deadline);
+  const args4 = fs.readFileSync(path.join(rw, "launch-args.txt"), "utf8");
+  ok("T4 launched into the same run dir", args4.includes(`--out-dir ${rw}`) && args4.includes(`--task-file ${path.join(rw, "RE-ENTRY.md")}`), args4);
   ok("T4 auth done", nodeState(p, "auth") === "done");
   ok("T4 root active", nodeState(p, "(root)") === "active");
   const act = active(p);
-  ok("T4 active.json → root re-entry", act && act.node === "(root)" && act.window === "run-2");
+  ok("T4 active.json → re-activated window", act && act.node === "(root)" && act.window === "run-1");
 }
 
-// ============ T5 — root budget-used, node deadline NOT expired → continuation
+// ============ T5 — root budget-used, node deadline NOT expired → NO continuation (3.2)
 {
-  const p = mkproj("t5-continuation");
+  const p = mkproj("t5-budget-used");
   mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
   const w = mkWindow(p, "run-1", { status: "completed", exitReason: "hard-timeout", deadlineIso: ISO(Date.now() - 5000) });
   const r = await step(p, w, CFG);
-  ok("T5 continuation launched", r.outcome?.next === "continuation" && r.outcome?.window === "run-2", JSON.stringify(r.outcome));
-  ok("T5 continuation brief", fs.readFileSync(R(p, "run-2/TASK.md"), "utf8").includes("CONTINUATION"));
-  ok("T5 root active", nodeState(p, "(root)") === "active");
-  ok("T5 window budget ≤ node deadline", r.outcome.deadline <= ISO(inMin(120)) && r.outcome.deadline > ISO(inMin(50)), r.outcome.deadline);
+  ok("T5 no continuation (3.2)", r.outcome?.next === "idle" && r.outcome?.reason === "budget-used", JSON.stringify(r.outcome));
+  ok("T5 no run-2 (no launch)", !fs.existsSync(R(p, "run-2")));
+  ok("T5 root paused", nodeState(p, "(root)") === "paused", nodeState(p, "(root)"));
+  ok("T5 3.2 note in STATE.md", /used its budget — the run ended at its deadline \(3\.2\)/.test(fs.readFileSync(path.join(p, "STATE.md"), "utf8")), fs.readFileSync(path.join(p, "STATE.md"), "utf8").trim().split("\n").slice(-1)[0]);
+  ok("T5 marker says budget-used", readMarker(w).kind === "budget-used", JSON.stringify(readMarker(w)));
 }
 
-// ============ T6 — sub budget-used, node deadline EXPIRED → parent re-entry
+// ============ T6 — sub budget-used, node deadline EXPIRED → parent run RE-ACTIVATED
 {
   const p = mkproj("t6-expired");
   mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:db)" });
@@ -217,7 +227,8 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const r = await step(p, w, CFG);
   ok("T6 deadline-expired → reentry", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
   ok("T6 db deadline-expired", nodeState(p, "db") === "deadline-expired");
-  ok("T6 root re-entry run-2", fs.existsSync(R(p, "run-2")) && nodeState(p, "(root)") === "active");
+  ok("T6 root RE-ACTIVATED (run-1, no run-2)", r.outcome?.window === "run-1" && !fs.existsSync(R(p, "run-2")) && nodeState(p, "(root)") === "active");
+  ok("T6 re-activation brief in RE-ENTRY.md", fs.readFileSync(R(p, "run-1/RE-ENTRY.md"), "utf8").includes("RE-ENTRY"));
 }
 
 // ================= T7 — blocked (stuck) → node blocked, halt, no launch
@@ -317,18 +328,23 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T12 second step skipped", r2.skipped === "chain-done", JSON.stringify(r2));
 }
 
-// ============ T13 — launch failure → blocked marker, window dir freed, no half-state
+// ============ T13 — re-activation launch failure → blocked, no new window, no half-state
 {
   const p = mkproj("t13-launchfail");
-  mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  mkNode(p, "auth", { deadline: ISO(inMin(90)) });
   fs.writeFileSync(path.join(p, ".pi-supervisor/launch-fail"), "1");
-  const w = mkWindow(p, "run-1", { status: "completed", exitReason: "hard-timeout", deadlineIso: ISO(Date.now() - 5000) });
-  const r = await step(p, w, CFG);
-  const m = readMarker(w);
+  mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" }); // root's spawn window
+  const cw = path.join(NR(p, "auth"), "run-1");
+  fs.mkdirSync(cw, { recursive: true });
+  fs.writeFileSync(path.join(cw, "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  const r = await step(p, cw, CFG);
+  const m = readMarker(cw);
   ok("T13 blocked outcome", m.outcome?.next === "halted" && /launch failed/i.test(m.outcome.reason), JSON.stringify(m.outcome));
   ok("T13 root blocked", nodeState(p, "(root)") === "blocked");
-  ok("T13 window dir freed", !fs.existsSync(R(p, "run-2")));
-  const r2 = await step(p, w, CFG);
+  ok("T13 STATE.md names the re-activation failure", /re-activation of run-1 failed/.test(fs.readFileSync(path.join(p, "STATE.md"), "utf8")), fs.readFileSync(path.join(p, "STATE.md"), "utf8").trim().split("\n").slice(-1)[0]);
+  ok("T13 no new window (the run dir stays)", !fs.existsSync(R(p, "run-2")) && fs.existsSync(R(p, "run-1")));
+  const r2 = await step(p, cw, CFG);
   ok("T13 idempotent after failure", r2.skipped === "chain-done");
 }
 
@@ -577,8 +593,10 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   }));
   const r3 = await step(p, dwin, CFG);
   ok("S8 db done → re-entry of auth (not root)", r3.outcome?.next === "reentry" && r3.outcome?.node_path === "auth", JSON.stringify(r3));
-  ok("S8 re-entry window in the AUTH project's runs dir", fs.existsSync(path.join(aproj, ".pi-supervisor", "runs", "run-2", "TASK.md")));
+  ok("S8 re-activates the AUTH project's spawn window (run-1)", r3.outcome?.window === "run-1" && fs.existsSync(path.join(awin, "RE-ENTRY.md")), JSON.stringify(r3.outcome));
+  ok("S8 no new auth window (no run-2)", !fs.existsSync(path.join(aproj, ".pi-supervisor", "runs", "run-2")));
   ok("S8 root run-2 NOT created (re-entry went one level)", !fs.existsSync(path.join(p, ".pi-supervisor", "runs", "run-2")));
+  ok("S8 consumed spawn request cleared (no double spawn)", !fs.existsSync(path.join(awin, "spawn-request.json")));
   ok("S8 db node done", readJsonFile(path.join(dproj, ".pi-supervisor", "node.json"))?.state === "done");
   ok("S8 auth active after re-entry", nodeState(p, "auth") === "active", nodeState(p, "auth"));
   ok("S8 root still paused(waiting:auth)", nodeState(p, "(root)") === "paused(waiting:auth)", nodeState(p, "(root)"));
@@ -618,42 +636,38 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   fs.chmodSync(stf, 0o644); // let the summary cleanup run clean
 }
 
-// ============ T18 — v0.30.0 P2/P4: continuation RESUMES the window's session
+// ============ T18 — v0.32.0 (3.2): budget used → NO continuation (resumable session or not)
 {
-  const p = mkproj("t18-cont-resume");
+  const p = mkproj("t18-budget-used");
   mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
   const sess = path.join(T, "sess-t18.jsonl");
   fs.writeFileSync(sess, JSON.stringify({ t: 1 }) + "\n");
   mkWindow(p, "run-1", { status: "completed", exitReason: "hard-timeout", deadlineIso: ISO(Date.now() - 5000), sessionFile: sess, sessionId: "t18" });
   const r = await step(p, R(p, "run-1"), CFG);
-  ok("T18 continuation launched", r.outcome?.next === "continuation" && r.outcome?.window === "run-2", JSON.stringify(r.outcome));
-  const args = fs.readFileSync(R(p, "run-2/launch-args.txt"), "utf8");
-  ok("T18 --session passed through", args.includes(`--session ${sess}`), args);
-  const brief = fs.readFileSync(R(p, "run-2/TASK.md"), "utf8");
-  ok("T18 resume brief (nudge, not handoff)", brief.includes("CONTINUATION (resume)") && brief.includes("RESUMES that session"), brief.slice(0, 200));
-  ok("T18 outcome flags resume", r.outcome?.resumed === true, JSON.stringify(r.outcome));
+  ok("T18 no continuation (3.2)", r.outcome?.next === "idle" && r.outcome?.reason === "budget-used", JSON.stringify(r.outcome));
+  ok("T18 no run-2 (no launch at all)", !fs.existsSync(R(p, "run-2")));
+  ok("T18 root paused", nodeState(p, "(root)") === "paused", nodeState(p, "(root)"));
+  ok("T18 3.2 note in STATE.md", /used its budget — the run ended at its deadline \(3\.2\)/.test(fs.readFileSync(path.join(p, "STATE.md"), "utf8")));
 }
 
-// ============ T19 — v0.30.0 P4: over the gate → fresh session + handoff brief
+// ============ T19 — v0.32.0 (3.2): budget used over the resume gate → still no continuation
 {
-  const p = mkproj("t19-cont-gate");
+  const p = mkproj("t19-budget-used");
   mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
   const sess = path.join(T, "sess-t19.jsonl");
   fs.writeFileSync(sess, "x".repeat(3_500_000)); // > 3MB default threshold
   mkWindow(p, "run-1", { status: "completed", exitReason: "hard-timeout", deadlineIso: ISO(Date.now() - 5000), sessionFile: sess });
   const r = await step(p, R(p, "run-1"), CFG);
-  ok("T19 continuation still launched", r.outcome?.next === "continuation", JSON.stringify(r.outcome));
-  const args = fs.readFileSync(R(p, "run-2/launch-args.txt"), "utf8");
-  ok("T19 NO --session over the gate", !args.includes("--session"), args);
-  const brief = fs.readFileSync(R(p, "run-2/TASK.md"), "utf8");
-  ok("T19 fresh handoff brief stands", brief.includes("CONTINUATION") && !brief.includes("(resume)") && brief.includes("Previous window's final report"), brief.slice(0, 160));
-  ok("T19 outcome flags fresh", r.outcome?.resumed === false, JSON.stringify(r.outcome));
+  ok("T19 no continuation (3.2)", r.outcome?.next === "idle" && r.outcome?.reason === "budget-used", JSON.stringify(r.outcome));
+  ok("T19 no run-2 (no launch at all)", !fs.existsSync(R(p, "run-2")));
+  ok("T19 root paused", nodeState(p, "(root)") === "paused", nodeState(p, "(root)"));
 }
 
 // ============ T20 — v0.30.0 P3: re-entry RESUMES the parent's pre-spawn session
 {
   const p = mkproj("t20-reentry-resume");
-  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  const nodeDl20 = ISO(inMin(120));
+  mkNode(p, "(root)", { deadline: nodeDl20, state: "paused(waiting:auth)" });
   mkNode(p, "auth", { deadline: ISO(inMin(90)) });
   const sess = path.join(T, "sess-t20.jsonl");
   fs.writeFileSync(sess, JSON.stringify({ t: 2 }) + "\n");
@@ -661,15 +675,23 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   fs.writeFileSync(path.join(rw, "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run-1" }));
   fs.mkdirSync(path.join(NR(p, "auth"), "run-1"), { recursive: true });
   fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  const origDl20 = JSON.parse(fs.readFileSync(path.join(rw, "pi-child-status.json"), "utf8")).deadlineIso;
   const r = await step(p, path.join(NR(p, "auth"), "run-1"), CFG);
-  ok("T20 reentry launched", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
-  const args = fs.readFileSync(R(p, "run-2/launch-args.txt"), "utf8");
+  ok("T20 reentry launched (re-activation)", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
+  ok("T20 RE-ACTIVATES the spawn window (run-1), no run-2", r.outcome?.window === "run-1" && !fs.existsSync(R(p, "run-2")), JSON.stringify(r.outcome));
+  ok("T20 original deadline unchanged", r.outcome?.deadline === origDl20, r.outcome?.deadline);
+  const args = fs.readFileSync(path.join(rw, "launch-args.txt"), "utf8");
   ok("T20 --session = parent's pre-spawn session", args.includes(`--session ${sess}`), args);
-  const brief = fs.readFileSync(R(p, "run-2/TASK.md"), "utf8");
+  ok("T20 launched into the same run dir", args.includes(`--out-dir ${rw}`) && args.includes(`--task-file ${path.join(rw, "RE-ENTRY.md")}`), args);
+  ok("T20 original TASK.md untouched", fs.readFileSync(path.join(rw, "TASK.md"), "utf8").includes("task run-1"));
+  const brief = fs.readFileSync(path.join(rw, "RE-ENTRY.md"), "utf8");
   ok("T20 resume brief: full context, no bookkeeping-only rule", brief.includes("RE-ENTRY (resume)") && brief.includes("RESUMES your own session") && !brief.includes("BOOKKEEPING"), brief.slice(0, 220));
   ok("T20 child report + spawn decision still embedded", brief.includes("Child's final report") && brief.includes('"node_path": "auth"'), brief.slice(0, 120));
   ok("T20 outcome flags resume", r.outcome?.resumed === true, JSON.stringify(r.outcome));
+  const act20 = active(p);
+  ok("T20 active.json → re-activated window", act20 && act20.node === "(root)" && act20.window === "run-1");
   ok("T20 STATE.md line says resumed", /resumed session/.test(fs.readFileSync(path.join(p, "STATE.md"), "utf8")), fs.readFileSync(path.join(p, "STATE.md"), "utf8").trim().split("\n").slice(-1)[0]);
+  ok("T20 root node deadline unchanged", readNode(p, "(root)")?.deadline === nodeDl20);
 }
 
 // ============ T21 — v0.30.0 P3: re-entry FRESH (no session recorded)
@@ -677,14 +699,17 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const p = mkproj("t21-reentry-fresh");
   mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
   mkNode(p, "auth", { deadline: ISO(inMin(90)) });
-  mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" }); // no sessionFile
+  const rw21 = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" }); // no sessionFile
+  const origDl21 = JSON.parse(fs.readFileSync(path.join(rw21, "pi-child-status.json"), "utf8")).deadlineIso;
   fs.mkdirSync(path.join(NR(p, "auth"), "run-1"), { recursive: true });
   fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
   const r = await step(p, path.join(NR(p, "auth"), "run-1"), CFG);
-  ok("T21 reentry launched", r.outcome?.next === "reentry", JSON.stringify(r.outcome));
-  const args = fs.readFileSync(R(p, "run-2/launch-args.txt"), "utf8");
+  ok("T21 reentry launched (re-activation)", r.outcome?.next === "reentry" && r.outcome?.window === "run-1", JSON.stringify(r.outcome));
+  ok("T21 no run-2", !fs.existsSync(R(p, "run-2")));
+  ok("T21 original deadline unchanged", r.outcome?.deadline === origDl21, r.outcome?.deadline);
+  const args = fs.readFileSync(R(p, "run-1/launch-args.txt"), "utf8");
   ok("T21 NO --session (nothing to resume)", !args.includes("--session"), args);
-  const brief = fs.readFileSync(R(p, "run-2/TASK.md"), "utf8");
+  const brief = fs.readFileSync(R(p, "run-1/RE-ENTRY.md"), "utf8");
   ok("T21 bookkeeping brief stands", brief.includes("RE-ENTRY") && brief.includes("BOOKKEEPING"), brief.slice(0, 160));
   ok("T21 outcome flags fresh", r.outcome?.resumed === false, JSON.stringify(r.outcome));
 }
@@ -731,11 +756,77 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
   const r = await step(p, path.join(NR(p, "auth"), "run-1"), CFG);
   ok("T23 reentry launched (parent is a run<N> dir)", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
-  const args = fs.readFileSync(R(p, "run-2/launch-args.txt"), "utf8");
+  ok("T23 re-activates the run<N> dir, no run-2", r.outcome?.window === "run1" && !fs.existsSync(R(p, "run-2")), JSON.stringify(r.outcome));
+  const args = fs.readFileSync(R(p, "run1/launch-args.txt"), "utf8");
   ok("T23 --session = parent's pre-spawn session", args.includes(`--session ${sess}`), args);
-  const brief = fs.readFileSync(R(p, "run-2/TASK.md"), "utf8");
+  const brief = fs.readFileSync(R(p, "run1/RE-ENTRY.md"), "utf8");
   ok("T23 non-null spawn decision embedded (5.1 observable)", brief.includes("RE-ENTRY (resume)") && brief.includes('"node_path": "auth"'), brief.slice(0, 220));
   ok("T23 outcome flags resume", r.outcome?.resumed === true, JSON.stringify(r.outcome));
+}
+
+// ============ T24 — re-activation refused: the original deadline is spent (1.2/3.2)
+{
+  const p = mkproj("t24-reentry-expired");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  mkNode(p, "auth", { deadline: ISO(inMin(90)) });
+  mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized", deadlineIso: ISO(Date.now() - 120000) }); // original deadline in the past
+  fs.writeFileSync(path.join(p, ".pi-supervisor", "runs", "run-1", "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run-1" }));
+  const aw = path.join(NR(p, "auth"), "run-1");
+  fs.mkdirSync(aw, { recursive: true });
+  fs.writeFileSync(path.join(aw, "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  const r = await step(p, aw, CFG);
+  ok("T24 no launch (deadline spent)", r.outcome?.next === "halted", JSON.stringify(r.outcome));
+  ok("T24 root blocked (human attention)", nodeState(p, "(root)") === "blocked");
+  ok("T24 no new window", !fs.existsSync(R(p, "run-2")));
+  const st = fs.readFileSync(path.join(p, "STATE.md"), "utf8");
+  ok("T24 STATE.md says the run is over (3.2) and names the sub-run report location", /run is over \(3\.2\)/.test(st) && st.includes(aw), st.trim().split("\n").slice(-1)[0]);
+}
+
+// ============ T25 — re-activation over the resume gate → fresh session, same run (5.3)
+{
+  const p = mkproj("t25-reentry-distill");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  mkNode(p, "auth", { deadline: ISO(inMin(90)) });
+  const sess = path.join(T, "sess-t25.jsonl");
+  fs.writeFileSync(sess, "x".repeat(3_500_000)); // > 3MB default threshold
+  const rw = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized", sessionFile: sess });
+  fs.writeFileSync(path.join(rw, "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run-1" }));
+  const origDl25 = JSON.parse(fs.readFileSync(path.join(rw, "pi-child-status.json"), "utf8")).deadlineIso;
+  const aw = path.join(NR(p, "auth"), "run-1");
+  fs.mkdirSync(aw, { recursive: true });
+  fs.writeFileSync(path.join(aw, "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  const r = await step(p, aw, CFG);
+  ok("T25 re-entry still re-activates run-1", r.outcome?.window === "run-1" && !fs.existsSync(R(p, "run-2")), JSON.stringify(r.outcome));
+  const args = fs.readFileSync(path.join(rw, "launch-args.txt"), "utf8");
+  ok("T25 NO --session over the gate (5.3)", !args.includes("--session"), args);
+  ok("T25 same deadline (5.3)", r.outcome?.deadline === origDl25, r.outcome?.deadline);
+  const brief = fs.readFileSync(path.join(rw, "RE-ENTRY.md"), "utf8");
+  ok("T25 fresh bookkeeping brief", brief.includes("RE-ENTRY") && brief.includes("BOOKKEEPING"), brief.slice(0, 160));
+  ok("T25 outcome flags fresh", r.outcome?.resumed === false, JSON.stringify(r.outcome));
+  ok("T25 gate reason in STATE.md", /threshold/.test(fs.readFileSync(path.join(p, "STATE.md"), "utf8")));
+}
+
+// ============ T26 — the re-activated window gets a FRESH step at its final end
+{
+  const p = mkproj("t26-reentry-resteps");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  mkNode(p, "auth", { deadline: ISO(inMin(90)) });
+  const rw = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" });
+  fs.writeFileSync(path.join(rw, "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run-1" }));
+  fs.writeFileSync(path.join(rw, "chain-done.json"), JSON.stringify({ v: 1, at: ISO(Date.now() - 300000), kind: "spawned", outcome: { next: "spawned", node_path: "auth", window: "run-1" } }));
+  const aw = path.join(NR(p, "auth"), "run-1");
+  fs.mkdirSync(aw, { recursive: true });
+  fs.writeFileSync(path.join(aw, "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  const r1 = await step(p, aw, CFG);
+  ok("T26 re-activation ran", r1.outcome?.next === "reentry" && r1.outcome?.window === "run-1", JSON.stringify(r1.outcome));
+  // the re-activated window now terminates (completed) — a FRESH step must run
+  // (NOT skipped: the chain-done marker was cleared on re-activation)
+  fs.writeFileSync(path.join(rw, "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 30000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(120)) }, null, 2));
+  const r2 = await step(p, rw, CFG);
+  ok("T26 final step is FRESH (marker cleared)", !r2.skipped && r2.kind === "completed", JSON.stringify(r2));
+  ok("T26 run ends idle/done", r2.outcome?.next === "idle" && r2.outcome?.reason === "root-done", JSON.stringify(r2.outcome));
+  ok("T26 root done", nodeState(p, "(root)") === "done");
+  ok("T26 active cleared", active(p) === null);
 }
 
 // ---------- summary ----------

@@ -332,7 +332,7 @@ export function sessionGate(windowDir, cfg) {
 // the guard detached). Synchronous: the chain must know before it records the
 // outcome. Returns { ok, error, launchOut }. sessionRef (v0.30.0) is passed to
 // launch.mjs/guard as --session: the window RESUMES that session file.
-function launchWindow(projectDir, nodePath, wdir, budget, cfg, windowDir, log, sessionRef = null) {
+function launchWindow(projectDir, nodePath, wdir, budget, cfg, windowDir, log, sessionRef = null, taskFile = null) {
   const L = cfg.launch || {};
   // v0.29.2 (run34): never hand launch.mjs a deadline it is forced to reject —
   // the same rule sizeDeadline applies at its wall clock, checked once here
@@ -353,7 +353,7 @@ function launchWindow(projectDir, nodePath, wdir, budget, cfg, windowDir, log, s
   const wproj = windowProjectOf(wdir) || projectDir;
   const args = [
     LAUNCH,
-    "--task-file", path.join(wdir, "TASK.md"),
+    "--task-file", taskFile || path.join(wdir, "TASK.md"),
     "--out-dir", wdir,
     "--project", wproj,
     "--tree-root", projectDir,
@@ -569,23 +569,14 @@ async function stepCore(projectDir, windowDir, cfg, log, standalone) {
         clearActiveSlots(projectDir, windowDir);
         return await reentry(parentName, projectDir, nodePath, windowDir, cfg, log, "deadline-expired", (o) => done(o));
       }
-      // continuation of the same node
-      const b = windowBudget({ nodeDeadline: nj.deadline, runtimeMin: cfg.launch?.runtimeMin ?? 90, now: new Date() });
-      if (!b.ok) { return haltBlocked(projectDir, nodePath, windowDir, log, `cannot size the continuation budget: ${b.why}`, (o) => done(o)); }
-      const prevReport = windowFinalReport(windowDir);
-      // v0.30.0: resume the previous window's session while the resume gate
-      // allows it (Box2D rule) — the run continues with full context; over the
-      // gate, the old fresh-session + handoff brief stands.
-      const gate = sessionGate(windowDir, cfg);
-      const brief = (wname) => gate.resume
-        ? briefResumeContinue({ nodePath, window: wname, prevWindowDir: windowDir, budget: b })
-        : briefContinuation({ nodePath, window: wname, prevWindowDir: windowDir, budget: b });
-      const opened = await openWithRetryName({ projectDir, nodePath, brief, budget: b, cfg, windowDir, log, sessionRef: gate.resume ? gate.ref : null });
-      if (!opened.ok) { return haltBlocked(projectDir, nodePath, windowDir, log, `continuation launch failed: ${opened.error}`, (o) => done(o)); }
-      setNodeState(projectDir, nodePath, "active");
+      // v0.32.0 (3.2): no automatic continuation — the run ENDED at its
+      // deadline (the hard timeout already killed the window); a new run is
+      // a human's (2.1) and picks up from the on-disk state. The node pauses.
+      setNodeState(projectDir, nodePath, "paused");
       appendState(projectDir, nodePath,
-        `- [${new Date().toISOString()}] window ${path.basename(windowDir)} used its budget — continuation ${opened.window} launched (${gate.resume ? `resumed session ${gate.sizeMb.toFixed(1)}MB` : `fresh session — ${gate.why}`}) (deadline ${new Date(b.deadlineMs).toISOString()})`);
-      return done({ next: "continuation", node_path: nodePath, window: opened.window, run_dir: opened.dir, deadline: new Date(b.deadlineMs).toISOString(), resumed: gate.resume });
+        `- [${new Date().toISOString()}] window ${path.basename(windowDir)} used its budget — the run ended at its deadline (3.2); goal not met; state on disk; a human starts the next run (2.1) (node deadline ${nj.deadline ?? "(none)"})`);
+      clearActiveSlots(projectDir, windowDir);
+      return done({ next: "idle", reason: "budget-used" });
     }
 
     // blocked (stuck / consult / error / aborted)
@@ -596,17 +587,29 @@ async function stepCore(projectDir, windowDir, cfg, log, standalone) {
 // header names its own window), launch. On launch failure: remove the freshly
 // allocated window dir (no process could have started from it) so the number
 // is not burned, and leave NO chain-done marker (retryable via repair).
-async function openWithRetryName({ projectDir, nodePath, brief, budget, cfg, windowDir, log, sessionRef = null }) {
-  const { window, dir: wdir } = await allocForNode(projectDir, nodePath);
-  if (!window) {
-    clog(projectDir, windowDir, `allocation failed for ${nodePath}: the node's runs dir is unresolvable (project dir missing?)`);
-    return { ok: false, error: "allocation failed (node's runs dir unresolvable)" };
+async function openWithRetryName({ projectDir, nodePath, brief, budget, cfg, windowDir, log, sessionRef = null, targetWindowDir = null, briefFile = "TASK.md" }) {
+  // v0.32.0 (2.3/5.1): targetWindowDir = RE-ACTIVATION — reuse an existing
+  // window dir (no allocation; nothing is removed on failure, the window
+  // stays), brief written to briefFile (RE-ENTRY.md, never the original task).
+  let window, wdir;
+  if (targetWindowDir) {
+    window = path.basename(targetWindowDir);
+    wdir = targetWindowDir;
+  } else {
+    const a = await allocForNode(projectDir, nodePath);
+    if (!a) {
+      clog(projectDir, windowDir, `allocation failed for ${nodePath}: the node's runs dir is unresolvable (project dir missing?)`);
+      return { ok: false, error: "allocation failed (node's runs dir unresolvable)" };
+    }
+    window = a.window; wdir = a.dir;
   }
-  fs.writeFileSync(path.join(wdir, "TASK.md"), brief(window));
-  const r = launchWindow(projectDir, nodePath, wdir, budget, cfg, windowDir, log, sessionRef);
+  fs.writeFileSync(path.join(wdir, briefFile), brief(window));
+  const r = launchWindow(projectDir, nodePath, wdir, budget, cfg, windowDir, log, sessionRef, briefFile === "TASK.md" ? null : path.join(wdir, briefFile));
   if (!r.ok) {
-    clog(projectDir, windowDir, `launch FAILED for ${nodePath}/${window}: ${r.error} — window dir removed (caller records the blocked outcome)`);
-    try { fs.rmSync(wdir, { recursive: true, force: true }); } catch { /* best effort */ }
+    clog(projectDir, windowDir, `launch FAILED for ${nodePath}/${window}: ${r.error}${targetWindowDir ? " — re-activation of the existing window (nothing removed)" : " — window dir removed (caller records the blocked outcome)"}`);
+    if (!targetWindowDir) {
+      try { fs.rmSync(wdir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
     return { ok: false, error: r.error };
   }
   // v0.27.0 §3: the chain maintains the TREE ROOT's active slot (what a root
@@ -664,7 +667,6 @@ export async function reentry(parentPath, projectDir, childPath, childWindowDir,
       }
     }
   }
-  const pnj = readNode(projectDir, parentPath);
   // the child's final window (its report is the re-entry's input) — the
   // child project's OWN runs dir.
   const childRuns = nodeRunsDir(projectDir, childPath);
@@ -673,35 +675,75 @@ export async function reentry(parentPath, projectDir, childPath, childWindowDir,
       `cannot resolve the child's runs dir for ${childPath} (registry entry without a project?) — human attention`, done);
   }
   const childFinalDir = path.join(childRuns, newestWindow(childRuns) || "run-1");
+  // v0.32.0 (2.3/5.1): the re-entry RE-ACTIVATES the parent's original run —
+  // the window that carried the spawn decision (or, without a decision on
+  // disk, the parent's newest window — its state is the on-disk fact) — same
+  // run dir, same deadline, no new window, no new run of its own project.
+  const pdir = nodeRunsDir(projectDir, parentPath);
+  if (!pdir) {
+    return haltBlocked(projectDir, parentPath, childWindowDir, log,
+      `cannot resolve the re-entry target's runs dir for ${parentPath} (registry entry without a project?) — human attention`, done);
+  }
+  let spawnWin = findSpawnWindow(projectDir, parentPath, childPath);
+  if (!spawnWin) {
+    let ents = [];
+    try { ents = fs.readdirSync(pdir, { withFileTypes: true }); } catch { ents = []; }
+    spawnWin = ents.filter((e) => e.isDirectory() && isWindowName(e.name))
+      .map((e) => e.name).sort((a, b) => windowNumber(b) - windowNumber(a))[0] || null;
+  }
+  if (!spawnWin) {
+    return haltBlocked(projectDir, parentPath, childWindowDir, log,
+      `cannot find the parent run to re-activate (no window in ${pdir}) — human attention`, done);
+  }
+  const winDir = path.join(pdir, spawnWin);
+  // The original deadline (1.2 invariant — a run owns its deadline; only a
+  // fresh human launch moves it): the guard-written status file, the monitor
+  // state as fallback.
+  const winSt = readJson(path.join(winDir, "pi-child-status.json")) || {};
+  const monSt = readJson(path.join(winDir, "ralph-monitor-state.json")) || {};
+  const origDl = winSt.deadlineIso || monSt.deadlineIso || winSt.deadline || null;
+  const origDlMs = origDl ? Date.parse(origDl) : NaN;
+  if (!origDl || Number.isNaN(origDlMs)) {
+    return haltBlocked(projectDir, parentPath, childWindowDir, log,
+      `cannot recover the original run's deadline (no deadlineIso in ${path.join(winDir, "pi-child-status.json")}) — human attention`, done);
+  }
+  // 1.2/3.2: the run may not re-activate if its deadline is spent — the SAME
+  // rule launchWindow applies (single source of truth).
+  const sized = sizeDeadline({ ts: new Date(origDlMs), finalizeMin: Number(cfg.launch?.finalizeMin) || 10, now: new Date() });
+  if (!sized.ok) {
+    return haltBlocked(projectDir, parentPath, childWindowDir, log,
+      `child ${childPath} ended (${childState}); the parent run's deadline (${origDl}) expired/was consumed before hand-back — the run is over (3.2); the sub-run's report is on disk at ${childFinalDir}; start a fresh run (2.1) to continue`, done);
+  }
+  const budget = { deadlineMs: origDlMs, deadlineIso: origDl, minutes: Math.max(0, Math.round((origDlMs - Date.now()) / 60000)), remainingMs: Math.max(0, origDlMs - Date.now()) };
   // the decision that launched THIS child lives in the PARENT's window that
   // carried the request (newest-first: a re-spawned child takes its latest)
   const decision = findSpawnDecision(projectDir, parentPath, childPath);
-  void childWindowDir; // kept in the signature for the log trail
-  const b = windowBudget({ nodeDeadline: pnj?.deadline ?? null, runtimeMin: cfg.launch?.runtimeMin ?? 90, now: new Date() });
-  if (!b.ok) return haltBlocked(projectDir, parentPath, childWindowDir, log, `cannot size the re-entry budget for ${parentPath}: ${b.why}`, done);
-  // v0.30.0: the parent's last session before the sub-run lives in the window
-  // that carried the spawn decision. While it stays under the resume gate
-  // (Box2D rule), the re-entry RESUMES it — the run continues with full
-  // context instead of a bookkeeping-only fresh turn.
-  const spawnWin = findSpawnWindow(projectDir, parentPath, childPath);
-  const gate = spawnWin
-    ? sessionGate(path.join(nodeRunsDir(projectDir, parentPath), spawnWin), cfg)
-    : { resume: false, why: "no spawn window found (decision missing?)", ref: null };
+  // v0.30.0 (5.1/5.2/5.3): the parent's last session before the sub-run lives
+  // in the re-activated window. Under the resume gate (Box2D rule) the re-entry
+  // RESUMES it — the run continues with full context; over the gate, a fresh
+  // session carrying the distilled brief (same run, same deadline).
+  const gate = sessionGate(winDir, cfg);
   const brief = (wname) => briefReentry({
     nodePath: parentPath, window: wname, childPath, childState,
-    childFinalDir, decision, budget: b, resume: gate.resume,
+    childFinalDir, decision, budget, resume: gate.resume,
   });
-  const opened = await openWithRetryName({ projectDir, nodePath: parentPath, brief, budget: b, cfg, windowDir: childWindowDir, log, sessionRef: gate.resume ? gate.ref : null });
+  // The prior step already recorded its outcome — clear the marker (and the
+  // consumed spawn request, else the final step re-spawns the same child)
+  // BEFORE the launch, under the existing lock (stepCore). The re-activated
+  // window's final termination then gets a fresh step.
+  fs.rmSync(path.join(winDir, "chain-done.json"), { force: true });
+  fs.rmSync(path.join(winDir, "spawn-request.json"), { force: true });
+  const opened = await openWithRetryName({ projectDir, nodePath: parentPath, brief, budget, cfg, windowDir: childWindowDir, log, sessionRef: gate.resume ? gate.ref : null, targetWindowDir: winDir, briefFile: "RE-ENTRY.md" });
   if (!opened.ok) {
     // the child already ended; the parent just cannot be relaunched right now
     setNodeState(projectDir, parentPath, "blocked");
-    appendState(projectDir, parentPath, `- [${new Date().toISOString()}] re-entry launch failed: ${opened.error}`);
-    return done({ next: "halted", reason: `reentry-launch-failed: ${opened.error}` });
+    appendState(projectDir, parentPath, `- [${new Date().toISOString()}] re-activation of ${spawnWin} failed: ${opened.error}`);
+    return done({ next: "halted", reason: `re-activation launch failed: ${opened.error}` });
   }
   setNodeState(projectDir, parentPath, "active");
   appendState(projectDir, parentPath,
-    `- [${new Date().toISOString()}] child ${childPath} ended (${childState}) — re-entry ${opened.window} launched (${gate.resume ? `resumed session ${gate.sizeMb.toFixed(1)}MB` : `fresh session — ${gate.why}`}) (deadline ${new Date(b.deadlineMs).toISOString()})`);
-  return done({ next: "reentry", node_path: parentPath, window: opened.window, run_dir: opened.dir, deadline: new Date(b.deadlineMs).toISOString(), child: childPath, resumed: gate.resume });
+    `- [${new Date().toISOString()}] child ${childPath} ended (${childState}) — run ${spawnWin} re-activated (${gate.resume ? `resumed session ${gate.sizeMb.toFixed(1)}MB` : `fresh session — ${gate.why}`}); deadline unchanged (${origDl})`);
+  return done({ next: "reentry", node_path: parentPath, window: spawnWin, run_dir: winDir, deadline: origDl, child: childPath, resumed: gate.resume });
 }
 
 function findSpawnDecision(projectDir, parentPath, childPath) {

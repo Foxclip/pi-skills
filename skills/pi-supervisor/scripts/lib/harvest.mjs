@@ -106,7 +106,18 @@ try {
 
 const exitReason = result.exitReason || status.exitReason || null;
 const alive = status.guardPid != null;
-const finalStatus = result.status || status.status || (exitReason ? exitReason : "unknown");
+let finalStatus = result.status || status.status || (exitReason ? exitReason : "unknown");
+// v0.32.0 (5.1): a pending SPAWN request is a PAUSE, not an end — the run
+// re-activates when the child comes back (chain reentry). The re-activated
+// run's final termination re-harvests and upserts the true terminal status.
+// A REJECTED decision is not a pause (the run ended normally).
+{
+  let dec = null;
+  if (fs.existsSync(path.join(runDir, "spawn-request.json"))) {
+    try { dec = JSON.parse(fs.readFileSync(path.join(runDir, "spawn-decision.json"), "utf8")); } catch { dec = null; }
+    if (!dec || dec.ok !== false) finalStatus = "paused";
+  }
+}
 
 // ---- 2. RUN-REPORT.md ------------------------------------------------------
 const L = [];

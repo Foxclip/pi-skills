@@ -618,7 +618,6 @@ async function stopLoop(pc) {
   // (divider + banner) and keep monitoring the new window instead of exiting
   // (run2: the terminal exited with "✓ done" while the tree kept running).
   saveState();
-  if (followSlot()) return;   // handoff → the loop continues on the new window
   // v0.25.4: event ordering — when the stop IS the child going terminal,
   // announce the child's state FIRST (same shape as the child beat line):
   // cause before reaction. (run11: the terminal state was first visible in
@@ -639,7 +638,16 @@ async function stopLoop(pc) {
   glog(pc.code === 0 ? "✓" : "✗", pc.code === 0 ? 32 : 31,
     `pre-check STOP: ${pc.reason} (cycle=${state.cycles} interventions=${state.interventions})`);
   saveState();
-  if (pc.code === 0 || pc.code === 4) await writeFinalReport(pc.reason);
+  // v0.32.0 (5.1/7.7): the pause-vs-end decision is the child's spawn
+  // request. WITH a pending spawn-request.json the run PAUSES (the chain
+  // re-activates this window on hand-back) — skip the final report (7.7: the
+  // report is for the run's END; run3 got one while pausing) and just follow
+  // the hand-back slot. WITHOUT one, the run truly ends — write the report
+  // BEFORE following the slot, so a hand-back that landed first cannot steal
+  // the report (hello-sub/run-1 had no FINAL-REPORT.md: the old order
+  // re-pointed first and skipped it).
+  const spawnPending = existsSync(path.join(A.runDir, "spawn-request.json"));
+  if (!spawnPending && (pc.code === 0 || pc.code === 4)) await writeFinalReport(pc.reason);
   // the slot can also land while the final report was being written (the
   // guard's chain step runs in parallel) — one last check before we exit.
   if (followSlot()) return;   // handoff → the loop continues on the new window
