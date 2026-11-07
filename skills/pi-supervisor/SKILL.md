@@ -20,7 +20,7 @@ If the child's job is fire-and-forget with no ongoing dialogue, `acp_delegate` i
 
 ## Spec — the confirmed model (v0.31.0)
 
-This Spec is the **main source of truth** for pi-supervisor. Any contradiction between the Spec and the code, or between the Spec and any other part of this SKILL.md, is resolved in favor of the Spec. The Spec may only be modified by an agent when the user asks.
+This Spec is the **main source of truth** for pi-supervisor. Any contradiction between the Spec and the code, or between the Spec and any other part of this SKILL.md, is resolved in favor of the Spec. The Spec may only be modified by an agent when the user asks. Entries are self-contained — an entry never references another entry.
 
 pi-supervisor runs a long, autonomous coding job that never stalls silently and can branch work into sub-projects — at a terminal, with a human at the boundaries.
 
@@ -38,7 +38,7 @@ The only primitive is **starting a run in a project**.
 
 ### 3. Worker rules
 - **3.1** A run (its session) **launches nothing** — it writes requests.
-- **3.2** A run works under its deadline. The run **ends** when its goal is met, its deadline is reached (its process is killed at hard timeout), or the process dies (6.3) — there is **no automatic continuation**; a new run (2.1) picks up from the on-disk state.
+- **3.2** A run works under its deadline. The run **ends** when its goal is met, its deadline is reached (its process is killed at hard timeout), or the process dies — there is **no automatic continuation**; a new run picks up from the on-disk state.
 
 ### 4. Supervisor — the point is to keep the run from stalling; two layers
 - **4.1 Monitor script** (deterministic, fast) — the easy stalls: thinking loops, exact message repetition, premature stopping; mechanical retry of the request when the model server times out.
@@ -47,7 +47,7 @@ The only primitive is **starting a run in a project**.
 
 ### 5. Session lifecycle (within a run)
 - **5.1 Re-entry (sub-run hand-back):** the sub-run finishes → its parent side writes the final report → the monitor activates the original session (resumes it) and sends a message into it (the sub-run's final report + spawn decision) → the run continues from its full context.
-- **5.2 Resume gate:** every resume (re-entry) is gated on the session's size — if the session file is above **~50–60% of the model's context window**, do **not** resume — distill instead (5.3).
+- **5.2 Resume gate:** every resume (re-entry) is gated on the session's size — if the session file is above **~50–60% of the model's context window**, do **not** resume — distill instead.
 - **5.3 Distill (context rot):** when the resume gate trips (session > ~50–60% of context window) or the parent judges the context rotted, the run's session is **replaced by a fresh one** carrying a distilled brief of the state (same run, same deadline). The guard's automatic context-overflow distill is the last-resort safety net.
 - **5.4** Sessions are always **finalized** (process exits, transcript on disk); continuing = re-activating by resume, never a kept-alive process.
 
@@ -59,18 +59,18 @@ The only primitive is **starting a run in a project**.
 
 ### 7. Durability
 - **7.1** Everything important is on disk and resumable: transcripts, state, reports, the tree.
-- **7.2** The **on-disk state** survives a reboot, so a fresh run can pick up from it. The live run does not: a reboot kills the owning terminal's process and the run ends (6.3).
+- **7.2** The **on-disk state** survives a reboot, so a fresh run can pick up from it. The live run does not: a reboot kills the owning terminal's process and the run ends.
 
 ### 8. Security — isolation the kernel enforces, not the prompt
 
 A run's model has full shell access and is **never trusted at the LLM layer** — no rule in a prompt can stop a process that can `rm -rf`. The guarantees below are therefore enforced by the OS (user/permission separation), not the prompt; that is what makes the rest of the Spec safe to run unattended. (Mechanics: the *Kernel protection* section.)
 
-- **8.1 Two trust domains.** The **trusted** side is the human and the deterministic supervisor (4.1). The **untrusted** side is every LLM process — the run's working session and the judging parent (4.2). Only the trusted side is privileged; both LLM processes run unprivileged.
+- **8.1 Two trust domains.** The **trusted** side is the human and the deterministic supervisor. The **untrusted** side is every LLM process — the run's working session and the judging parent. Only the trusted side is privileged; both LLM processes run unprivileged.
 - **8.2 Privilege separation.** Every LLM process runs as a dedicated **unprivileged OS user**, separated from the host by the kernel. It cannot read the host's home, and it **cannot escalate** — it holds no privilege by default.
-- **8.3 Ground-truth protection.** A run's on-disk state (7.1) is the ground truth, and it is protected *from the model that is producing it*: the model's write access to the project cannot move or delete the run tree that holds its transcripts and state.
+- **8.3 Ground-truth protection.** A run's on-disk state is the ground truth, and it is protected *from the model that is producing it*: the model's write access to the project cannot move or delete the run tree that holds its transcripts and state.
 - **8.4 Least privilege, per run.** Access is granted to what the run needs (its project, its run tree, its own sessions) and nothing more; it is scoped to the run and revocable, not standing.
-- **8.5 Escalation is an explicit, logged exception.** The model has no path to grow its own privilege. The only way a run gains privilege is a human opting it in (`--sudo`), which deliberately **voids** the isolation for that run, is flagged at launch, and is auditable in the transcript. A run can never extend its own deadline (1.2) or grant itself access.
-- **8.6 Auditability.** Everything a run does is recorded on disk (transcripts, logs) and survives the run (7.1); the untrusted side is reviewable after the fact.
+- **8.5 Escalation is an explicit, logged exception.** The model has no path to grow its own privilege. The only way a run gains privilege is a human opting it in (`--sudo`), which deliberately **voids** the isolation for that run, is flagged at launch, and is auditable in the transcript. A run can never extend its own deadline or grant itself access.
+- **8.6 Auditability.** Everything a run does is recorded on disk (transcripts, logs) and survives the run; the untrusted side is reviewable after the fact.
 - **8.7 Scope of the guarantee.** The isolation holds only where the kernel provides it (the protected default on a Linux host). In the opt-out, or on a host without the mechanism, there is **no** privilege separation — a run is only as safe as its prompt — and that is the operator's explicit choice. File/privilege isolation does not cover the network: the model can still reach the endpoints it needs.
 
 ## Quickstart — the main mode: `ralph.sh`
