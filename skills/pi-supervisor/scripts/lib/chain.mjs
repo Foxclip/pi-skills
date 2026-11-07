@@ -51,6 +51,7 @@ import {
   stateFileOf,
   ensureRootNode,
   ensureStateMdAt,
+  grantChildAccess,
   registerChild,
   commitDetached,
   allocWindowIn,
@@ -92,6 +93,11 @@ export function appendTolerant(file, text) {
       const bak = `${file}.bak-${Date.now()}-${process.pid}`;
       fs.renameSync(file, bak);
       fs.writeFileSync(file, old + text);
+      // v0.31.0 (PLAN-run2 item 3): the reclaim flipped ownership back to the
+      // caller — re-grant the worker on the state files it must be able to
+      // append (STATE.md/TASK.md only; chain.log lives in the child-owned run
+      // dir where the child has full control anyway).
+      if (/^(STATE|TASK)\.md$/.test(path.basename(file))) grantChildAccess(file);
       try { fs.unlinkSync(bak); } catch { /* best effort */ }
     } else {
       throw err;
@@ -824,6 +830,7 @@ async function processSpawnRequest(projectDir, parentNodePath2, windowDir, req, 
   }
   fs.mkdirSync(path.join(subDir, ".pi-supervisor", "runs"), { recursive: true });
   fs.writeFileSync(path.join(subDir, "TASK.md"), taskText); // the sub-project's task file
+  grantChildAccess(path.join(subDir, "TASK.md"));
   ensureStateMdAt(path.join(subDir, "STATE.md"), nm);
   if (!snj) {
     // parent = the parent node's path ("(root)" for a top-level sub-project

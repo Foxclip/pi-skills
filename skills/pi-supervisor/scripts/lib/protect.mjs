@@ -492,6 +492,17 @@ export function ensureProtection(opts) {
     if (t && fs.existsSync(t)) aclChainX(spec, t);
 
   aclSet(projectDir, spec, "rwx");
+  // v0.31.0 (PLAN-run2 item 3): the worker's own STATE.md/TASK.md updates must
+  // not depend on owning the file (run2: the child's distill write died EACCES
+  // on the chain-created STATE.md) — re-assert the named-user rw grant on
+  // every apply (idempotent; a chain-side reclaim flips ownership back to the
+  // owner, and a pre-fix tree gets healed here on the next launch).
+  for (const f of ["STATE.md", "TASK.md"]) {
+    const fpath = path.join(projectDir, f);
+    // "rw-" — getfacl's 3-char form; aclSet's idempotency pre-check compares
+    // against the raw getfacl line ("user:<u>:rw-"), so the perm must match it.
+    if (fs.existsSync(fpath)) aclSet(fpath, spec, "rw-");
+  }
   aclSet(psup, spec, "r-x");
   if (fs.existsSync(runs)) aclSet(runs, spec, "--x");
   if (fs.existsSync(runs)) {

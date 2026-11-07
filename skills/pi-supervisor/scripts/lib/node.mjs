@@ -35,6 +35,7 @@
 
 import fs from "fs";
 import path from "path";
+import { execFileSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 import { parseDeadline } from "./deadline.mjs";
 
@@ -199,17 +200,41 @@ export function readNode(rootProject, nodePath) {
   return p ? readJson(p) : null;
 }
 
+// v0.31.0 (PLAN-run2 item 3, run2 defect): the STATE.md/TASK.md grants.
+// Under kernel protection the chain side runs as the owner and the worker
+// side (the child's own bash) runs as the child user — a file the chain
+// created is child-unwritable, and the child's distill writes died EACCES
+// (run2: the worker's own STATE.md distill write was lost). The worker's
+// plain append must not depend on owning the file: every creation/reclaim
+// site grants the child u:<child>:rw, and protect.mjs re-asserts the sweep
+// at every bootstrap/attach/repair. Best effort — a failed setfacl must
+// never break the write path (the owner can always append; without setfacl
+// the child's write simply surfaces as EACCES in its own session and the
+// distill still reaches the chain via the final report).
+function childGrantUser() {
+  return process.env.PI_SUP_CHILD_USER || "pichild";
+}
+export function grantChildAccess(file) {
+  const user = childGrantUser();
+  if (!user || !fs.existsSync(file)) return;
+  try { execFileSync("setfacl", ["-m", `u:${user}:rw`, file], { stdio: "ignore" }); } catch { /* best effort */ }
+}
+
 export function ensureStateMdAt(p, name) {
-  if (fs.existsSync(p)) return;
-  fs.writeFileSync(p, [
-    `# STATE — ${name}`,
-    "",
-    "- goal: (set by the chain step / maintained by this node's child)",
-    "- verified facts:",
-    "  - (none yet)",
-    "- next: (none yet)",
-    "",
-  ].join("\n"));
+  if (!fs.existsSync(p)) {
+    fs.writeFileSync(p, [
+      `# STATE — ${name}`,
+      "",
+      "- goal: (set by the chain step / maintained by this node's child)",
+      "- verified facts:",
+      "  - (none yet)",
+      "- next: (none yet)",
+      "",
+    ].join("\n"));
+  }
+  // The worker must be able to append whatever created the file (owner-side
+  // create, or a later reclaim) — re-assert the grant, not just on create.
+  grantChildAccess(p);
 }
 
 // ---------- v2 materialization + the parent registry ------------------------
@@ -263,6 +288,7 @@ export function ensureRootNode(projectDir, { deadline = null, state = "active", 
     }
   }
   ensureStateMdAt(path.join(projectDir, "STATE.md"), ROOT);
+  grantChildAccess(path.join(projectDir, "TASK.md")); // the human's task file — the worker may update it
   return { node: readJson(p), dir: projectDir, created };
 }
 

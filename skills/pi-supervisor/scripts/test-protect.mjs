@@ -302,6 +302,48 @@ setTimeout(() => {}, 300000);
   const fa24 = sh("getfacl", ["-p", path.join(pkgRepo, ".git")]);
   ok(fa24.out.includes(`user:${TEST_USER}:`), "repo .git granted to child (umask-independent)");
 
+  // ---- S8: state-file grants (v0.31.0, PLAN-run2 item 3) -------------------
+  // The worker's own STATE.md/TASK.md updates must not depend on owning the
+  // file (run2: the child's distill write died EACCES on the chain-created
+  // STATE.md). The grant is u:<child>:rw, set at every create/reclaim site
+  // and re-asserted by protect apply. main() is sync, so the owner-side write
+  // paths run in node subprocesses (the grant reads PI_SUP_CHILD_USER at call
+  // time — passed via env).
+  console.log("S8: state-file grants (v0.31.0, PLAN-run2 item 3)");
+  const s8 = path.join(SB, "s8");
+  fs.mkdirSync(s8, { recursive: true });
+  const libDir = path.join(SKILL_DIR, "scripts", "lib");
+  const env8 = { ...process.env, PI_SUP_CHILD_USER: TEST_USER };
+  const ownerEnsureState = (file) => sh(NODE, ["--input-type=module", "-e",
+    `import { pathToFileURL } from "node:url"; const { ensureStateMdAt } = await import(pathToFileURL(${JSON.stringify(path.join(libDir, "node.mjs"))}).href); ensureStateMdAt(process.argv[1], "s8");`, file], { env: env8 });
+  const ownerAppend = (file, text) => sh(NODE, ["--input-type=module", "-e",
+    `import { pathToFileURL } from "node:url"; const { appendTolerant } = await import(pathToFileURL(${JSON.stringify(path.join(libDir, "chain.mjs"))}).href); appendTolerant(process.argv[1], process.argv[2]);`, file, text], { env: env8 });
+  const ownerGrant = (file) => sh(NODE, ["--input-type=module", "-e",
+    `import { pathToFileURL } from "node:url"; const { grantChildAccess } = await import(pathToFileURL(${JSON.stringify(path.join(libDir, "node.mjs"))}).href); grantChildAccess(process.argv[1]);`, file], { env: env8 });
+  const childUid = parseInt(asUser(TEST_USER, "id -u").out.trim(), 10);
+  const stA = path.join(s8, "STATE.md");
+  ok(ownerEnsureState(stA).code === 0, "S8a: owner-side ensureStateMdAt ok");
+  let r8 = asUser(TEST_USER, `printf 'child line\\n' >> ${sq(stA)}`);
+  ok(r8.code === 0 && !/EACCES|Permission denied/.test(r8.err), "S8a: child's own append to the owner-created STATE.md lands (no EACCES)");
+  ok(fs.readFileSync(stA, "utf8").includes("child line"), "S8a: child's distill line present in STATE.md");
+  const s8b = path.join(s8, "b");
+  fs.mkdirSync(s8b);
+  fs.chmodSync(s8b, 0o777); // the child creates its own STATE.md here
+  const stB = path.join(s8b, "STATE.md");
+  asUser(TEST_USER, `printf 'child-owned content\\n' > ${sq(stB)}`);
+  const r8b = ownerAppend(stB, "owner line\n");
+  const c8b = fs.existsSync(stB) ? fs.readFileSync(stB, "utf8") : "";
+  ok(r8b.code === 0 && c8b.includes("child-owned content") && c8b.includes("owner line"), "S8b: child-owned STATE.md appended by a differently-owned writer — reclaimed, not lost");
+  ok(fs.statSync(stB).uid !== childUid, "S8b: the reclaimed file is owner-owned");
+  const r8c = asUser(TEST_USER, `printf 'child line 2\\n' >> ${sq(stB)}`);
+  ok(r8c.code === 0, "S8b: child can still append after the owner's reclaim (grant re-asserted)");
+  ok(fs.readFileSync(stB, "utf8").includes("child line 2"), "S8b: child's post-reclaim line present");
+  const tk = path.join(s8, "TASK.md");
+  fs.writeFileSync(tk, "# task\n");
+  ok(ownerGrant(tk).code === 0, "S8c: owner-side grantChildAccess(TASK.md) ok");
+  const r8d = asUser(TEST_USER, `printf 'progress\\n' >> ${sq(tk)}`);
+  ok(r8d.code === 0 && fs.readFileSync(tk, "utf8").includes("progress"), "S8c: child's own TASK.md update lands (no EACCES)");
+
   // ---- S7: unprotect restores -----------------------------------------------
   console.log("S7: unprotect");
   // Remove child-owned files AS THE CHILD first — unprotect about to run
