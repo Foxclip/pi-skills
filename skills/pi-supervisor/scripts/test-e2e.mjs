@@ -75,9 +75,11 @@ mkdirSync(path.join(proj, "tasks"), { recursive: true });
 const taskFile = path.join(proj, "tasks", "auth-task.md");
 writeFileSync(taskFile, "AUTH_TASK_BODY — implement the auth sub-project (stub goal).");
 const runs = M.runsRoot(proj);           // the root's windows dir
-const DL_ROOT = new Date(Date.now() + 2 * 3600e3).toISOString();
+// run4 shape (plan F7): window deadline (7200 s) < sub deadline (7600 s) < node deadline (8400 s) —
+// the sub can legally out-run the parent window; the receipt must flag it (F3).
+const DL_ROOT = new Date(Date.now() + 2 * 3600e3 + 20 * 60e3).toISOString();
 M.ensureRootNode(proj, { deadline: DL_ROOT });
-const DL_AUTH = new Date(Date.now() + 3600e3).toISOString();
+const DL_AUTH = new Date(Date.now() + 7600e3).toISOString();
 const projOf = (nodePath) => nodePath === M.ROOT ? proj : M.projectOfNode(proj, nodePath).dir;
 const active = (nodePath) => M.activePath(projOf(nodePath));
 const jread = (p) => { try { return JSON.parse(readFileSync(p, "utf8")); } catch { return null; } };
@@ -135,6 +137,7 @@ r("W1 auth/run-1 sub brief: header + task verbatim + sub rules + budget",
   authBrief.split("\n")[0] || "(missing)");
 const dec1 = jread(path.join(w1d, "spawn-decision.json"));
 r("W1 spawn-decision.json ok (node auth, deadline ≈ request)", Boolean(dec1?.ok) && dec1.node_path === "auth" && dec1.window === "run-1", JSON.stringify(dec1 || null).slice(0, 140));
+r("W1 receipt WARN: sub deadline past the parent window's hard stop (F3, run4 shape)", typeof dec1?.warn === "string" && dec1.warn.startsWith("WARN: sub runtime exceeds the parent window's remaining"), String(dec1?.warn || "").slice(0, 120));
 const rootNode1 = jread(path.join(proj, ".pi-supervisor", "node.json"));
 r("W1 root node paused(waiting:auth)", rootNode1?.state === "paused(waiting:auth)", `state=${rootNode1?.state}`);
 const act1 = jread(active("auth"));
@@ -151,14 +154,19 @@ const authNode1 = jread(path.join(authDir, ".pi-supervisor", "node.json"));
 r("W1 auth node exists, deadline inherited from request", authNode1 && authNode1.state === "active" && new Date(authNode1.deadline).getTime() === new Date(DL_AUTH).getTime(), JSON.stringify(authNode1 || null).slice(0, 140));
 
 // ================= W2: auth/run-1 meets the goal — the chain RE-ACTIVATES root/run-1 ==============
+// The sub finished early (far inside its 2 h 10 m deadline), and the monitor that
+// followed the tree left its log in the sub's window dir (supervision followed the tree, F4).
+writeFileSync(path.join(authW1, "ralph-monitor.log"), `[${new Date().toISOString()}] cycle=1 decision=OK reason=sub-run working as expected\n`);
 endChild(authW1, { report: "Auth sub-project complete.\nAUTH-GOAL-MET\nCredentials module tested; see STATE.md." });
 const step2 = await step(proj, authW1, CFG);
 const reentryBrief = existsSync(path.join(w1d, "RE-ENTRY.md")) ? readFileSync(path.join(w1d, "RE-ENTRY.md"), "utf8") : "";
 r("W2 step → reentry RE-ACTIVATES root/run-1 (v0.32.0: no run-2)", step2?.outcome?.next === "reentry" && step2.outcome.node_path === M.ROOT && step2.outcome.window === "run-1" && step2.outcome.run_dir === w1d, JSON.stringify(step2?.outcome ?? step2));
 const reLaunch = jread(path.join(w1d, "launch-args.json"));
 r("W2 re-activation RESUMED root's pre-spawn session", reLaunch?.session === sessRoot1, JSON.stringify(reLaunch || null).slice(0, 160));
-r("W2 deadline unchanged (run's own deadline, not a fresh budget)", step2?.outcome?.deadline === origDlE2e && reLaunch?.deadline === String(Math.floor(Date.parse(origDlE2e) / 1000)), `outcome=${step2?.outcome?.deadline} args=${reLaunch?.deadline} orig=${origDlE2e}`);
+r("W2 deadline = the run's (node's) deadline (F1: fresh allocation within the run's deadline; 1.3)", step2?.outcome?.deadline === DL_ROOT && reLaunch?.deadline === String(Math.floor(Date.parse(DL_ROOT) / 1000)), `outcome=${step2?.outcome?.deadline} args=${reLaunch?.deadline} node=${DL_ROOT} window=${origDlE2e}`);
 r("W2 no run-2 dir + spawn marker cleared", !existsSync(path.join(runs, "run-2")) && !existsSync(path.join(w1d, "spawn-request.json")), `run2=${existsSync(path.join(runs, "run-2"))} req=${existsSync(path.join(w1d, "spawn-request.json"))}`);
+r("W2 monitor log present in the sub-run window dir (supervision followed the tree)", existsSync(path.join(authW1, "ralph-monitor.log")), `monitor-log=${existsSync(path.join(authW1, "ralph-monitor.log"))}`);
+r("W2 FINAL-REPORT.md only at the run's true end: none yet for the re-activated run (7.7)", !existsSync(path.join(w1d, "FINAL-REPORT.md")), `report=${existsSync(path.join(w1d, "FINAL-REPORT.md"))}`);
 r("W2 re-entry brief is the resume hand-off (full context, no bookkeeping-only rule)", reentryBrief.includes("RE-ENTRY (resume)") && reentryBrief.includes("RESUMES your own session") && !reentryBrief.includes("BOOKKEEPING"), reentryBrief.split("\n")[0] || "(missing)");
 r("W2 outcome flags resumed", step2?.outcome?.resumed === true, JSON.stringify(step2?.outcome ?? {}));
 r("W2 re-entry brief embeds auth's FINAL-REPORT (AUTH-GOAL-MET)", reentryBrief.includes("# RE-ENTRY") && reentryBrief.includes("AUTH-GOAL-MET") && /child node `auth` has ended \(state: done\)/.test(reentryBrief), reentryBrief.split("\n").slice(0, 4).join(" | ").slice(0, 160));
@@ -178,6 +186,7 @@ r("W2 harvest ran (RUN-REPORT + INDEX) without clobbering FINAL-REPORT",
 endChild(w1d, { report: "Re-entry: auth outcome distilled into STATE.md. Node (root) declares done.\nROOT-DONE" });
 const step3 = await step(proj, w1d, CFG);
 r("W3 step → idle (root-done)", step3?.outcome?.next === "idle" && step3.outcome.reason === "root-done", JSON.stringify(step3?.outcome ?? step3));
+r("W3 FINAL-REPORT.md exists at the run's true end (7.7)", existsSync(path.join(w1d, "FINAL-REPORT.md")), `report=${existsSync(path.join(w1d, "FINAL-REPORT.md"))}`);
 r("W3 active.json cleared (unlinked)", !existsSync(active(M.ROOT)), existsSync(active(M.ROOT)) ? "still present" : "gone");
 const rootNode3 = jread(path.join(proj, ".pi-supervisor", "node.json"));
 r("W3 root node done + STATE.md trail", rootNode3?.state === "done" && /window run-1 completed — node done/.test(readFileSync(path.join(proj, "STATE.md"), "utf8")), `state=${rootNode3?.state}`);
