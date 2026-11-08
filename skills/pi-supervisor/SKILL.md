@@ -18,11 +18,13 @@ A pi agent can spawn and converse with another pi agent. It is not limited to `a
 
 If the child's job is fire-and-forget with no ongoing dialogue, `acp_delegate` is usually better: clean context, async, result saved to a file.
 
-## Spec — the confirmed model (v0.32.0)
+## Spec — the confirmed model (v0.33.0)
 
 This Spec is the **main source of truth** for pi-supervisor. Any contradiction between the Spec and the code, or between the Spec and any other part of this SKILL.md, is resolved in favor of the Spec. The Spec may only be modified by an agent when the user asks. Entries are self-contained — an entry never references another entry.
 
 pi-supervisor runs a long, autonomous coding job that never stalls silently and can branch work into sub-projects — at a terminal, with a human at the boundaries.
+
+Two roles recur throughout the Spec. The **Worker** is the agent that does all the actual work — the run's working session. The **Judge** is the throwaway session that checks in periodically, views how the Worker is doing, and makes a verdict.
 
 ### 1. Structure
 - **1.1 Project tree.** A root project plus nested sub-projects (sub-folders). Each project has its own task and state. A project can contain **multiple runs** over its life.
@@ -42,27 +44,27 @@ The only primitive is **starting a run in a project**.
 
 ### 4. Supervisor — the point is to keep the run from stalling; two layers
 - **4.1 Monitor script** (deterministic, fast) — the easy stalls: thinking loops, exact message repetition, premature stopping; mechanical retry of the request when the model server times out.
-- **4.2 Parent** (an LLM judgment, run fresh each cycle) — the generalist: catches what the script can't (inexact/semantic loops, problems with the supervisor itself) and makes the decisions — context rot (distill → new session), continue, nudge/steer, stop, and the final report when work ends.
-- **4.3** The script is the fast reflex; the parent is the judgment. The parent is re-run fresh each cycle with all memory on disk, so a dead model kills one cycle, not the supervision.
+- **4.2 Judge** (a throwaway LLM judgment, run fresh each cycle) — the generalist: views how the Worker is doing, catches what the script can't (inexact/semantic loops, problems with the supervisor itself) and makes the verdict — context rot (distill → new session), continue, nudge/steer, stop, and the final report when work ends.
+- **4.3** The script is the fast reflex; the Judge is the judgment. The Judge is re-run fresh each cycle with all memory on disk, so a dead model kills one cycle, not the supervision.
 
 ### 5. Session lifecycle (within a run)
 - **5.1 Re-entry (sub-run hand-back):** the sub-run finishes → its parent side writes the final report → the monitor activates the original session (resumes it) and sends a message into it (the sub-run's final report + spawn decision) → the run continues from its full context.
 - **5.2 Resume gate:** every resume (re-entry) is gated on the session's size — if the session file is above **~50–60% of the model's context window**, do **not** resume — distill instead.
-- **5.3 Distill (context rot):** when the resume gate trips (session > ~50–60% of context window) or the parent judges the context rotted, the run's session is **replaced by a fresh one** carrying a distilled brief of the state (same run, same deadline). The guard's automatic context-overflow distill is the last-resort safety net.
+- **5.3 Distill (context rot):** when the resume gate trips (session > ~50–60% of context window) or the Judge verdicts the context rotted, the run's session is **replaced by a fresh one** carrying a distilled brief of the state (same run, same deadline). The guard's automatic context-overflow distill is the last-resort safety net.
 - **5.4** Sessions are always **finalized** (process exits, transcript on disk); continuing = re-activating by resume, never a kept-alive process.
 
 ### 6. Tree dynamics
 - **6.1** Exactly **one active run** across the whole tree at a time.
 - **6.2** A run is **owned by the terminal that launched it** and **dies with that terminal**. The owning terminal follows the active run down the tree; other terminals may attach read-only — their death is irrelevant to the run.
 - **6.3** When the owning terminal dies (close, kill, reboot), the run and its **whole owned tree** — active and paused, across sub-projects — is torn down. No orphaned processes.
-- **6.4** **Steering** is separate: the human sends a message to a session, stops a run, or requests a spawn; the parent can nudge a session through the same channel. The display never drives. **Ctrl-C in any attached terminal stops all running processes.**
+- **6.4** **Steering** is separate: the human sends a message to a session, stops a run, or requests a spawn; the Judge can nudge a session through the same channel. The display never drives. **Ctrl-C in any attached terminal stops all running processes.**
 
 ### 7. Terminal output
 - **7.1 The view, not the record.** The terminal is the human's live view of the run: derived from the on-disk state and disposable — an attach re-derives the same view from disk, and its death loses nothing (the run dies with it; the state survives on disk).
-- **7.2 The view, not the conversation.** The terminal shows what is happening *now*, not what was said — the child's transcript is never streamed into it; the transcript is on disk.
+- **7.2 The view, not the conversation.** The terminal shows what is happening *now*, not what was said — the Worker's transcript is never streamed into it; the transcript is on disk.
 - **7.3 Banner.** At start, a context banner: project, run, deadline, models.
-- **7.4 Progress.** Child progress lines — one per tool call, one per quiet minute; derived from the child's status, not its output.
-- **7.5 Judgment.** One parent judgment per cycle: a verdict line, with the full reasoning printed under it, not just the verdict. Full reasoning means the judgment's **final message** — its entire response, minus the DECISION line — not its thinking.
+- **7.4 Progress.** Worker progress lines — one per tool call, one per quiet minute; derived from the Worker's status, not its output.
+- **7.5 Judgment.** One Judge verdict per cycle: a verdict line, with the full reasoning printed under it, not just the verdict. Full reasoning means the Judge's **final message** — its entire response, minus the DECISION line — not its thinking.
 - **7.6 Handoff.** When the active run changes (a handoff to a sub-project, or a re-entry to the parent): a divider and tree banner, and the view re-points to the new run.
 - **7.7 The end.** The final report, printed to the terminal when the run ends.
 - **7.8 Local time.** All displayed time is **local time**, never ISO: each line carries a short local `[HH:MM:SS]`, and the deadline is shown as a local date and time. ISO-8601 (UTC) appears only in the files, not the terminal.
@@ -78,7 +80,7 @@ The only primitive is **starting a run in a project**.
 
 A run's model has full shell access and is **never trusted at the LLM layer** — no rule in a prompt can stop a process that can `rm -rf`. The guarantees below are therefore enforced by the OS (user/permission separation), not the prompt; that is what makes the rest of the Spec safe to run unattended. (Mechanics: the *Kernel protection* section.)
 
-- **9.1 Two trust domains.** The **trusted** side is the human and the deterministic supervisor. The **untrusted** side is every LLM process — the run's working session and the judging parent. Only the trusted side is privileged; both LLM processes run unprivileged.
+- **9.1 Two trust domains.** The **trusted** side is the human and the deterministic supervisor. The **untrusted** side is every LLM process — the Worker and the Judge. Only the trusted side is privileged; both LLM processes run unprivileged.
 - **9.2 Privilege separation.** Every LLM process runs as a dedicated **unprivileged OS user**, separated from the host by the kernel. It cannot read the host's home, and it **cannot escalate** — it holds no privilege by default.
 - **9.3 Ground-truth protection.** A run's on-disk state is the ground truth, and it is protected *from the model that is producing it*: the model's write access to the project cannot move or delete the run tree that holds its transcripts and state.
 - **9.4 Least privilege, per run.** Access is granted to what the run needs (its project, its run tree, its own sessions) and nothing more; it is scoped to the run and revocable, not standing.
