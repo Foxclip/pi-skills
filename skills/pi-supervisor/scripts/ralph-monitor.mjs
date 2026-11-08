@@ -379,6 +379,13 @@ function preCheck(status) {
     if (state.interventions >= A.maxInterventions)
       return { stop: true, code: 4, reason: "budget (interventions exhausted)" };
   }
+  // run11 fix (ping9/ping10 era): a terminal child state OTHER than completed
+  // before the deadline ends the window NOW — the guard has exited, nothing
+  // more will happen in this window. The old code kept polling (and judging
+  // a dead child) until the deadline: ping9's child died at 1 s, the monitor
+  // sat out the whole 4-min window and stopped with a misleading "deadline".
+  if (s === "error" || s === "stuck" || s === "failed" || s === "aborted")
+    return { stop: true, code: 5, reason: `child-terminal (${status.exitReason || s})` };
   return { stop: false };
 }
 
@@ -666,7 +673,10 @@ async function stopLoop(pc) {
   // the report (hello-sub/run-1 had no FINAL-REPORT.md: the old order
   // re-pointed first and skipped it).
   const spawnPending = existsSync(path.join(A.runDir, "spawn-request.json"));
-  if (!spawnPending && (pc.code === 0 || pc.code === 4)) {
+  // run11 fix: code 5 (child-terminal, non-completed) is ALSO the run's end
+  // when nothing is pending — 7.7 requires the final report at every end
+  // (ping9's error-stop would otherwise have exited silently).
+  if (!spawnPending && (pc.code === 0 || pc.code === 4 || pc.code === 5)) {
     // run4 fix (F2, 7.7): a chain HALT also ends the run — and it is decided
     // by the deterministic chain step (no LLM in the guard), so the final
     // report must carry the halt context from the durable marker (reason,

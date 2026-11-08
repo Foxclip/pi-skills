@@ -1784,23 +1784,26 @@ try {
     // Verified launch (kernel protection): the wrapper's process group must
     // contain a member running as the child user — an owner-privileged RPC
     // child would own the project tree and defeat the DAC.
+    let verifyDiag = "no polls"; // last observation, reported on failure
     for (let t = 0; t < 25 && !childVerified; t++) {
       await new Promise((r) => setTimeout(r, 200));
       try {
         const leader = readFileSync(childPidFile, "utf8").trim().split("\n")[0];
         const kids = readFileSync(`/proc/${leader}/task/${leader}/children`, "utf8").trim().split(/\s+/).filter(Boolean);
+        verifyDiag = `leader=${leader} kids=[${kids.join(",")}]`;
         for (const k of kids) {
           const line = readFileSync(`/proc/${k}/status`, "utf8").split("\n").find((l) => l.startsWith("Uid:"));
           const uid = line ? line.trim().split(/\s+/)[1] : "";
+          verifyDiag += ` uid(${k})=${uid || "?"}`;
           if (uid && uid !== String(process.getuid())) {
             childVerified = { user: childUser, uid, group: leader };
             break;
           }
         }
-      } catch { /* not up yet */ }
+      } catch (e) { verifyDiag = `poll error: ${e.message}`; }
     }
     if (!childVerified) {
-      logSup(`[error] kernel protection: could not verify the child runs as ${childUser} — aborting window`);
+      logSup(`[error] kernel protection: could not verify the child runs as ${childUser} — aborting window (last: ${verifyDiag})`);
       writeStatus("error", "protection-verification-failed");
       process.exit(49);
     }

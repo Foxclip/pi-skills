@@ -1196,6 +1196,32 @@ console.log("DECISION: OK");`);
     `exit=${r.status} report=${existsSync(rep)} head=${repText.split("\n").slice(0, 2).join(" | ").slice(0, 100)}`);
 }
 
+// ---- R45: run11 fix — a child that went terminally ERROR before the deadline
+// must stop the monitor IMMEDIATELY (exit 5 + final report), not poll to the
+// deadline (ping9: the child died at 1 s — the monitor judged the corpse for
+// the rest of the window and stopped with a misleading "deadline").
+{
+  const d = runDir("r45");
+  mkStatus(d, {
+    status: "error",
+    exitReason: "Agent process exited (code=143 signal=null). Stderr: ",
+    guardPid: null,
+    toolCalls: 0,
+    deadlineIso: new Date(Date.now() + 600_000).toISOString(),
+    at: new Date().toISOString(),
+  });
+  process.env.RM_INV_LOG = path.join(root, "inv-r45.log");
+  const r = runRm(d, STUB_INV, ["--once"]);
+  process.env.RM_INV_LOG = "";
+  const rep45 = path.join(d, "FINAL-REPORT.md");
+  report("R45 pre-deadline child error → immediate exit 5 + final report (ping9)",
+    r.status === 5
+    && /child-terminal \(Agent process exited/.test(readLog(d))
+    && existsSync(rep45)
+    && invLog("r45") === "REPORT\n",
+    `exit=${r.status} inv=${JSON.stringify(invLog("r45"))} report=${existsSync(rep45)} log=${readLog(d).trim().slice(0, 100)}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
