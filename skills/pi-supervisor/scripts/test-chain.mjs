@@ -804,21 +804,22 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T23 outcome flags resume", r.outcome?.resumed === true, JSON.stringify(r.outcome));
 }
 
-// ============ T24 — run4 replay (run4 fix F1): the dead WINDOW's deadline is
-// spent, the RUN's (node's) deadline is ALIVE → re-activation LAUNCHES. The old
-// gate halted here (52 s short of the window deadline) — D1-a: the re-entry is
-// part of the run, so its budget is the run's deadline, never the dead launch
-// instance's hard stop.
+// ============ T24 — run4 replay (run4 fix F1) at run4's EXACT values: hand-back
+// with window-remaining 10 m 52 s and node-remaining 21.7 min. The old gate sized
+// the re-entry against the window: floor(10.87)−10 (finalize) = 0 min → HALT
+// ("52 s short of the window's deadline") — while the run's (node's) deadline was
+// still 21.7 min out. D1-a: the re-entry is part of the run, so its budget is the
+// run's deadline, never the window's hard stop → re-activation LAUNCHES.
 {
-  const p = mkproj("t24-reentry-window-spent");
-  const nodeDl24 = ISO(inMin(120));
+  const p = mkproj("t24-reentry-run4-replay");
+  const nodeDl24 = ISO(inMin(21.7));
   mkNode(p, "(root)", { deadline: nodeDl24, state: "paused(waiting:auth)" });
-  mkNode(p, "auth", { deadline: ISO(inMin(90)) });
-  mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized", deadlineIso: ISO(Date.now() - 120000) }); // the dead window's hard stop, in the past
+  mkNode(p, "auth", { deadline: ISO(inMin(21.7)) });
+  mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized", deadlineIso: ISO(inMin(10.87)) }); // run4's window: 10 m 52 s of hard stop left at hand-back
   fs.writeFileSync(path.join(p, ".pi-supervisor", "runs", "run-1", "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run-1" }));
   const aw = path.join(NR(p, "auth"), "run-1");
   fs.mkdirSync(aw, { recursive: true });
-  fs.writeFileSync(path.join(aw, "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  fs.writeFileSync(path.join(aw, "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(21.7)) }, null, 2));
   const r = await step(p, aw, CFG);
   ok("T24 (run4 replay) re-entry LAUNCHED — the run's deadline is alive (F1)", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
   ok("T24 re-activates run-1 (no run-2)", r.outcome?.window === "run-1" && !fs.existsSync(R(p, "run-2")), JSON.stringify(r.outcome));
