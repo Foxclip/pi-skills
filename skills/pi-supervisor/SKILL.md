@@ -24,13 +24,12 @@ This Spec is the **main source of truth** for pi-supervisor. Any contradiction b
 
 pi-supervisor runs a long, autonomous coding job that never stalls silently and can branch work into sub-projects — at a terminal, with a human at the boundaries.
 
-Two roles recur throughout the Spec. The **Worker** is the agent that does all the actual work — the run's working session. The **Judge** is the throwaway session that checks in periodically, views how the Worker is doing, and makes a verdict.
-
 ### 1. Structure
 - **1.1 Project tree.** A root project plus nested sub-projects (sub-folders). Each project has its own task and state. A project can contain **multiple runs** over its life.
 - **1.2 Run.** A unit of work within a project. A run **owns a deadline** (invariant — only a fresh human launch moves it) and contains **one or more pi sessions** over its life.
 - **1.3 Sub-run.** A run *in a sub-project*, launched — by request through the monitor — by a run in the parent project. A sub-project is a container, not 1:1 with a run: the same session can request any number of runs in the same sub-project.
 - **1.4 Session.** The run's conversation with the model. Transcript on disk; the process is disposable. A session is finalized (process exits) and can be resumed.
+- **1.5 Worker.** The agent that does all the actual work — the run's working session.
 
 ### 2. Launch — one primitive, two triggers
 The only primitive is **starting a run in a project**.
