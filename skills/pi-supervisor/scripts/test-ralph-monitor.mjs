@@ -1133,6 +1133,69 @@ console.log("DECISION: OK");`);
     `exit=${r.status} report=${existsSync(rep)} logB=${logB.trim().split("\n").slice(0, 2).join(" | ").slice(0, 120)}`);
 }
 
+// ---- R43: run4 fix (F4, 6.2/7.6) — the pause path must WAIT for the
+// handoff slot: run4's terminal exited 1.7 s before the slot landed and the
+// sub-window ran with no monitor. The pause path makes no pi call the stub
+// could hook into, so the slot writer is a background process: it drops
+// active.json → r43-b ~1.2 s after the child went terminal.
+{
+  const proj = path.join(root, "r43-proj");
+  const dA = runDir("r43-a");
+  const dB = runDir("r43-b");
+  mkStatus(dA, { status: "completed", exitReason: "completed-finalized", guardPid: null, toolCalls: 5 });
+  writeFileSync(path.join(dA, "spawn-request.json"), JSON.stringify({ kind: "spawn", node: "auth", task: "tasks/auth.md" }));
+  mkStatus(dB, { status: "running" });
+  mkdirSync(path.join(proj, ".pi-supervisor"), { recursive: true });
+  const slotPath43 = path.join(proj, ".pi-supervisor", "active.json");
+  const slotJson43 = JSON.stringify({
+    run_dir: dB, node: "auth", guard_pid: process.pid, window: "run-2",
+    started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+  });
+  const writer = spawn(NODE, ["-e", `setTimeout(()=>{require("node:fs").writeFileSync(${JSON.stringify(slotPath43)}, ${JSON.stringify(slotJson43)});},1200);`], { stdio: "ignore" });
+  const t0 = Date.now();
+  const r = runRm(dA, STUB_INV, ["--project-dir", proj, "--once"]);
+  const dur = Date.now() - t0;
+  writer.kill();
+  const logA = readLog(dA);
+  const logB = readLog(dB);
+  report("R43 pause path WAITS for the handoff slot (F4 poll): re-points, no exit, no report",
+    r.status === 0
+    && dur >= 1000                                    // waited for the slot; did not exit at t=0
+    && !existsSync(path.join(dA, "FINAL-REPORT.md"))  // pause: no final report (7.7)
+    && /handoff: r43-a → r43-b \(node auth · run-2\)/.test(logB)  // re-pointed
+    && existsSync(path.join(dB, "ralph-monitor-state.json")),
+    `exit=${r.status} dur=${dur}ms lastA=${(logA.trim().split("\n").pop() || "").slice(0, 90)}`);
+}
+
+// ---- R44: run4 fix (F2, 7.7) — child-terminal + a chain HALT (durable
+// marker on disk, no pending spawn request) → the final report carries the
+// halt context (the marker's reason), not just the pre-check reason. The
+// stub echoes the halt line of the prompt it received, so the report file
+// proves the context reached the report call.
+{
+  const dA = runDir("r44-a");
+  mkStatus(dA, { status: "completed", exitReason: "completed-finalized", guardPid: null, toolCalls: 9 });
+  const haltReason44 = "child auth ended (done); the run's deadline (2026-11-08T07:07:28Z) was reached (3.2) before hand-back — the run is over";
+  writeFileSync(path.join(dA, "chain-halt.json"), JSON.stringify({ v: 1, at: new Date().toISOString(), kind: "completed", node: "(root)", reason: haltReason44, window: "run-1" }));
+  const stub44 = mkStub("pi-r44.mjs", `
+import { appendFileSync } from "node:fs";
+appendFileSync(process.env.RM_INV_LOG || "/dev/null", "REPORT\\n");
+const p = process.argv[process.argv.length - 1];
+console.log("thinking about the child's progress...");
+console.log(p.split("\\n").find((l) => l.includes("CHAIN HALT")) || "NO-HALT-CTX");
+console.log("DECISION: OK");`);
+  process.env.RM_INV_LOG = path.join(root, "inv-r44.log");
+  const r = runRm(dA, stub44, ["--once"]);
+  process.env.RM_INV_LOG = "";
+  const rep = path.join(dA, "FINAL-REPORT.md");
+  const repText = existsSync(rep) ? readFileSync(rep, "utf8") : "";
+  report("R44 chain halt at stop → FINAL-REPORT.md carries the halt context (F2)",
+    r.status === 0
+    && existsSync(rep)
+    && repText.includes(haltReason44),
+    `exit=${r.status} report=${existsSync(rep)} head=${repText.split("\n").slice(0, 2).join(" | ").slice(0, 100)}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);

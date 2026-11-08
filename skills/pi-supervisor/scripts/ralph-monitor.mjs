@@ -610,6 +610,25 @@ let finalWaitAnnounced = false;   // v0.24.3: announce the finalization wait onc
 // also runs on deadline/stuck endings — that is exactly when the user needs
 // the "what happened" answer, and the child is terminal here, so the model
 // slot is free for the report (a failed report never changes the exit code).
+// run4 fix (F2): the halt context for the final report — the durable
+// chain-halt.json marker first (greppable, written by the chain step), the
+// chain-done.json outcome as fallback. Null when the run did not end on a
+// chain halt.
+function readHaltContext() {
+  let halt = null;
+  try {
+    const h = JSON.parse(readFileSync(path.join(A.runDir, "chain-halt.json"), "utf8"));
+    if (h && (h.reason || h.outcome)) halt = h;
+  } catch { /* no marker */ }
+  if (!halt) {
+    try {
+      const d = JSON.parse(readFileSync(path.join(A.runDir, "chain-done.json"), "utf8"));
+      if (d && d.outcome && d.outcome.next === "halted") halt = d.outcome;
+    } catch { /* no marker */ }
+  }
+  if (!halt) return null;
+  return { reason: halt.reason || "no reason recorded" };
+}
 async function stopLoop(pc) {
   // v0.31.0 conform (6.2/6.3): the handoff slot is written by the EXITING
   // window's own guard in its final seconds (the chain step runs after the
@@ -647,7 +666,27 @@ async function stopLoop(pc) {
   // the report (hello-sub/run-1 had no FINAL-REPORT.md: the old order
   // re-pointed first and skipped it).
   const spawnPending = existsSync(path.join(A.runDir, "spawn-request.json"));
-  if (!spawnPending && (pc.code === 0 || pc.code === 4)) await writeFinalReport(pc.reason);
+  if (!spawnPending && (pc.code === 0 || pc.code === 4)) {
+    // run4 fix (F2, 7.7): a chain HALT also ends the run — and it is decided
+    // by the deterministic chain step (no LLM in the guard), so the final
+    // report must carry the halt context from the durable marker (reason,
+    // sub-run report location), not just the pre-check reason.
+    const hc = readHaltContext();
+    await writeFinalReport(hc ? `${pc.reason} — CHAIN HALT (the run is over): ${hc.reason}` : pc.reason);
+  }
+  // run4 fix (F4, 6.2/7.6): on the pause path (child-terminal + pending
+  // spawn request) the handoff slot is written by the EXITING window's guard
+  // in its chain step — it can land seconds after the status is durable.
+  // Poll it boundedly (~10 s) instead of exiting while the spawn is in
+  // flight (run4: the terminal exited 1.7 s before the slot landed and the
+  // sub-window ran with no monitor). No slotPath → no slot can ever land.
+  if (spawnPending && slotPath) {
+    for (let i = 0; i < 40; i++) {
+      if (followSlot()) return;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    glog("…", 33, "hand-off slot not observed after 10 s — chain may still be spawning; a later-attaching terminal follows the tree");
+  }
   // the slot can also land while the final report was being written (the
   // guard's chain step runs in parallel) — one last check before we exit.
   if (followSlot()) return;   // handoff → the loop continues on the new window
