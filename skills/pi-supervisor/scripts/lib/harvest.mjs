@@ -111,11 +111,24 @@ let finalStatus = result.status || status.status || (exitReason ? exitReason : "
 // re-activates when the child comes back (chain reentry). The re-activated
 // run's final termination re-harvests and upserts the true terminal status.
 // A REJECTED decision is not a pause (the run ended normally).
+// run4 fix (F5): a HALT is a terminal end — the chain-halt.json marker (F2)
+// overrides the pause, and so does a BLOCKED node: the pause only holds while
+// the node is still waiting; a blocked node means the run was halted, not
+// paused (run4: the entry read `paused` forever while the node said blocked).
 {
-  let dec = null;
-  if (fs.existsSync(path.join(runDir, "spawn-request.json"))) {
-    try { dec = JSON.parse(fs.readFileSync(path.join(runDir, "spawn-decision.json"), "utf8")); } catch { dec = null; }
-    if (!dec || dec.ok !== false) finalStatus = "paused";
+  if (fs.existsSync(path.join(runDir, "chain-halt.json"))) {
+    finalStatus = "halted";
+  } else {
+    let dec = null;
+    let nodeBlocked = false;
+    try {
+      const nj = JSON.parse(fs.readFileSync(path.join(projectDir, ".pi-supervisor", "node.json"), "utf8"));
+      nodeBlocked = Boolean(nj && nj.state === "blocked");
+    } catch { /* no node.json — keep the plain pause rule */ }
+    if (fs.existsSync(path.join(runDir, "spawn-request.json"))) {
+      try { dec = JSON.parse(fs.readFileSync(path.join(runDir, "spawn-decision.json"), "utf8")); } catch { dec = null; }
+      if (!dec || dec.ok !== false) finalStatus = nodeBlocked ? "halted" : "paused";
+    }
   }
 }
 

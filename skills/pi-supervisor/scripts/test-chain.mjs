@@ -179,11 +179,11 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
 // ================= T4 — sub completed → node done + parent run RE-ACTIVATED (2.3/5.1)
 {
   const p = mkproj("t4-reentry");
-  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  const nodeDl4 = ISO(inMin(120));
+  mkNode(p, "(root)", { deadline: nodeDl4, state: "paused(waiting:auth)" });
   mkNode(p, "auth", { deadline: ISO(inMin(90)) });
   const rw = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" }); // root's spawn window
   fs.writeFileSync(path.join(rw, "chain-done.json"), JSON.stringify({ v: 1, at: ISO(Date.now() - 300000), kind: "spawned", outcome: { next: "spawned", node_path: "auth", window: "run-1" } }));
-  const origDl4 = JSON.parse(fs.readFileSync(path.join(rw, "pi-child-status.json"), "utf8")).deadlineIso;
   fs.mkdirSync(path.join(NR(p, "auth"), "run-1"), { recursive: true });
   fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
   const w = path.join(NR(p, "auth"), "run-1");
@@ -193,7 +193,7 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T4 re-entry brief in RE-ENTRY.md", fs.existsSync(path.join(rw, "RE-ENTRY.md")) && fs.readFileSync(path.join(rw, "RE-ENTRY.md"), "utf8").includes("RE-ENTRY"));
   ok("T4 original TASK.md untouched", fs.readFileSync(path.join(rw, "TASK.md"), "utf8").includes("task run-1"));
   ok("T4 chain-done marker cleared (fresh step later)", !fs.existsSync(path.join(rw, "chain-done.json")));
-  ok("T4 original deadline unchanged", r.outcome?.deadline === origDl4, r.outcome?.deadline);
+  ok("T4 re-entry deadline = the run's (node's) deadline (run4 fix F1)", r.outcome?.deadline === nodeDl4, r.outcome?.deadline);
   const args4 = fs.readFileSync(path.join(rw, "launch-args.txt"), "utf8");
   ok("T4 launched into the same run dir", args4.includes(`--out-dir ${rw}`) && args4.includes(`--task-file ${path.join(rw, "RE-ENTRY.md")}`), args4);
   ok("T4 auth done", nodeState(p, "auth") === "done");
@@ -675,11 +675,10 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   fs.writeFileSync(path.join(rw, "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run-1" }));
   fs.mkdirSync(path.join(NR(p, "auth"), "run-1"), { recursive: true });
   fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
-  const origDl20 = JSON.parse(fs.readFileSync(path.join(rw, "pi-child-status.json"), "utf8")).deadlineIso;
   const r = await step(p, path.join(NR(p, "auth"), "run-1"), CFG);
   ok("T20 reentry launched (re-activation)", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
   ok("T20 RE-ACTIVATES the spawn window (run-1), no run-2", r.outcome?.window === "run-1" && !fs.existsSync(R(p, "run-2")), JSON.stringify(r.outcome));
-  ok("T20 original deadline unchanged", r.outcome?.deadline === origDl20, r.outcome?.deadline);
+  ok("T20 re-entry deadline = the run's (node's) deadline (run4 fix F1)", r.outcome?.deadline === nodeDl20, r.outcome?.deadline);
   const args = fs.readFileSync(path.join(rw, "launch-args.txt"), "utf8");
   ok("T20 --session = parent's pre-spawn session", args.includes(`--session ${sess}`), args);
   ok("T20 launched into the same run dir", args.includes(`--out-dir ${rw}`) && args.includes(`--task-file ${path.join(rw, "RE-ENTRY.md")}`), args);
@@ -697,16 +696,16 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
 // ============ T21 — v0.30.0 P3: re-entry FRESH (no session recorded)
 {
   const p = mkproj("t21-reentry-fresh");
-  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  const nodeDl21 = ISO(inMin(120));
+  mkNode(p, "(root)", { deadline: nodeDl21, state: "paused(waiting:auth)" });
   mkNode(p, "auth", { deadline: ISO(inMin(90)) });
   const rw21 = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" }); // no sessionFile
-  const origDl21 = JSON.parse(fs.readFileSync(path.join(rw21, "pi-child-status.json"), "utf8")).deadlineIso;
   fs.mkdirSync(path.join(NR(p, "auth"), "run-1"), { recursive: true });
   fs.writeFileSync(path.join(NR(p, "auth"), "run-1", "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
   const r = await step(p, path.join(NR(p, "auth"), "run-1"), CFG);
   ok("T21 reentry launched (re-activation)", r.outcome?.next === "reentry" && r.outcome?.window === "run-1", JSON.stringify(r.outcome));
   ok("T21 no run-2", !fs.existsSync(R(p, "run-2")));
-  ok("T21 original deadline unchanged", r.outcome?.deadline === origDl21, r.outcome?.deadline);
+  ok("T21 re-entry deadline = the run's (node's) deadline (run4 fix F1)", r.outcome?.deadline === nodeDl21, r.outcome?.deadline);
   const args = fs.readFileSync(R(p, "run-1/launch-args.txt"), "utf8");
   ok("T21 NO --session (nothing to resume)", !args.includes("--session"), args);
   const brief = fs.readFileSync(R(p, "run-1/RE-ENTRY.md"), "utf8");
@@ -764,34 +763,62 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T23 outcome flags resume", r.outcome?.resumed === true, JSON.stringify(r.outcome));
 }
 
-// ============ T24 — re-activation refused: the original deadline is spent (1.2/3.2)
+// ============ T24 — run4 replay (run4 fix F1): the dead WINDOW's deadline is
+// spent, the RUN's (node's) deadline is ALIVE → re-activation LAUNCHES. The old
+// gate halted here (52 s short of the window deadline) — D1-a: the re-entry is
+// part of the run, so its budget is the run's deadline, never the dead launch
+// instance's hard stop.
 {
-  const p = mkproj("t24-reentry-expired");
-  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  const p = mkproj("t24-reentry-window-spent");
+  const nodeDl24 = ISO(inMin(120));
+  mkNode(p, "(root)", { deadline: nodeDl24, state: "paused(waiting:auth)" });
   mkNode(p, "auth", { deadline: ISO(inMin(90)) });
-  mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized", deadlineIso: ISO(Date.now() - 120000) }); // original deadline in the past
+  mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized", deadlineIso: ISO(Date.now() - 120000) }); // the dead window's hard stop, in the past
   fs.writeFileSync(path.join(p, ".pi-supervisor", "runs", "run-1", "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run-1" }));
   const aw = path.join(NR(p, "auth"), "run-1");
   fs.mkdirSync(aw, { recursive: true });
   fs.writeFileSync(path.join(aw, "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
   const r = await step(p, aw, CFG);
-  ok("T24 no launch (deadline spent)", r.outcome?.next === "halted", JSON.stringify(r.outcome));
-  ok("T24 root blocked (human attention)", nodeState(p, "(root)") === "blocked");
-  ok("T24 no new window", !fs.existsSync(R(p, "run-2")));
-  const st = fs.readFileSync(path.join(p, "STATE.md"), "utf8");
-  ok("T24 STATE.md says the run is over (3.2) and names the sub-run report location", /run is over \(3\.2\)/.test(st) && st.includes(aw), st.trim().split("\n").slice(-1)[0]);
+  ok("T24 (run4 replay) re-entry LAUNCHED — the run's deadline is alive (F1)", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
+  ok("T24 re-activates run-1 (no run-2)", r.outcome?.window === "run-1" && !fs.existsSync(R(p, "run-2")), JSON.stringify(r.outcome));
+  ok("T24 deadline = the run's (node's) deadline", r.outcome?.deadline === nodeDl24, r.outcome?.deadline);
+  ok("T24 root active (not blocked)", nodeState(p, "(root)") === "active", nodeState(p, "(root)"));
+  ok("T24 no halt marker (the run continued)", !fs.existsSync(path.join(aw, "chain-halt.json")));
+}
+
+// ============ T24b — the RUN's (node's) deadline is genuinely spent → halt (3.2):
+// node blocked, halt marker (F2), INDEX halted (F5)
+{
+  const p = mkproj("t24b-run-deadline-spent");
+  mkNode(p, "(root)", { deadline: ISO(Date.now() - 120000), state: "paused(waiting:auth)" });
+  mkNode(p, "auth", { deadline: ISO(inMin(90)) });
+  mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" });
+  fs.writeFileSync(path.join(p, ".pi-supervisor", "runs", "run-1", "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run-1" }));
+  const aw = path.join(NR(p, "auth"), "run-1");
+  fs.mkdirSync(aw, { recursive: true });
+  fs.writeFileSync(path.join(aw, "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
+  const r = await step(p, aw, CFG);
+  ok("T24b halt (the run's deadline was reached, 3.2)", r.outcome?.next === "halted", JSON.stringify(r.outcome));
+  ok("T24b reason names the run's deadline and 3.2", /run's deadline/.test(r.outcome?.reason || "") && /was reached \(3\.2\)/.test(r.outcome?.reason || ""), r.outcome?.reason);
+  ok("T24b root blocked", nodeState(p, "(root)") === "blocked");
+  ok("T24b no launch (no run-2)", !fs.existsSync(R(p, "run-2")));
+  ok("T24b halt marker written (F2)", fs.existsSync(path.join(aw, "chain-halt.json")));
+  const hm = JSON.parse(fs.readFileSync(path.join(aw, "chain-halt.json"), "utf8"));
+  ok("T24b marker carries the window's node + reason", hm.node === "auth" && /was reached \(3\.2\)/.test(hm.reason || ""), JSON.stringify(hm));
+  const idx24b = JSON.parse(fs.readFileSync(R(p, "INDEX.json"), "utf8"));
+  ok("T24b INDEX run-1 entry says halted (F5)", idx24b.runs.find((e) => e.run === "run-1")?.status === "halted", JSON.stringify(idx24b));
 }
 
 // ============ T25 — re-activation over the resume gate → fresh session, same run (5.3)
 {
   const p = mkproj("t25-reentry-distill");
-  mkNode(p, "(root)", { deadline: ISO(inMin(120)), state: "paused(waiting:auth)" });
+  const nodeDl25 = ISO(inMin(120));
+  mkNode(p, "(root)", { deadline: nodeDl25, state: "paused(waiting:auth)" });
   mkNode(p, "auth", { deadline: ISO(inMin(90)) });
   const sess = path.join(T, "sess-t25.jsonl");
   fs.writeFileSync(sess, "x".repeat(3_500_000)); // > 3MB default threshold
   const rw = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized", sessionFile: sess });
   fs.writeFileSync(path.join(rw, "spawn-decision.json"), JSON.stringify({ ok: true, node_path: "auth", window: "run-1" }));
-  const origDl25 = JSON.parse(fs.readFileSync(path.join(rw, "pi-child-status.json"), "utf8")).deadlineIso;
   const aw = path.join(NR(p, "auth"), "run-1");
   fs.mkdirSync(aw, { recursive: true });
   fs.writeFileSync(path.join(aw, "pi-child-status.json"), JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(90)) }, null, 2));
@@ -799,7 +826,7 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T25 re-entry still re-activates run-1", r.outcome?.window === "run-1" && !fs.existsSync(R(p, "run-2")), JSON.stringify(r.outcome));
   const args = fs.readFileSync(path.join(rw, "launch-args.txt"), "utf8");
   ok("T25 NO --session over the gate (5.3)", !args.includes("--session"), args);
-  ok("T25 same deadline (5.3)", r.outcome?.deadline === origDl25, r.outcome?.deadline);
+  ok("T25 fresh allocation within the run's deadline (5.3, run4 fix F1)", r.outcome?.deadline === nodeDl25, r.outcome?.deadline);
   const brief = fs.readFileSync(path.join(rw, "RE-ENTRY.md"), "utf8");
   ok("T25 fresh bookkeeping brief", brief.includes("RE-ENTRY") && brief.includes("BOOKKEEPING"), brief.slice(0, 160));
   ok("T25 outcome flags fresh", r.outcome?.resumed === false, JSON.stringify(r.outcome));

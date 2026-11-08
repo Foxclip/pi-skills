@@ -482,6 +482,18 @@ async function stepCore(projectDir, windowDir, cfg, log, standalone) {
   const done = (outcome) => {
     const rec = { v: 1, at: new Date().toISOString(), kind, outcome };
     writeJson(marker, rec);
+    // run4 fix (F2): a halt is a TERMINAL run decision — leave a durable,
+    // greppable marker next to chain-done.json so the monitor can detect the
+    // halt without parsing prose and write the final report (7.7) with the
+    // halt context (the run ended; the sub-run's report is on disk).
+    if (outcome.next === "halted") {
+      try {
+        writeJson(path.join(windowDir, "chain-halt.json"), {
+          v: 1, at: new Date().toISOString(), kind, node: nodePath || ROOT,
+          reason: outcome.reason || null, window: path.basename(windowDir),
+        });
+      } catch { /* best effort — the marker is a convenience for the monitor */ }
+    }
     log(`step done: outcome=${outcome.next || "halted"}${outcome.node_path ? ` next=${outcome.node_path}/${outcome.window}` : ""}`);
     return { kind, outcome };
   };
@@ -696,25 +708,32 @@ export async function reentry(parentPath, projectDir, childPath, childWindowDir,
       `cannot find the parent run to re-activate (no window in ${pdir}) — human attention`, done);
   }
   const winDir = path.join(pdir, spawnWin);
-  // The original deadline (1.2 invariant — a run owns its deadline; only a
-  // fresh human launch moves it): the guard-written status file, the monitor
-  // state as fallback.
+  // The RUN's deadline (1.3 invariant — a run owns its deadline; only a fresh
+  // human launch moves it). run4 fixes (F1, D1-a): the re-entry is PART OF
+  // THE RUN, so its budget is sized against the NODE's deadline, not the dead
+  // launch instance's hard stop (run4: the window allocation had 10.9min
+  // left, the run had 21.7min — the old gate halted, 52s short of the
+  // window deadline). The window's recovered deadline stays only as the
+  // fallback when the node has none recorded.
+  const pnj = readNode(projectDir, parentPath) || {};
+  const nodeDl = pnj.deadline || null;
   const winSt = readJson(path.join(winDir, "pi-child-status.json")) || {};
   const monSt = readJson(path.join(winDir, "ralph-monitor-state.json")) || {};
-  const origDl = winSt.deadlineIso || monSt.deadlineIso || winSt.deadline || null;
-  const origDlMs = origDl ? Date.parse(origDl) : NaN;
-  if (!origDl || Number.isNaN(origDlMs)) {
+  const winDl = winSt.deadlineIso || monSt.deadlineIso || winSt.deadline || null;
+  const dlIso = nodeDl || winDl || null;
+  const dlMs = dlIso ? Date.parse(dlIso) : NaN;
+  if (!dlIso || Number.isNaN(dlMs)) {
     return haltBlocked(projectDir, parentPath, childWindowDir, log,
-      `cannot recover the original run's deadline (no deadlineIso in ${path.join(winDir, "pi-child-status.json")}) — human attention`, done);
+      `cannot recover the run's deadline (no deadline on the node and no deadlineIso in ${path.join(winDir, "pi-child-status.json")}) — human attention`, done);
   }
-  // 1.2/3.2: the run may not re-activate if its deadline is spent — the SAME
+  // 1.3/3.2: the run may not re-activate if its deadline is spent — the SAME
   // rule launchWindow applies (single source of truth).
-  const sized = sizeDeadline({ ts: new Date(origDlMs), finalizeMin: Number(cfg.launch?.finalizeMin) || 10, now: new Date() });
+  const sized = sizeDeadline({ ts: new Date(dlMs), finalizeMin: Number(cfg.launch?.finalizeMin) || 10, now: new Date() });
   if (!sized.ok) {
     return haltBlocked(projectDir, parentPath, childWindowDir, log,
-      `child ${childPath} ended (${childState}); the parent run's deadline (${origDl}) expired/was consumed before hand-back — the run is over (3.2); the sub-run's report is on disk at ${childFinalDir}; start a fresh run (2.1) to continue`, done);
+      `child ${childPath} ended (${childState}); the run's deadline (${dlIso}) was reached (3.2) before hand-back — the run is over; the sub-run's report is on disk at ${childFinalDir}; start a fresh run (2.1) to continue`, done);
   }
-  const budget = { deadlineMs: origDlMs, deadlineIso: origDl, minutes: Math.max(0, Math.round((origDlMs - Date.now()) / 60000)), remainingMs: Math.max(0, origDlMs - Date.now()) };
+  const budget = { deadlineMs: dlMs, deadlineIso: dlIso, minutes: Math.max(0, Math.round((dlMs - Date.now()) / 60000)), remainingMs: Math.max(0, dlMs - Date.now()) };
   // the decision that launched THIS child lives in the PARENT's window that
   // carried the request (newest-first: a re-spawned child takes its latest)
   const decision = findSpawnDecision(projectDir, parentPath, childPath);
@@ -742,8 +761,8 @@ export async function reentry(parentPath, projectDir, childPath, childWindowDir,
   }
   setNodeState(projectDir, parentPath, "active");
   appendState(projectDir, parentPath,
-    `- [${new Date().toISOString()}] child ${childPath} ended (${childState}) — run ${spawnWin} re-activated (${gate.resume ? `resumed session ${gate.sizeMb.toFixed(1)}MB` : `fresh session — ${gate.why}`}); deadline unchanged (${origDl})`);
-  return done({ next: "reentry", node_path: parentPath, window: spawnWin, run_dir: winDir, deadline: origDl, child: childPath, resumed: gate.resume });
+    `- [${new Date().toISOString()}] child ${childPath} ended (${childState}) — run ${spawnWin} re-activated (${gate.resume ? `resumed session ${gate.sizeMb.toFixed(1)}MB` : `fresh session — ${gate.why}`}); deadline unchanged (${dlIso})`);
+  return done({ next: "reentry", node_path: parentPath, window: spawnWin, run_dir: winDir, deadline: dlIso, child: childPath, resumed: gate.resume });
 }
 
 function findSpawnDecision(projectDir, parentPath, childPath) {
@@ -779,7 +798,32 @@ function haltBlocked(projectDir, nodePath, windowDir, log, reason, done) {
   setNodeState(projectDir, nodePath, "blocked");
   appendState(projectDir, nodePath, `- [${new Date().toISOString()}] window ${path.basename(windowDir)}: ${reason}`);
   clearActiveSlots(projectDir, windowDir);
+  markRunHalted(projectDir, nodePath);
   return done({ next: "halted", reason });
+}
+// run4 fix (F5): a halt is the run's end state — the node says `blocked`, so
+// the run's INDEX entry says `halted` too (before the fix, a pending
+// spawn-request kept the entry `paused` forever while the node said blocked —
+// three contradictory end states in one tree). Best effort.
+function markRunHalted(projectDir, nodePath) {
+  const runs = nodeRunsDir(projectDir, nodePath);
+  if (!runs) return;
+  let ents = [];
+  try { ents = fs.readdirSync(runs, { withFileTypes: true }); } catch { return; }
+  const win = ents.filter((e) => e.isDirectory() && isWindowName(e.name))
+    .map((e) => e.name).sort((a, b) => windowNumber(b) - windowNumber(a))[0];
+  if (!win) return;
+  try {
+    const idxPath = path.join(runs, "INDEX.json");
+    let idx = readJson(idxPath);
+    if (!idx || typeof idx !== "object" || !Array.isArray(idx.runs)) idx = { v: 1, updated: null, runs: [] };
+    idx.updated = new Date().toISOString();
+    const i = idx.runs.findIndex((r) => r.run === win);
+    const entry = i >= 0 ? idx.runs[i] : { run: win, dir: path.join(runs, win) };
+    entry.status = "halted";
+    if (i >= 0) idx.runs[i] = entry; else idx.runs.push(entry);
+    writeJson(idxPath, idx);
+  } catch { /* best effort — the halt itself is the truth */ }
 }
 
 // The node's deadline (if any) has passed. Also ADOPTS the window's own
