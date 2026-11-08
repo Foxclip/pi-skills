@@ -26,10 +26,12 @@ pi-supervisor runs a long, autonomous coding job that never stalls silently and 
 
 ### 1. Structure
 - **1.1 Project tree.** A root project plus nested sub-projects (sub-folders). Each project has its own task and state. A project can contain **multiple runs** over its life.
-- **1.2 Run.** A unit of work within a project. A run **owns a deadline** (invariant — only a fresh human launch moves it) and contains **one or more pi sessions** over its life.
-- **1.3 Sub-run.** A run *in a sub-project*, launched — by request through the monitor — by a run in the parent project. A sub-project is a container, not 1:1 with a run: the same session can request any number of runs in the same sub-project.
-- **1.4 Session.** The run's conversation with the model. Transcript on disk; the process is disposable. A session is finalized (process exits) and can be resumed.
-- **1.5 Worker.** The agent that does all the actual work — the run's working session.
+- **1.2 Project.** A single project — the root or a sub-project — is the unit that owns a task and a state; it can contain **multiple runs** over its life.
+- **1.3 Run.** A unit of work within a project. A run **owns a deadline** (invariant — only a fresh human launch moves it) and contains **one or more pi sessions** over its life.
+- **1.4 Sub-run.** A run *in a sub-project*, launched — by request through the monitor — by a run in the parent project. A sub-project is a container, not 1:1 with a run: the same session can request any number of runs in the same sub-project.
+- **1.5 Session.** The run's conversation with the model. Transcript on disk; the process is disposable. A session is finalized (process exits) and can be resumed.
+- **1.6 Worker.** The agent that does all the actual work — the run's working session.
+- **1.7 Judge.** A throwaway LLM judgment, run fresh each cycle — the generalist: views how the Worker is doing, catches what the script can't (inexact/semantic loops, problems with the supervisor itself) and makes the verdict — context rot (distill → new session), continue, nudge/steer, stop, and the final report when work ends.
 
 ### 2. Launch — one primitive, two triggers
 The only primitive is **starting a run in a project**.
@@ -43,8 +45,7 @@ The only primitive is **starting a run in a project**.
 
 ### 4. Supervisor — the point is to keep the run from stalling; two layers
 - **4.1 Monitor script** (deterministic, fast) — the easy stalls: thinking loops, exact message repetition, premature stopping; mechanical retry of the request when the model server times out.
-- **4.2 Judge** (a throwaway LLM judgment, run fresh each cycle) — the generalist: views how the Worker is doing, catches what the script can't (inexact/semantic loops, problems with the supervisor itself) and makes the verdict — context rot (distill → new session), continue, nudge/steer, stop, and the final report when work ends.
-- **4.3** The script is the fast reflex; the Judge is the judgment. The Judge is re-run fresh each cycle with all memory on disk, so a dead model kills one cycle, not the supervision.
+- **4.2** The script is the fast reflex; the Judge is the judgment. The Judge is re-run fresh each cycle with all memory on disk, so a dead model kills one cycle, not the supervision.
 
 ### 5. Session lifecycle (within a run)
 - **5.1 Re-entry (sub-run hand-back):** the sub-run finishes → its parent side writes the final report → the monitor activates the original session (resumes it) and sends a message into it (the sub-run's final report + spawn decision) → the run continues from its full context.
