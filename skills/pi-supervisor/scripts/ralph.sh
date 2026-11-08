@@ -443,6 +443,44 @@ if (!s.ok) process.stdout.write(s.why);
       saye "${C_Y}⚠${C_N} spawn budget warning: ${SP_FEAS} — the chain step will REJECT this launch when the window ends. Re-issue with a larger --runtime or a later --deadline before ending your turn (the request below is written as-is).${C_N}"
     fi
   fi
+
+  # run4 fix (F3, V5): spawn receipt pre-check — the sub's runtime vs the PARENT
+  # WINDOW's remaining budget (the window that hosts this spawn request; its
+  # status file is the same source the chain step reads). A WARN, not a
+  # rejection: early-finish sub-runs are legal (run4's finished in 62 s). The
+  # overshoot only changes supervision topology (the sub runs while its parent
+  # window is dead) and, pre-F1, would have ended the run at hand-back (3.2);
+  # post-F1 the re-entry gate sizes against the run's deadline, so this is
+  # informational — printed so the judge can re-issue with a smaller runtime.
+  SP_OVR=""
+  if [ -n "$SP_RUNTIME_MIN$SP_DEADLINE" ] && [ -n "$PI_SUP_RUN_DIR" ] && [ -f "$PI_SUP_RUN_DIR/pi-child-status.json" ]; then
+    SP_OVR="$(SP_PWSTATUS="$PI_SUP_RUN_DIR/pi-child-status.json" SP_RT="$SP_RUNTIME_MIN" SP_DL="$SP_DEADLINE" SP_PNJB="${SP_PROJ:-}/.pi-supervisor/node.json" node -e '
+const fs = require("fs");
+const j = (p) => { try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; } };
+const st = j(process.env.SP_PWSTATUS);
+const dl = (st && (st.deadlineIso || st.deadline)) || null;
+const ms = dl ? Date.parse(dl) : NaN;
+if (!dl || Number.isNaN(ms)) process.exit(0);
+// the effective deadline of the sub — the SAME resolution the chain step
+// applies: an absolute deadline from the request wins; else the minimum of
+// the node deadline and now + runtime.
+const pn = j(process.env.SP_PNJB) || {};
+const rt = Number(process.env.SP_RT);
+let subMs = null;
+if (process.env.SP_DL) { const q = Date.parse(process.env.SP_DL); if (!Number.isNaN(q)) subMs = q; }
+if (subMs === null) {
+  let cap = Infinity;
+  if (pn.deadline) { const q = Date.parse(pn.deadline); if (!Number.isNaN(q)) cap = q; }
+  if (Number.isFinite(rt) && rt > 0) cap = Math.min(cap, Date.now() + rt * 60000);
+  if (cap !== Infinity) subMs = cap;
+}
+if (subMs === null || subMs <= ms) process.exit(0);
+const remMin = Math.floor((ms - Date.now()) / 60000);
+const lead = (Number.isFinite(rt) && rt > 0) ? "sub runtime (" + rt + "m)" : "sub deadline (" + process.env.SP_DL + ")";
+process.stdout.write(lead + " exceeds the parent window" + String.fromCharCode(39) + "s remaining (" + remMin + "m); if the sub-run uses its full budget, the hand-back lands after the parent window" + String.fromCharCode(39) + "s hard stop (" + dl + ") and the run ends (3.2) — pass a smaller --runtime to keep re-entry inside the window");
+' 2>/dev/null || true)"
+  fi
+  [ -n "$SP_OVR" ] && saye "${C_Y}⚠${C_N} spawn receipt: WARN — ${SP_OVR}${C_N}"
   SP_REQ="${PI_SUP_RUN_DIR}/spawn-request.json"
   SP_REQ_JSON="$(SP_NAME="$SP_NAME" SP_TASK_ABS="$SP_TASK_ABS" SP_DEADLINE="$SP_DEADLINE" SP_RUNTIME_MIN="$SP_RUNTIME_MIN" SP_REASON="$SP_REASON" SP_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" node -e '
 const j = {

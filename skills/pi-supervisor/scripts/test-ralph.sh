@@ -469,6 +469,35 @@ RC=$?
   && ok "S16: feasible spawn → green receipt, no warning" \
   || bad "S16: rc=$RC $(head -8 $T/S16.log)"
 
+# S16b (run4 fix, F3): spawn receipt pre-check — the sub's runtime vs the PARENT
+# WINDOW's remaining. Synthetic window with 11 m 54 s left: --runtime 15 → the
+# receipt carries the WARN; --runtime 5 → no WARN.
+mkdir -p $T/projS16b/.pi-supervisor/runs/run-1
+echo '{"v":2,"name":"(root)","path":"(root)","parent":null,"state":"active","children":[]}' > $T/projS16b/.pi-supervisor/node.json
+echo "# root task" > $T/projS16b/TASK.md
+echo "# sub task" > $T/spawn-task-S16b.md
+D16B="$(node -e 'process.stdout.write(new Date(Date.now() + 714000).toISOString())')"
+cat > $T/projS16b/.pi-supervisor/runs/run-1/pi-child-status.json <<EOF
+{"v":2,"at":"$(date -u +%Y-%m-%dT%H:%M:%S.000Z)","status":"running","deadlineIso":"$D16B"}
+EOF
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$T/projS16b/.pi-supervisor/runs/run-1 ralph.sh spawn \
+  --name slow15 --task $T/spawn-task-S16b.md --runtime 15 > $T/S16b.log 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && grep -q "spawn receipt: WARN" $T/S16b.log \
+  && grep -q "sub runtime (15m) exceeds the parent window's remaining (11m)" $T/S16b.log \
+  && ok "S16b: --runtime 15 vs window 11m54s → receipt WARN" \
+  || bad "S16b: rc=$RC $(head -8 $T/S16b.log)"
+[ -f $T/projS16b/.pi-supervisor/runs/run-1/spawn-request.json ] \
+  && ok "S16b: WARN does not refuse — request still written" \
+  || bad "S16b: no spawn-request.json"
+rm -f $T/projS16b/.pi-supervisor/runs/run-1/spawn-request.json
+PATH="$T/sandbox/scripts:$PATH" PI_SUP_RUN_DIR=$T/projS16b/.pi-supervisor/runs/run-1 ralph.sh spawn \
+  --name fast5 --task $T/spawn-task-S16b.md --runtime 5 > $T/S16b-5.log 2>&1
+RC=$?
+[ "$RC" -eq 0 ] && ! grep -q "spawn receipt: WARN" $T/S16b-5.log \
+  && ok "S16b: --runtime 5 vs window 11m54s → no WARN" \
+  || bad "S16b-5: rc=$RC $(head -8 $T/S16b-5.log)"
+
 # S17 (v0.29.3, run35): a re-run of an EXISTING tree with a FUTURE --deadline
 # refreshes the root's PAST invariant via the S0 gate and unblocks it. run35
 # froze exactly here: the gate used to call ensureRootNode only when node.json

@@ -939,7 +939,29 @@ async function processSpawnRequest(projectDir, parentNodePath2, windowDir, req, 
       + `\n## Task (the node's task file, unchanged)\n\n\`\`\`\n${taskText.trim()}\n\`\`\`\n`
     : (wname) => briefSub({ nodePath: full, taskText, budget: b });
   // launch via the shared opener (alloc + brief + launch; failure = blocked marker)
-  return openChildWindow(projectDir, full, brief, b, cfg, windowDir, log, full);
+  const dec = await openChildWindow(projectDir, full, brief, b, cfg, windowDir, log, full);
+  if (dec.ok) {
+    // run4 fix (F3, V5): the spawn RECEIPT flags the sub's budget vs the PARENT
+    // WINDOW's remaining — the sub can legally out-run the parent window
+    // (early-finish sub-runs are common; run4's finished in 62 s), but if it
+    // uses its full budget the hand-back lands after the parent's hard stop:
+    // the window is dead (changed supervision topology) and, pre-F1, the run
+    // would have ended (3.2). Informational post-F1 (the re-entry gate sizes
+    // against the run's deadline) — the judge and the monitor still plan
+    // around the window's hard stop.
+    try {
+      const pst = readJson(path.join(windowDir, "pi-child-status.json")) || {};
+      const pwDl = pst.deadlineIso || pst.deadline || null;
+      const pwMs = pwDl ? Date.parse(pwDl) : NaN;
+      const subMs = Date.parse(dec.deadline);
+      if (!Number.isNaN(pwMs) && !Number.isNaN(subMs) && subMs > pwMs) {
+        const rem = pwMs - Date.now();
+        const remTxt = rem > 0 ? `${Math.floor(rem / 60000)}m ${Math.floor((rem % 60000) / 1000)}s` : "0s";
+        dec.warn = `WARN: sub runtime exceeds the parent window's remaining (${remTxt}) — if the sub-run uses its full budget, the hand-back lands after the parent's hard stop (${pwDl}) and the run ends (3.2); pass a smaller --runtime to keep re-entry inside the window`;
+      }
+    } catch { /* receipt note is best effort */ }
+  }
+  return dec;
 }
 
 // (openChildWindow = openWithRetryName with the decision shape on success)

@@ -602,6 +602,47 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("S8 root still paused(waiting:auth)", nodeState(p, "(root)") === "paused(waiting:auth)", nodeState(p, "(root)"));
 }
 
+// ================= S9 — run4 fix (F3, V5): the spawn receipt flags sub-runtime
+// vs the PARENT WINDOW's remaining. run4: sub deadline was 14.3 min past the
+// parent window's hard stop; the receipt said nothing. Early-finish sub-runs
+// are legal, so it's a WARN line, not a rejection.
+{
+  const p = mkproj("s9-f3-receipt");
+  ensureRootNode(p, { deadline: ISO(inMin(60)) });
+  const taskFile = path.join(T, "s9-task.md");
+  fs.writeFileSync(taskFile, "implement the f3 sub-project\n");
+  // synthetic parent window: 11 m 54 s remaining
+  const w = mkWindow(p, "run-1", {
+    status: "completed", exitReason: "completed-finalized",
+    deadlineIso: new Date(Date.now() + 11 * 60000 + 54000).toISOString(),
+  });
+  fs.writeFileSync(path.join(w, "spawn-request.json"), JSON.stringify({
+    kind: "spawn", node: "f3a", task: taskFile, runtime_min: 15, deadline: null, reason: "f3 warn", at: ISO(Date.now()),
+  }));
+  const r = await step(p, w, CFG);
+  const d = readJsonFile(path.join(w, "spawn-decision.json"));
+  ok("S9 spawn with runtime 15 > window remaining 11m54s → launched", r.outcome?.next === "spawned" && d?.ok === true, JSON.stringify(r));
+  ok("S9 receipt carries the WARN line (sub out-runs the parent window)",
+    typeof d?.warn === "string" && d.warn.startsWith("WARN: sub runtime exceeds the parent window's remaining") && /11m 5\ds/.test(d.warn),
+    JSON.stringify(d?.warn ?? d));
+  // same shape, smaller runtime → no WARN. (The plan's illustrative value was
+  // --runtime 5, but 5min cannot pass the sizing gate in this harness: CFG
+  // reserves 5min for finalization, so runtime 5 "leaves no work time". 8m is
+  // the smallest feasible runtime and is still < 11m54s remaining.)
+  const p2 = mkproj("s9-f3-nowarn");
+  ensureRootNode(p2, { deadline: ISO(inMin(60)) });
+  const w2 = mkWindow(p2, "run-1", {
+    status: "completed", exitReason: "completed-finalized",
+    deadlineIso: new Date(Date.now() + 11 * 60000 + 54000).toISOString(),
+  });
+  fs.writeFileSync(path.join(w2, "spawn-request.json"), JSON.stringify({
+    kind: "spawn", node: "f3b", task: taskFile, runtime_min: 8, deadline: null, reason: "f3 no warn", at: ISO(Date.now()),
+  }));
+  const r2 = await step(p2, w2, CFG);
+  const d2 = readJsonFile(path.join(w2, "spawn-decision.json"));
+  ok("S9 spawn with runtime 8 < window remaining → launched, no WARN", r2.outcome?.next === "spawned" && d2?.ok === true && !("warn" in (d2 || {})), JSON.stringify(d2));
+}
+
 // ============ T17 — v0.30.0 P1: EACCES-tolerant append (run37 ownership lockout)
 // A STATE.md the child's own pi process wrote is pichild-owned; a plain append
 // fails EACCES and the chain lost its bookkeeping. appendTolerant reclaims the
