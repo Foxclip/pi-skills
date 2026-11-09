@@ -26,8 +26,10 @@
 //   - the queue unit is the node; run-N is a WINDOW within a node.
 //   - hierarchy is bookkeeping on disk; scheduling is flat (one active window
 //     project-wide, tracked in .pi-supervisor/active.json).
-//   - the node's deadline is INVARIANT across its windows; a window's budget
-//     is min(runtime, nodeDeadline − now).
+//   - the node's deadline is INVARIANT across its windows (chain-side paths —
+//     spawn, re-entry, continuation — never move it); a window's budget is
+//     min(runtime, nodeDeadline − now). Only a FRESH HUMAN LAUNCH moves it,
+//     and only forward (v0.35.0: it extends, never shortens).
 //
 // Allocation (ensureRootNode / registerChild / allocWindowIn / withLock)
 // must run under the project lock (withLock). The pure readers (nodeState,
@@ -261,8 +263,16 @@ export function ensureRootNode(projectDir, { deadline = null, state = "active", 
     // v0.29.2 (run34): a PAST invariant deadline can only reject — every
     // spawn from this node inherits it and dies in windowBudget, and a plain
     // re-run of the project used to freeze the whole spawn tree. A fresh
-    // launch with a FUTURE deadline refreshes a past (or unparseable) one;
-    // a FUTURE invariant deadline still never moves.
+    // launch with a FUTURE deadline refreshes a past (or unparseable) one.
+    // v0.35.0 (TestProject2 run23): it also EXTENDS a future-but-earlier one.
+    // A fresh launch is the human re-granting the node's budget (spec 1.3:
+    // "only a fresh human launch moves it"), so a launch horizon LATER than
+    // the current deadline moves it forward — never backward. run23: the
+    // root kept run22's future deadline 10:29:23 while the fresh 30m window
+    // ran to 10:44:35 (window past the invariant); every sub-spawn inherited
+    // the near node deadline, died in sizeDeadline ("no work time"), and the
+    // terminal root halted. The shorter-horizon re-run used to be impossible
+    // to express at all.
     // v0.29.3 (run35): a refresh ALSO unblocks — a root marked blocked by a
     // chain halt is waiting for exactly this human attention (a fresh
     // launch); leaving it blocked contradicts the launch. (State is an
@@ -275,10 +285,13 @@ export function ensureRootNode(projectDir, { deadline = null, state = "active", 
     // never touches state.
     const fresh = deadline ? parseDeadline(String(deadline)) : null;
     const old = nj.deadline ? parseDeadline(nj.deadline) : null;
+    // fresh > old covers the past/unparseable cases too (fresh is a future
+    // time; a past or invalid old is always < fresh), so one comparison keeps
+    // the v0.29.2 refresh AND the v0.35.0 forward extension.
     const refresh = Boolean(deadline) && (
       !nj.deadline
       || (fresh.ok && fresh.ts.getTime() > Date.now()
-      && (!old.ok || old.ts.getTime() <= Date.now())));
+      && (!old.ok || fresh.ts.getTime() > old.ts.getTime())));
     // both HALT classes wait for the same human attention (blocked = abnormal
     // end, stopped = user stop) — a fresh launch is that attention for both
     if (refresh || (unblock && ["blocked", "stopped"].includes(nj.state))) {

@@ -517,10 +517,10 @@ ST17=$(node -e 'try{console.log(require("./.pi-supervisor/node.json").state)}cat
 [ "$ST17" = "active" ] && ok "S17: the refresh also unblocks the root (was blocked)" || bad "S17: state='$ST17'"
 stoprun $T/projS17 > $T/S17.stop 2>&1
 
-# S17b: a FUTURE invariant never moves — a launch deadline earlier than the
-# existing one leaves the deadline untouched (v0.30.1: the fresh launch's
+# S17b: an EARLIER launch deadline never moves the invariant (v0.35.0:
+# only a LATER one extends it — see S17d). v0.30.1: the fresh launch's
 # unblock: true still flips the halted state — the invariant is the deadline,
-# not the halt marker).
+# not the halt marker.
 mkproj $T/projS17b && cd $T/projS17b
 mkdir -p .pi-supervisor/runs/run-1
 INV17B=$(date -u -d '+3 hours' '+%Y-%m-%dT%H:%M:%SZ')
@@ -535,6 +535,25 @@ ST17B=$(node -e 'try{console.log(require("./.pi-supervisor/node.json").state)}ca
 [ "$ST17B" = "active" ] && ok "S17b: the fresh launch still unblocks the halted root (v0.30.1)" \
   || bad "S17b: state='$ST17B' want active"
 stoprun $T/projS17b > $T/S17b.stop 2>&1
+
+# S17d (v0.35.0, TestProject2 run23): a LATER launch deadline EXTENDS a
+# future-but-earlier invariant — the fresh launch is the human re-granting
+# the budget (spec 1.3: only a fresh human launch moves it). run23: the
+# root kept the previous run's future deadline while the fresh 30m window
+# out-ran it; every sub-spawn inherited the expired node deadline, died in
+# sizeDeadline ("no work time"), and the terminal root halted.
+mkproj $T/projS17d && cd $T/projS17d
+mkdir -p .pi-supervisor/runs/run-1
+EARLY17D=$(date -u -d '+1 hour' '+%Y-%m-%dT%H:%M:%SZ')
+echo "{\"v\":2,\"name\":\"(root)\",\"path\":\"(root)\",\"parent\":null,\"state\":\"active\",\"children\":[],\"deadline\":\"$EARLY17D\"}" > .pi-supervisor/node.json
+DL17D=$(( $(date +%s) + 7200 ))
+PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK ralph.sh --deadline $DL17D > $T/S17d.log 2>&1 &
+sleep 4
+ND17D=$(node -e 'try{console.log(new Date(require("./.pi-supervisor/node.json").deadline).getTime()/1000)}catch{console.log("")}' 2>/dev/null)
+[ -n "$ND17D" ] && [ "$ND17D" -ge $((DL17D-5)) ] && [ "$ND17D" -le $((DL17D+5)) ] \
+  && ok "S17d: a later launch extends the future-but-earlier invariant" \
+  || bad "S17d: node deadline='$ND17D' want ≈$DL17D $(head -8 $T/S17d.log)"
+stoprun $T/projS17d > $T/S17d.stop 2>&1
 
 # S17c: an HH:MM launch deadline is normalized to ISO before it touches
 # node.json (the old gate stored the raw string — a bare 'HH:MM' invariant).

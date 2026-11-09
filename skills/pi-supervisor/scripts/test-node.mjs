@@ -58,19 +58,37 @@ ok(!validNodeName("has space").ok, "space rejected");
 // --------------------------------------------------------------------------
 section("N2 — root materialization (ensureRootNode)");
 {
-  // relative dates — the invariant semantics depend on the wall clock (v0.29.2)
+  // relative dates — the deadline semantics depend on the wall clock (v0.29.2/v0.35.0)
   const F1 = new Date(Date.now() + 86400e3).toISOString();
   const F2 = new Date(Date.now() + 2 * 86400e3).toISOString();
   const p = proj("p-root");
-  let rn = ensureRootNode(p, { deadline: F1 });
+  let rn = ensureRootNode(p, { deadline: F2 });
   ok(rn.created === true, "first call creates");
   let nj = J(supNodePath(p));
   ok(nj.v === 2 && nj.name === ROOT && nj.parent === null && Array.isArray(nj.children) && nj.children.length === 0, "v2 root shape (dot-dir node.json)", JSON.stringify(nj));
-  ok(nj.deadline === F1, "deadline recorded");
+  ok(nj.deadline === F2, "deadline recorded");
   ok(fs_exists(path.join(p, "STATE.md")), "root STATE.md at the project root");
-  rn = ensureRootNode(p, { deadline: F2 });
+  rn = ensureRootNode(p, { deadline: F1 });
   ok(rn.created === false, "second call joins, does not create");
-  ok(J(supNodePath(p)).deadline === F1, "future invariant deadline never moves");
+  ok(J(supNodePath(p)).deadline === F2, "an earlier launch horizon never shortens the deadline");
+}
+
+// --------------------------------------------------------------------------
+section("N2e — v0.35.0 (TestProject2 run23): a fresh launch extends a future-but-earlier deadline forward");
+{
+  const earlier = new Date(Date.now() + 3600e3).toISOString();
+  const later = new Date(Date.now() + 7200e3).toISOString();
+  // run23: the root kept the previous run's future deadline while the fresh
+  // 30m window out-ran it; every sub-spawn inherited the node deadline, died
+  // in sizeDeadline ("no work time"), and the terminal root halted.
+  const p = proj("p-root-extend");
+  ensureRootNode(p, { deadline: earlier });
+  ensureRootNode(p, { deadline: later, unblock: true });
+  ok(J(supNodePath(p)).deadline === later, "a later launch horizon extends the deadline forward");
+  const p2 = proj("p-root-extend-keep");
+  ensureRootNode(p2, { deadline: later });
+  ensureRootNode(p2, { deadline: earlier, unblock: true });
+  ok(J(supNodePath(p2)).deadline === later, "an earlier launch horizon leaves it untouched");
 }
 
 // --------------------------------------------------------------------------
@@ -105,27 +123,30 @@ section("N2c — v0.29.3 (run35): a refresh also unblocks a halted (blocked) roo
   ensureRootNode(p, { deadline: future });
   const after = J(supNodePath(p));
   ok(after.deadline === future && after.state === "active", "the refresh refreshes the deadline AND unblocks");
-  // a FUTURE invariant still never moves — and WITHOUT the unblock flag (the
-  // chain step's materialization call) no refresh happens, so the blocked
-  // marker stays until the deadline actually runs past
+  // v0.35.0: only a LATER horizon refreshes (see N2e). An EARLIER one leaves
+  // the deadline untouched; without the unblock flag (the chain step's
+  // materialization call) no state change happens, so the blocked marker stays
   const p2 = proj("p-root-blocked-fut");
   ensureRootNode(p2, { deadline: future });
   const nj2 = J(supNodePath(p2)); nj2.state = "blocked"; writeNode(p2, nj2);
-  ensureRootNode(p2, { deadline: new Date(Date.now() + 7200e3).toISOString() });
+  ensureRootNode(p2, { deadline: new Date(Date.now() + 1800e3).toISOString() });
   const after2 = J(supNodePath(p2));
-  ok(after2.deadline === future && after2.state === "blocked", "a future invariant never moves (and stays blocked without the flag)");
+  ok(after2.deadline === future && after2.state === "blocked", "an earlier horizon never moves it (and stays blocked without the flag)");
 }
-section("N2d — v0.30.1: a fresh launch (unblock: true) unblocks a halted root even under a future invariant");
+section("N2d — v0.30.1: a fresh launch (unblock: true) unblocks a halted root even without a deadline refresh");
 {
-  const future = new Date(Date.now() + 3600e3).toISOString();
+  const future = new Date(Date.now() + 7200e3).toISOString();
+  const earlier = new Date(Date.now() + 3600e3).toISOString();
+  // an EARLIER horizon does not refresh (v0.35.0), so this isolates the
+  // unblock flag from the refresh
   const p = proj("p-root-unblock-fut");
   ensureRootNode(p, { deadline: future });
   let nj = J(supNodePath(p)); nj.state = "blocked"; writeNode(p, nj);
-  ensureRootNode(p, { deadline: new Date(Date.now() + 7200e3).toISOString(), unblock: true });
+  ensureRootNode(p, { deadline: earlier, unblock: true });
   let after = J(supNodePath(p));
-  ok(after.deadline === future && after.state === "active", "unblock:true flips blocked → active, the future invariant untouched");
+  ok(after.deadline === future && after.state === "active", "unblock:true flips blocked → active, the unrefreshed deadline untouched");
   nj = J(supNodePath(p)); nj.state = "stopped"; writeNode(p, nj);
-  ensureRootNode(p, { deadline: new Date(Date.now() + 7200e3).toISOString(), unblock: true });
+  ensureRootNode(p, { deadline: earlier, unblock: true });
   after = J(supNodePath(p));
   ok(after.deadline === future && after.state === "active", "unblock:true also flips stopped → active");
   nj = J(supNodePath(p)); nj.state = "blocked"; writeNode(p, nj);
