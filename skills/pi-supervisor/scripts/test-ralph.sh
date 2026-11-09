@@ -18,7 +18,10 @@ SELF="$(readlink -f "$0")"
 SKILL="$(cd "$(dirname "$SELF")" && pwd)"
 S=$SKILL
 T=$(mktemp -d /tmp/ralph-suite.XXXXXX)
-trap 'pkill -f "sleep 600" 2>/dev/null; true' EXIT
+# [r]alph… — bracket trick: the trap's own shell has the pattern in its argv and
+# must not match itself. Without this, cases that leave a monitor running (its
+# window never stopped) leak a ralph-monitor.mjs per run.
+trap 'pkill -f "sleep 600" 2>/dev/null; pkill -f "[r]alph-monitor.mjs --run-dir $T/" 2>/dev/null; true' EXIT
 PASS=0; FAIL=0
 ok()  { echo "PASS: $1"; PASS=$((PASS+1)); }
 bad() { echo "FAIL: $1"; FAIL=$((FAIL+1)); }
