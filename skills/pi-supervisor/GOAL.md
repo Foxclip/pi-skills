@@ -12,8 +12,16 @@
 - Observe what the run outputs.
 - Use debugging tools to get information about crashes.
 - If there are problems, make changes to pi-supervisor to try to fix that problem.
-- After significant changes to pi-supervisor, verify session transcript for hallucinated user messages and commit changes.
+- Use polling loop that can early return to wait for runs. Don't use goal_wait to wait for runs.
+- After significant changes to pi-supervisor, verify your session transcript for hallucinated user messages and commit changes.
+
+# This file
+
+- Do not edit.
+- Do not commit.
+- Do not delete.
 
 # Stopping condition
 
 - 10 consequtive runs ended with no problems.
+
