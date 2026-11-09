@@ -101,6 +101,11 @@ for (let i = 0; i < argv.length; i++) {
   else { console.error(usage()); process.exit(1); }
 }
 if (!A.runDir || !A.pi) { console.error(usage()); process.exit(1); }
+// v0.35.1: the run dir this monitor was LAUNCHED on. A.runDir follows the
+// slot; origRunDir never moves — followSlot uses it to tell the hand-BACK to
+// our own window (re-entry re-activates the SAME run dir, legit) from a NEW
+// launch (a sibling run dir in the same project's runs/ root, not a hand-off).
+A.origRunDir = A.runDir;
 if (!existsSync(A.runDir)) { console.error(`run dir not found: ${A.runDir}`); process.exit(1); }
 
 // deadline: explicit --deadline wins; else now + --max-hours
@@ -720,6 +725,23 @@ function followSlot() {
   try { p = JSON.parse(readFileSync(slotPath, "utf8")); } catch { return false; }
   const rd = p && p.run_dir;
   if (!rd || !existsSync(rd) || rd === A.runDir) return false;
+  // v0.35.1 (TestProject2 streak, 2026-11-09): a NEW top-level launch is not a
+  // hand-off. ralph.sh writes this project's active.json to the NEXT run dir
+  // under the same runs/ root, and the old code followed it — so back-to-back
+  // launches leaked every monitor forward: each kept monitoring every later
+  // window, wrote a DUPLICATE final report at each window end (up to 9
+  // concurrent report writers on one window; the local model serialized them
+  // ~8 min each, FINAL-REPORT.md overwritten repeatedly), never exited, and
+  // its ralph.sh parent sat in `wait $MON_PID` for up to ~105 min (the
+  // terminal box + RUN-REPORT landed up to ~94 min past the run's true end).
+  // Refuse a target in the launch project's runs/ root UNLESS it is our own
+  // original window (the hand-back on re-entry). Sub-project hand-offs live
+  // OUTSIDE that root and are followed as before.
+  if (A.projectDir) {
+    const root = path.resolve(path.join(A.projectDir, ".pi-supervisor", "runs"));
+    const t = path.resolve(rd);
+    if (t !== path.resolve(A.origRunDir) && (t === root || t.startsWith(root + path.sep))) return false;
+  }
   const from = path.basename(A.runDir);
   const to = path.basename(rd);
   A.runDir = rd;

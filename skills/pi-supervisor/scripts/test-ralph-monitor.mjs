@@ -1222,6 +1222,47 @@ console.log("DECISION: OK");`);
     `exit=${r.status} inv=${JSON.stringify(invLog("r45"))} report=${existsSync(rep45)} log=${readLog(d).trim().slice(0, 100)}`);
 }
 
+// ---- R46: v0.35.1 — the NEW-launch leak guard (TestProject2 streak, 2026-11-09):
+// back-to-back top-level launches write the project's active.json to the NEXT
+// run dir under the same runs/ root; the pre-fix monitor followed it, so every
+// monitor leaked forward (up to 9 concurrent report writers on one window, run
+// boxes up to ~94 min late). followSlot must refuse a sibling launch in the
+// launch project's runs/ root while still following sub-project hand-offs
+// (outside that root). (The hand-BACK to our own window needs no guard:
+// re-entry re-activates the SAME run dir, which hits rd === A.runDir first.)
+{
+  const proj = path.join(root, "r46-proj");
+  const runsRoot = path.join(proj, ".pi-supervisor", "runs");
+  const mkWin = (name) => {
+    const d = path.join(runsRoot, name);
+    mkdirSync(path.join(d, ".pi-supervisor"), { recursive: true });
+    mkStatus(d, { status: "running" });
+    return d;
+  };
+  const slot = path.join(proj, ".pi-supervisor", "active.json");
+  const slotTo = (dir, win) => writeFileSync(slot, JSON.stringify({
+    run_dir: dir, node: "auth", guard_pid: process.pid, window: win,
+    started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+  }));
+  const dLaunch = mkWin("run26");
+  const dSibling = mkWin("run27");            // the NEXT top-level launch (the leak trigger)
+  const dSub = runDir("r46-subwin");          // sub-project window, OUTSIDE runsRoot
+  mkdirSync(path.join(dSub, ".pi-supervisor"), { recursive: true });
+  mkStatus(dSub, { status: "running" });
+  // Phase A: slot → sibling launch in the same runs root → must NOT be followed.
+  slotTo(dSibling, "run27");
+  const rA = runRm(dLaunch, STUB_OK, ["--project-dir", proj, "--once"]);
+  const aOwn = existsSync(path.join(dLaunch, "ralph-monitor-state.json"));
+  const aSib = existsSync(path.join(dSibling, "ralph-monitor-state.json"));
+  // Phase B: slot → sub-project window outside the runs root → must be followed.
+  slotTo(dSub, "run-1");
+  const rB = runRm(dLaunch, STUB_OK, ["--project-dir", proj, "--once"]);
+  const bSub = existsSync(path.join(dSub, "ralph-monitor-state.json"));
+  report("R46 v0.35.1 leak guard: sibling launch NOT followed, sub hand-off still followed",
+    rA.status === 0 && aOwn && !aSib && rB.status === 0 && bSub,
+    `A: exit=${rA.status} own-state=${aOwn} sibling-state=${aSib} | B: exit=${rB.status} sub-state=${bSub}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
