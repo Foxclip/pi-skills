@@ -1717,6 +1717,36 @@ async function doParentDistill(req) {
 }
 
 let exitCode = 1;
+// v0.34.0: snapshot the owner+child process tree on a startup failure, so the
+// transient child-tree death (exit 143 / protection "leader" vanishing) can be
+// attributed. PID-based (reads /proc) so it never matches unrelated commands
+// (e.g. a human's `ps | grep guard`). Best effort — never throws.
+function captureStartupTree() {
+  const parts = [];
+  const guardPid = process.pid;
+  // The wrapper = the guard's child that is the node child-wrapper (vs. any
+  // tool subprocess the guard may have spawned).
+  try {
+    const kids = readFileSync(`/proc/${guardPid}/task/${guardPid}/children`, "utf8").trim().split(/\s+/).filter(Boolean);
+    const detail = kids.map((k) => {
+      try { const c = readFileSync(`/proc/${k}/comm`, "utf8").trim(); const st = readFileSync(`/proc/${k}/status`, "utf8").split("\n").find((l) => l.startsWith("State:")); return `${k}(${c}${st ? "/" + st.trim().split(/\s+/)[1] : ""})`; } catch { return `${k}(gone)`; }
+    });
+    parts.push(`guard(${guardPid}) children=[${detail.join(" ") || "none"}]`);
+  } catch (e) { parts.push(`guard(${guardPid}) children: ${e.code}`); }
+  // The leader (front-end sudo, from child-pgid) + its children (the real CLI).
+  try {
+    const leader = readFileSync(childPidFile, "utf8").trim().split("\n")[0];
+    const lkids = readFileSync(`/proc/${leader}/task/${leader}/children`, "utf8").trim().split(/\s+/).filter(Boolean);
+    const ldetail = lkids.map((k) => {
+      try { const l = readFileSync(`/proc/${k}/status`, "utf8").split("\n").find((x) => x.startsWith("Uid:")); return `${k}(uid=${l ? l.trim().split(/\s+/)[1] : "?"})`; } catch { return `${k}(gone)`; }
+    });
+    parts.push(`leader(${leader}) children=[${ldetail.join(" ") || "none"}]`);
+  } catch (e) {
+    parts.push(`leader: ${e.code === "ENOENT" ? "GONE (child-pgid target exited)" : e.code}`);
+  }
+  return parts.join(" | ");
+}
+
 let outcome = "error";
 let relayHappened = false; // v0.6.0: an overflow relay ran to completion
 let relayExitCode = 1;
@@ -1778,36 +1808,70 @@ try {
       logSup(`[info] resume preflight: session ${mb.toFixed(1)} MB (overflow threshold ${overflowThresholdMb} MB)`);
     }
   }
-  await client.start();
-
-  if (childUser) {
-    // Verified launch (kernel protection): the wrapper's process group must
-    // contain a member running as the child user — an owner-privileged RPC
-    // child would own the project tree and defeat the DAC.
-    let verifyDiag = "no polls"; // last observation, reported on failure
-    for (let t = 0; t < 25 && !childVerified; t++) {
-      await new Promise((r) => setTimeout(r, 200));
-      try {
-        const leader = readFileSync(childPidFile, "utf8").trim().split("\n")[0];
-        const kids = readFileSync(`/proc/${leader}/task/${leader}/children`, "utf8").trim().split(/\s+/).filter(Boolean);
-        verifyDiag = `leader=${leader} kids=[${kids.join(",")}]`;
-        for (const k of kids) {
-          const line = readFileSync(`/proc/${k}/status`, "utf8").split("\n").find((l) => l.startsWith("Uid:"));
-          const uid = line ? line.trim().split(/\s+/)[1] : "";
-          verifyDiag += ` uid(${k})=${uid || "?"}`;
-          if (uid && uid !== String(process.getuid())) {
-            childVerified = { user: childUser, uid, group: leader };
-            break;
-          }
+  // v0.34.0: startup retry. The child's process tree (wrapper → sudo → pi)
+  // intermittently dies within the first ~5 s of launch with zero tool calls —
+  // seen either as exit 143 (SIGTERM to the child group) or as the protection
+  // "leader" vanishing before verification completes. The death is transient
+  // (a minority of launches succeed identically), so relaunch up to
+  // MAX_STARTUP_ATTEMPTS times before giving up. Each failed attempt captures
+  // the wrapper stderr + a process-tree snapshot so the real killer can be
+  // identified (diagnostics only — the retry is the fix).
+  const MAX_STARTUP_ATTEMPTS = 3;
+  let startupAttempt = 0;
+  let childReady = false;
+  let startupErr = "";
+  while (!childReady && startupAttempt < MAX_STARTUP_ATTEMPTS) {
+    startupAttempt++;
+    try {
+      if (startupAttempt > 1) {
+        logSup(`[guard] startup attempt ${startupAttempt}/${MAX_STARTUP_ATTEMPTS} (retrying after: ${startupErr})`);
+        try { await client.stop(); } catch { /* already dead */ }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      await client.start();
+      if (childUser) {
+        // Verified launch (kernel protection): the wrapper's process group must
+        // contain a member running as the child user — an owner-privileged RPC
+        // child would own the project tree and defeat the DAC.
+        let verifyDiag = "no polls"; // last observation, reported on failure
+        for (let t = 0; t < 25 && !childVerified; t++) {
+          await new Promise((r) => setTimeout(r, 200));
+          try {
+            const leader = readFileSync(childPidFile, "utf8").trim().split("\n")[0];
+            const kids = readFileSync(`/proc/${leader}/task/${leader}/children`, "utf8").trim().split(/\s+/).filter(Boolean);
+            verifyDiag = `leader=${leader} kids=[${kids.join(",")}]`;
+            for (const k of kids) {
+              const line = readFileSync(`/proc/${k}/status`, "utf8").split("\n").find((l) => l.startsWith("Uid:"));
+              const uid = line ? line.trim().split(/\s+/)[1] : "";
+              verifyDiag += ` uid(${k})=${uid || "?"}`;
+              if (uid && uid !== String(process.getuid())) {
+                childVerified = { user: childUser, uid, group: leader };
+                break;
+              }
+            }
+          } catch (e) { verifyDiag = `poll error: ${e.message}`; }
         }
-      } catch (e) { verifyDiag = `poll error: ${e.message}`; }
+        if (!childVerified) {
+          const wrapperErr = (client.getStderr ? client.getStderr() : "").trim().slice(-1500);
+          startupErr = `protection-verification-failed (last: ${verifyDiag})${wrapperErr ? " | wrapper-stderr: " + wrapperErr : ""}`;
+          logSup(`[error] kernel protection: could not verify the child runs as ${childUser} — ${startupErr}`);
+          logSup(`[diag] startup-failure tree:\n${captureStartupTree()}`);
+          continue; // relaunch
+        }
+        logSup(`[info] kernel protection verified: group ${childVerified.group} contains uid ${childVerified.uid} (${childUser})`);
+      }
+      childReady = true;
+    } catch (e) {
+      const wrapperErr = (client.getStderr ? client.getStderr() : "").trim().slice(-1500);
+      startupErr = `client.start failed: ${e.message}${wrapperErr ? " | wrapper-stderr: " + wrapperErr : ""}`;
+      logSup(`[error] ${startupErr}`);
+      logSup(`[diag] startup-failure tree:\n${captureStartupTree()}`);
+      try { await client.stop(); } catch { /* already dead */ }
     }
-    if (!childVerified) {
-      logSup(`[error] kernel protection: could not verify the child runs as ${childUser} — aborting window (last: ${verifyDiag})`);
-      writeStatus("error", "protection-verification-failed");
-      process.exit(49);
-    }
-    logSup(`[info] kernel protection verified: group ${childVerified.group} contains uid ${childVerified.uid} (${childUser})`);
+  }
+  if (!childReady) {
+    writeStatus("error", childUser ? "protection-verification-failed" : "child-startup-failed");
+    process.exit(49);
   }
 
   try {
