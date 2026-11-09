@@ -1,6 +1,9 @@
 # Goal
 
-- Goal is fixing bugs in pi-supervisor.
+- Goal is fixing problems in pi-supervisor.
+- Problems are:
+    1. Bugs
+    2. Spec deviations
 
 # Previous attempts
 
