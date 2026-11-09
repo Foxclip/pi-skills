@@ -733,7 +733,10 @@ export async function reentry(parentPath, projectDir, childPath, childWindowDir,
     return haltBlocked(projectDir, parentPath, childWindowDir, log,
       `child ${childPath} ended (${childState}); the run's deadline (${dlIso}) was reached (3.2) before hand-back — the run is over; the sub-run's report is on disk at ${childFinalDir}; start a fresh run (2.1) to continue`, done);
   }
-  const budget = { deadlineMs: dlMs, deadlineIso: dlIso, minutes: Math.max(0, Math.round((dlMs - Date.now()) / 60000)), remainingMs: Math.max(0, dlMs - Date.now()) };
+  // ok:true — the budget IS available here (the sizing gate above just
+  // rejected the no-budget case); without it budgetLine() renders the
+  // "no remaining budget" fallback in RE-ENTRY.md (run35, 2026-11-09).
+  const budget = { ok: true, deadlineMs: dlMs, deadlineIso: dlIso, minutes: Math.max(0, Math.round((dlMs - Date.now()) / 60000)), remainingMs: Math.max(0, dlMs - Date.now()) };
   // the decision that launched THIS child lives in the PARENT's window that
   // carried the request (newest-first: a re-spawned child takes its latest)
   const decision = findSpawnDecision(projectDir, parentPath, childPath);

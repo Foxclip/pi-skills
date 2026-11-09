@@ -117,6 +117,11 @@ if (A.deadline !== null) {
 } else if (A.maxHours > 0) {
   deadlineMs = Date.now() + A.maxHours * 3600_000;
 }
+// v0.35.4 (run35, 7.7): the deadline of the window this monitor was LAUNCHED
+// on. followSlot re-points deadlineMs at every followed window; the hand-back
+// to the launch window restores THIS value (re-entry re-activates the same
+// window with the same deadline — the run owns its deadline, 1.3).
+const launchDeadlineMs = deadlineMs;
 
 // ---- state + log
 let statePath = path.join(A.runDir, "ralph-monitor-state.json");   // let: follow-the-slot re-points on handoff (v0.26.0)
@@ -705,6 +710,17 @@ async function stopLoop(pc) {
   // the slot can also land while the final report was being written (the
   // guard's chain step runs in parallel) — one last check before we exit.
   if (followSlot()) return;   // handoff → the loop continues on the new window
+  // v0.35.4 (run35, 7.7/6.4): the hand-back slot can be CONSUMED before we
+  // reach it — the re-entry window runs and the chain's terminal step clears
+  // the pointer while the sub window's final report is still being written
+  // (run35: the report LLM call took 167 s; the re-entry child finished and
+  // the chain ran idle/root-done at T+8 s; the slot-less exit then left the
+  // RUN's final report unwritten — 7.7 violation, run35 had no
+  // FINAL-REPORT.md). Re-point to the launch window and let the loop decide:
+  // its child may still be running (keep monitoring) or be terminal (stop
+  // with the run's final report). No ping-pong: after the re-point
+  // A.runDir === origRunDir, so a later stopLoop falls through to exit.
+  if (handBackToLaunch()) return;
   process.exit(pc.code);
 }
 // ---- follow-the-slot (v0.26.0, plan §5.5) ----------------------------------
@@ -762,6 +778,35 @@ function followSlot() {
     for (const line of renderTree(A.projectDir).split("\n")) glog("", 2, line);
   } catch { /* the tree is decoration — the re-point is the substance */ }
   flog(`handoff: ${from} → ${to} (node ${p.node || "?"} · ${p.window || "?"})`);
+  return true;
+}
+// v0.35.4 (run35, 7.7): the hand-back re-point for the SLOT-LESS case. stopLoop
+// calls it after the report, when followSlot found nothing: a missing slot on a
+// non-launch window means the run already ended while we were away (the chain
+// cleared the pointer at its terminal step). Re-point to the launch window —
+// the monitor's home per 6.4 (the terminal belongs to the run that launched
+// it) — and let the loop's preCheck act on the launch window's real state.
+function handBackToLaunch() {
+  const target = path.resolve(A.origRunDir);
+  if (path.resolve(A.runDir) === target) return false;
+  if (!existsSync(target)) return false;
+  const from = path.basename(A.runDir);
+  const to = path.basename(target);
+  A.runDir = target;
+  statePath = path.join(target, "ralph-monitor-state.json");
+  if (!A.logFile) logPath = path.join(target, "ralph-monitor.log");
+  try { state = JSON.parse(readFileSync(statePath, "utf8")); } catch { /* first cycle on this window */ }
+  state = state || {
+    startedAt: new Date().toISOString(), cycles: 0, interventions: 0,
+    lastToolCalls: -1, lastProgressAt: new Date().toISOString(),
+    lastDecision: null, llmFailStreak: 0, lastJudgeToolCalls: null,
+  };
+  deadlineMs = launchDeadlineMs;   // the launch window's own deadline (1.3)
+  glog("→", 36, `hand-back: ${from} → ${to} (slot consumed — re-point to the launch window)`);
+  try {
+    for (const line of renderTree(A.projectDir).split("\n")) glog("", 2, line);
+  } catch { /* the tree is decoration — the re-point is the substance */ }
+  flog(`hand-back: ${from} → ${to} (slot consumed — re-point to the launch window)`);
   return true;
 }
 

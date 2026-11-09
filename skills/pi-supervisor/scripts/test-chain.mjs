@@ -191,6 +191,13 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T4 reentry launched", r.outcome?.next === "reentry" && r.outcome?.node_path === "(root)", JSON.stringify(r.outcome));
   ok("T4 RE-ACTIVATES the spawn window (run-1), no run-2", r.outcome?.window === "run-1" && !fs.existsSync(R(p, "run-2")), JSON.stringify(r.outcome));
   ok("T4 re-entry brief in RE-ENTRY.md", fs.existsSync(path.join(rw, "RE-ENTRY.md")) && fs.readFileSync(path.join(rw, "RE-ENTRY.md"), "utf8").includes("RE-ENTRY"));
+  // run35 (2026-11-09): the reentry budget object lacked the ok field, so
+  // budgetLine() rendered the "no remaining budget" fallback in RE-ENTRY.md
+  // although ~100 minutes were left on the run.
+  const brief4 = fs.readFileSync(path.join(rw, "RE-ENTRY.md"), "utf8");
+  ok("T4 re-entry budget line shows the real budget (not the no-budget fallback)",
+    !brief4.includes("no remaining budget") && /~\d+ minutes, hard deadline/.test(brief4),
+    brief4.split("\n").find((l) => /minutes, hard deadline|no remaining budget/.test(l)) || "(budget line not found)");
   ok("T4 original TASK.md untouched", fs.readFileSync(path.join(rw, "TASK.md"), "utf8").includes("task run-1"));
   ok("T4 chain-done marker cleared (fresh step later)", !fs.existsSync(path.join(rw, "chain-done.json")));
   ok("T4 re-entry deadline = the run's (node's) deadline (run4 fix F1)", r.outcome?.deadline === nodeDl4, r.outcome?.deadline);

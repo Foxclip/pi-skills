@@ -1263,6 +1263,57 @@ console.log("DECISION: OK");`);
     `A: exit=${rA.status} own-state=${aOwn} sibling-state=${aSib} | B: exit=${rB.status} sub-state=${bSub}`);
 }
 
+// ---- R47: v0.35.4 (run35, 7.7/6.4) — the hand-back slot CONSUMED before the
+// sub window's final-report LLM call finished: the re-entry window ran to
+// completion and the chain's terminal step cleared the pointer in the mean
+// time (run35: the report took 167 s; the run ended 9 s after the re-entry
+// child quit). The slot-less exit then left the RUN's final report unwritten
+// (run35 had no FINAL-REPORT.md — only the sub window's). The stop path must
+// re-point to the launch window and let the loop end the run there, so both
+// reports land: the sub window's own (5.1) and the run's (7.7).
+{
+  const proj = path.join(root, "r47-proj");
+  const runsRoot = path.join(proj, ".pi-supervisor", "runs");
+  const dLaunch = path.join(runsRoot, "run28");
+  mkdirSync(path.join(dLaunch, ".pi-supervisor"), { recursive: true });
+  const dSub = runDir("r47-subwin");
+  mkdirSync(path.join(dSub, ".pi-supervisor"), { recursive: true });
+  // the sub child finished; the re-entry child (in dLaunch) already ran to
+  // completion — the run is over, only the reports are missing. The spawn
+  // request is consumed (the chain's reentry removes it before launching).
+  mkStatus(dSub, { status: "completed", exitReason: "completed-finalized", guardPid: null, toolCalls: 7 });
+  mkStatus(dLaunch, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 4 });
+  // the slot still points at the sub window at launch (the follow must happen);
+  // the stub deletes it during the report call (the chain's terminal clear).
+  mkdirSync(path.join(proj, ".pi-supervisor"), { recursive: true });
+  const slot = path.join(proj, ".pi-supervisor", "active.json");
+  writeFileSync(slot, JSON.stringify({
+    run_dir: dSub, node: "auth", guard_pid: process.pid, window: "run-1",
+    started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+  }));
+  const stub = mkStub("pi-r47.mjs", `
+import { rmSync, appendFileSync } from "node:fs";
+const p = process.argv[process.argv.length - 1];
+const isReport = p.includes("final report writer");
+if (isReport) rmSync(${JSON.stringify(slot)}, { force: true });   // the chain's terminal clear
+appendFileSync(process.env.RM_INV_LOG || "/dev/null", (isReport ? "REPORT" : "JUDGE") + "\\n");
+console.log("r47 report body");
+console.log("DECISION: OK");`);
+  process.env.RM_INV_LOG = path.join(root, "inv-r47.log");
+  const r = runRm(dLaunch, stub, ["--project-dir", proj, "--once"]);
+  process.env.RM_INV_LOG = "";
+  const repSub = path.join(dSub, "FINAL-REPORT.md");
+  const repRun = path.join(dLaunch, "FINAL-REPORT.md");
+  const logLaunch = readLog(dLaunch);
+  report("R47 hand-back slot consumed during the report → re-point to the launch window, run report written there",
+    r.status === 0
+    && existsSync(repSub)                                   // the sub window's own report (5.1)
+    && existsSync(repRun)                                  // 7.7 — the run's report (run35 was missing it)
+    && /hand-back: r47-subwin → run28/.test(logLaunch)     // the re-point is visible in the launch window's log
+    && (invLog("r47").match(/REPORT/g) || []).length === 2, // both reports, no judgment
+    `exit=${r.status} repSub=${existsSync(repSub)} repRun=${existsSync(repRun)} inv=${JSON.stringify(invLog("r47"))} logLaunch=${logLaunch.trim().split("\n").slice(0, 1).join(" | ").slice(0, 120)}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
