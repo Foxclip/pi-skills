@@ -20,7 +20,7 @@ If the child's job is fire-and-forget with no ongoing dialogue, `acp_delegate` i
 
 ## Spec — the confirmed model (v0.33.0)
 
-This Spec is the **main source of truth** for pi-supervisor. Any contradiction between the Spec and the code, or between the Spec and any other part of this SKILL.md, is resolved in favor of the Spec. The Spec may only be modified by an agent when the user asks. Entries are self-contained — an entry never references another entry.
+This Spec is the **main source of truth** for pi-supervisor. Any contradiction between the Spec and the code, or between the Spec and any other part of this SKILL.md, is resolved in favor of the Spec. The Spec may only be modified by an agent when the user asks. Entries are self-contained — an entry never references another entry. Every Spec entry must be numbered. The only unnumbered part of the spec is this preamble. Spec entries should be as short as possible and not contain implementation details.
 
 pi-supervisor runs a long, autonomous coding job that never stalls silently and can branch work into sub-projects — at a terminal, with a human at the boundaries.
 
@@ -87,6 +87,11 @@ A run's model has full shell access and is **never trusted at the LLM layer** �
 - **9.5 Escalation is an explicit, logged exception.** The model has no path to grow its own privilege. The only way a run gains privilege is a human opting it in (`--sudo`), which deliberately **voids** the isolation for that run, is flagged at launch, and is auditable in the transcript. A run can never extend its own deadline or grant itself access.
 - **9.6 Auditability.** Everything a run does is recorded on disk (transcripts, logs) and survives the run; the untrusted side is reviewable after the fact.
 - **9.7 Scope of the guarantee.** The isolation holds only where the kernel provides it (the protected default on a Linux host). In the opt-out, or on a host without the mechanism, there is **no** privilege separation — a run is only as safe as its prompt — and that is the operator's explicit choice. File/privilege isolation does not cover the network: the model can still reach the endpoints it needs.
+
+### 10. Process lifetime
+- **10.1** Every supervisor process belongs to the run that launched it and ends with it — a process outliving its run is a bug, not a race.
+- **10.2** The monitor leaves its run only for the hand-off to a sub-run and the hand-back on re-entry. It never follows a new launch.
+- **10.3** Whatever spawns supervisor processes kills all of them on every exit path — and never its own shell while doing so.
 
 ## Quickstart — the main mode: `ralph.sh`
 
