@@ -18,6 +18,19 @@
 - Use polling loop that can early return to wait for runs. Don't use goal_wait to wait for runs.
 - After significant changes to pi-supervisor, verify your session transcript for hallucinated user messages and commit changes.
 
+# Phases
+
+## Streak phase
+
+- Attemt doing a streak of clean runs. This is the Streak phase.
+- After each run that ended without obvious problems, verify Spec compliance entry-by-entry.
+    - If possible, try to verify compliance to a specific Spec entry with tools, not just your judgement.
+
+## Fix phase
+
+- If there is a problem, you can make runs without full Spec compliance check. This is the Fix phase.
+- After you fixed a problem that you found and a run ended without obvious problems, go to Streak phase.
+
 # This file
 
 - Do not edit.
