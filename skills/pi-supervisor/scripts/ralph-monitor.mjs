@@ -278,9 +278,47 @@ const pidAlive = (pid) => {
   if (!pid || !Number.isFinite(pid)) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
 };
+// v0.35.5 (run40, 7.7/6.3): a re-activated window keeps its PREVIOUS child's
+// terminal status on disk until the new child's guard overwrites it (run40:
+// the monitor re-pointed 8 ms after the hand-back, read the first child's
+// "completed", and stopped — exiting 47 s before the re-entry child finished;
+// the run-summary snapshotted status=running). A terminal status is STALE —
+// it belongs to a dead child instance — when the window's current child is a
+// different instance:
+//   (1) the child-pgid file (the guard writes it at child start) names a
+//       different pgid than status.childPgid, or
+//   (2) we re-pointed here through a slot whose launch time is NEWER than the
+//       status (covers the gap before the new guard writes child-pgid).
+// Stale ⇒ present as "starting": the loop keeps polling (POLL_SEC cadence),
+// the new guard overwrites the status within seconds, and the deadline/stale
+// caps bound the wait if the re-activation never materializes.
+let slotStartedAtMs = null;   // followSlot: launch time of the window we just moved to
+const currentChildPgid = () => {
+  try { return Number(readFileSync(path.join(A.runDir, "child-pgid"), "utf8").trim().split("\n")[0]); }
+  catch { return NaN; }   // no file yet (pre-first-launch) — not a staleness signal
+};
+const statusIsStale = (s) => {
+  if (!s || !s.at) return false;
+  if (s.status === "running" || s.status === "starting") return false;   // only a terminal status can be stale
+  const writtenAt = Date.parse(s.at);
+  if (!Number.isFinite(writtenAt)) return false;
+  const pg = currentChildPgid();
+  if (Number.isFinite(pg) && Number.isFinite(Number(s.childPgid)) && Number(s.childPgid) !== pg) return true;
+  return slotStartedAtMs !== null && slotStartedAtMs > writtenAt;
+};
 const readStatus = () => {
-  try { return JSON.parse(readFileSync(path.join(A.runDir, "pi-child-status.json"), "utf8")); }
+  let s;
+  try { s = JSON.parse(readFileSync(path.join(A.runDir, "pi-child-status.json"), "utf8")); }
   catch { return null; }
+  if (statusIsStale(s)) {
+    // the window's current child is a (re-)starting instance — the on-disk
+    // terminal is the previous instance's. Freshen the fields the pre-checks
+    // use (at → no false child-stale; guardPid dead-check is skipped for
+    // "starting"); keep deadlineIso (the run's deadline is invariant, 1.3).
+    return { ...s, status: "starting", exitReason: null, toolCalls: 0, lastTool: null,
+      at: new Date().toISOString(), staleReactivation: true };
+  }
+  return s;
 };
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 
@@ -773,6 +811,10 @@ function followSlot() {
     const d = parseDeadline(String(p.deadline));
     if (d.ok) deadlineMs = d.ts.getTime();
   }
+  // v0.35.5 (run40): the slot's launch time — a terminal status OLDER than it
+  // belongs to a previous child instance of this window (see statusIsStale).
+  const stAt = p.started_at ? Date.parse(p.started_at) : NaN;
+  slotStartedAtMs = Number.isFinite(stAt) ? stAt : null;
   glog("→", 36, `handoff: ${from} → ${to} (node ${p.node || "?"} · ${p.window || "?"})`);
   try {
     for (const line of renderTree(A.projectDir).split("\n")) glog("", 2, line);
@@ -802,6 +844,7 @@ function handBackToLaunch() {
     lastDecision: null, llmFailStreak: 0, lastJudgeToolCalls: null,
   };
   deadlineMs = launchDeadlineMs;   // the launch window's own deadline (1.3)
+  slotStartedAtMs = null;          // no slot here — only the child-pgid check applies
   glog("→", 36, `hand-back: ${from} → ${to} (slot consumed — re-point to the launch window)`);
   try {
     for (const line of renderTree(A.projectDir).split("\n")) glog("", 2, line);

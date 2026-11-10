@@ -1287,9 +1287,12 @@ console.log("DECISION: OK");`);
   // the stub deletes it during the report call (the chain's terminal clear).
   mkdirSync(path.join(proj, ".pi-supervisor"), { recursive: true });
   const slot = path.join(proj, ".pi-supervisor", "active.json");
+  // started_at = the sub window's LAUNCH time (before its child went terminal)
+  // — reality order, so the sub's own terminal status is NOT "older than a
+  // relaunch" (v0.35.5 staleness check).
   writeFileSync(slot, JSON.stringify({
     run_dir: dSub, node: "auth", guard_pid: process.pid, window: "run-1",
-    started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+    started_at: new Date(Date.now() - 60_000).toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
   }));
   const stub = mkStub("pi-r47.mjs", `
 import { rmSync, appendFileSync } from "node:fs";
@@ -1312,6 +1315,84 @@ console.log("DECISION: OK");`);
     && /hand-back: r47-subwin → run28/.test(logLaunch)     // the re-point is visible in the launch window's log
     && (invLog("r47").match(/REPORT/g) || []).length === 2, // both reports, no judgment
     `exit=${r.status} repSub=${existsSync(repSub)} repRun=${existsSync(repRun)} inv=${JSON.stringify(invLog("r47"))} logLaunch=${logLaunch.trim().split("\n").slice(0, 1).join(" | ").slice(0, 120)}`);
+}
+
+// ---- R48: v0.35.5 (run40, 7.7/6.3) — the re-entry child's status has not
+// landed yet: a re-activated window keeps its PREVIOUS child's terminal status
+// on disk until the new child's guard overwrites it. run40: the monitor
+// re-pointed 8 ms after the hand-back, read the first child's "completed"
+// (10 tool calls, dead pgid) and stopped — it exited 47 s BEFORE the re-entry
+// child finished, so the run-summary snapshotted status=running and the
+// re-entry child ran unmonitored. A terminal status is stale when the window's
+// current child is a different instance (child-pgid file ≠ status.childPgid, or
+// the slot was launched after the status was written): present as "starting",
+// keep polling, stop only on the NEW child's terminal.
+{
+  const proj = path.join(root, "r48-proj");
+  const runsRoot = path.join(proj, ".pi-supervisor", "runs");
+  const dLaunch = path.join(runsRoot, "run29");
+  mkdirSync(path.join(dLaunch, ".pi-supervisor"), { recursive: true });
+  const dSub = runDir("r48-subwin");
+  mkdirSync(path.join(dSub, ".pi-supervisor"), { recursive: true });
+  // dSub: the sub window's CURRENT child went terminal (pgid 555, current).
+  mkStatus(dSub, { status: "completed", exitReason: "completed-finalized", guardPid: null, toolCalls: 7, childPgid: 555 });
+  writeFileSync(path.join(dSub, "child-pgid"), "555\npichild\n");
+  // dLaunch: the re-entry child (pgid 222) owns the window now (child-pgid
+  // already rewritten) but its guard has not written the status yet — the
+  // on-disk terminal is the FIRST child's (pgid 111) and must not stop the
+  // monitor.
+  mkStatus(dLaunch, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 10, childPgid: 111 });
+  writeFileSync(path.join(dLaunch, "child-pgid"), "222\npichild\n");
+  // background writer: the re-entry child's guard lands running (+2 s) and its
+  // true terminal (+5 s).
+  const writer = mkStub("writer-r48.mjs", `
+import { writeFileSync } from "node:fs";
+const sleep = (s) => new Promise((r) => setTimeout(r, s * 1000));
+const st = (over) => writeFileSync(${JSON.stringify(path.join(dLaunch, "pi-child-status.json"))}, JSON.stringify({
+  v: 2, at: new Date().toISOString(), status: "running", guardPid: ${String(process.pid)},
+  childPid: ${String(process.pid + 1)}, attempt: 1, rewinds: 0, toolCalls: 0, lastTool: "bash",
+  elapsedMs: 1000, sessionId: "fake-r48", childPgid: 222, deadlineIso: new Date(Date.now() + 3600e3).toISOString(), ...over,
+}, null, 2));
+await sleep(2);
+st({});
+await sleep(3);
+st({ status: "completed", exitReason: "completed", guardPid: null, toolCalls: 3, lastTool: "bash" });
+`);
+  const wproc = spawn(NODE, [writer], { stdio: "ignore" });
+  // the slot points at the sub window (the follow must happen); the stub
+  // deletes it during the sub report (the chain's terminal clear).
+  mkdirSync(path.join(proj, ".pi-supervisor"), { recursive: true });
+  const slot = path.join(proj, ".pi-supervisor", "active.json");
+  writeFileSync(slot, JSON.stringify({
+    run_dir: dSub, node: "auth", guard_pid: process.pid, window: "run-1",
+    started_at: new Date(Date.now() - 120_000).toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+  }));
+  const stub = mkStub("pi-r48.mjs", `
+import { rmSync, appendFileSync } from "node:fs";
+const p = process.argv[process.argv.length - 1];
+const isReport = p.includes("final report writer");
+if (isReport) rmSync(${JSON.stringify(slot)}, { force: true });
+appendFileSync(process.env.RM_INV_LOG || "/dev/null", (isReport ? "REPORT" : "JUDGE") + "\\n");
+console.log("r48 body");
+console.log("DECISION: OK");`);
+  process.env.RM_INV_LOG = path.join(root, "inv-r48.log");
+  // NO --once: the whole point is that the loop keeps polling through the
+  // stale status until the new child's terminal lands (run40's monitor ran
+  // continuously; --once would exit after one cycle).
+  const r = runRm(dLaunch, stub, ["--project-dir", proj]);
+  wproc.kill();
+  process.env.RM_INV_LOG = "";
+  const repSub = path.join(dSub, "FINAL-REPORT.md");
+  const repRun = path.join(dLaunch, "FINAL-REPORT.md");
+  const logLaunch = readLog(dLaunch);
+  report("R48 stale terminal on re-entry → poll through, stop on the NEW child's terminal",
+    r.status === 0
+    && existsSync(repSub)                                  // the sub report still lands
+    && existsSync(repRun)                                  // the run report lands…
+    && /child completed · 3 tool calls/.test(logLaunch)   // …on the NEW child (3), not the stale one (10)
+    && !/child completed · 10 tool calls/.test(logLaunch) // the stale terminal never stopped the loop
+    && /hand-back: r48-subwin → run29/.test(logLaunch),
+    `exit=${r.status} repSub=${existsSync(repSub)} repRun=${existsSync(repRun)} logLaunch=${logLaunch.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);
