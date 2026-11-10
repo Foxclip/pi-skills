@@ -162,9 +162,49 @@ class RpcClient {
   async getState() { return { sessionId: "fake-session", sessionFile: (spec.sessionFile ?? "/tmp/fake-session.jsonl"), entries: this.entries }; }
   async getEntries() {
     const last = this.entries[this.entries.length - 1];
-    return { entries: this.entries, leafId: last ? last.id : null };
+    // spec.entriesTextAt: per-index override of what entries report for the
+    // LAST assistant message's text blocks (chars to keep; 0 = none). The
+    // v0.35.6 test uses it to model the divergence where entries report no
+    // text while the RPC view has it (run48's production direction was the
+    // mirror image — entries full, RPC empty — covered by the
+    // "stall -> L2 fork -> completed" test). Only text blocks are affected;
+    // thinking blocks keep replaying normally.
+    const ov = spec.entriesTextAt;
+    let entries = this.entries;
+    if (ov) {
+      let lastAsstIdx = -1;
+      for (let i = this.entries.length - 1; i >= 0; i--) {
+        if (this.entries[i]?.type === "message" && this.entries[i].message?.role === "assistant") { lastAsstIdx = i; break; }
+      }
+      if (lastAsstIdx >= 0) {
+        entries = this.entries.map((e, i) => {
+          if (i !== lastAsstIdx) return e;
+          const chars = ov[i];
+          return {
+            ...e,
+            message: {
+              ...e.message,
+              content: e.message.content.map((b) => (b.type === "text" ? { ...b, text: b.text.slice(0, chars) } : b)),
+            },
+          };
+        });
+      }
+    }
+    return { entries, leafId: last ? last.id : null };
   }
-  async getLastAssistantText() { return { text: this.lastText }; }
+  // v0.35.6: mirror the real RpcClient (pi 1.5.1) — the LAST assistant
+  // message's concatenated text blocks, trimmed, or undefined. A plain
+  // string, not a {text} object — the old object shape was the exact API
+  // mismatch that masked the run48 bug in tests. spec.rpcText overrides the
+  // view for divergence tests.
+  async getLastAssistantText() {
+    if (spec.rpcText !== undefined) return spec.rpcText.trim() || undefined;
+    const last = [...this.entries].reverse().find((e) => e.type === "message" && e.message?.role === "assistant");
+    if (!last) return undefined;
+    let text = "";
+    for (const b of last.message?.content ?? []) if (b.type === "text") text += b.text;
+    return text.trim() || undefined;
+  }
   async getMessages() {
     // v0.30.0 P5b: mirrors pi's RPC get_messages (session messages; assistant
     // messages may carry stopReason/errorMessage — see the errorStop item).
@@ -890,6 +930,34 @@ run({
   phases: [[...tool("bash", { cmd: "work" }), { settled: {} }]],
   expect: ["EMPTY", "\"exitReason\":\"empty-final\"", "\"status\":\"stuck\""],
   expectExit: 3,
+});
+// v0.35.6 (run48): the old inspectSettle read RpcClient.getLastAssistantText()
+// as an OBJECT (`.text` on the string pi 1.5.1 returns) → textChars was always
+// 0 → a healthy final (text + toolCall blocks; entries view full, 2722 chars
+// in run48) was misclassified empty-final: 3 steers, 2 forks, stuck halt.
+// Regression: the attempt-scoped entries view must drive completion. The
+// phase below settles on a toolCall-only LAST message, so the RPC view is
+// empty while the attempt's entries carry the text — entries must win.
+run({
+  name: "v0.35.6 (run48) text→toolCall→settle: entries view drives completion, not empty-final",
+  args: [TASK, "--max-steers", "0", "--max-forks", "0"],
+  phases: [[say("Done, report saved."), ...tool("bash", { cmd: "work" }), { settled: {} }]],
+  expect: ["\"status\":\"completed\"", "settle text-source divergence"],
+  expectNot: ["empty-final", "EMPTY final message"],
+  expectExit: 0,
+});
+// The opposite divergence: entries report no text for the attempt while the
+// RPC view carries some — the RPC view must be accepted (never steer a
+// healthy completion either way).
+run({
+  name: "v0.35.6 divergence: entries empty, RPC view full → RPC accepted, completed",
+  // run() serializes { phases, ...extra } into the spec — the stub hook goes in `extra`, not spec.
+  extra: { rpcText: "Status: task done, report saved to report.md." },
+  args: [TASK, "--max-steers", "0", "--max-forks", "0"],
+  phases: [[...tool("bash", { cmd: "work" }), { settled: {} }]],
+  expect: ["\"status\":\"completed\"", "settle text-source divergence"],
+  expectNot: ["empty-final"],
+  expectExit: 0,
 });
 
 run({

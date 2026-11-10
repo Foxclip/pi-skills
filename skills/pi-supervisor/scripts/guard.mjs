@@ -1114,7 +1114,7 @@ function consultAllowed(trigger) {
 async function doConsult(trigger, extra) {
   let lastText = "";
   try {
-    lastText = (await client.getLastAssistantText())?.text ?? "";
+    lastText = rpcTextOf(await client.getLastAssistantText());
   } catch { /* best effort */ }
   if (!lastText) lastText = finalTextAcc;
   const payload = {
@@ -1410,14 +1410,54 @@ async function doRewind(reason) {
 // thinking content); the degenerate decision in the main loop combines it with
 // the attempt-scoped counters (text streamed + tool calls since the last
 // prompt), so a stray thinking-only tail after a real answer is NOT flagged.
+//
+// v0.35.6: text is measured ATTEMPT-scoped (like the attemptTextChars /
+// attemptToolCalls counters), not from RpcClient.getLastAssistantText() and
+// not from a single entries message — run48 (TestProject2 streak, 2026-11-10)
+// showed the RPC view reports EMPTY ("", null-safe ?? falls through) for a
+// final assistant message that carries text + toolCall blocks, while the
+// entries view read full (2722 chars) — the child was misclassified
+// empty-final, steer-spammed 3×, forked 2×, and a healthy completed run became
+// a stuck/empty-final halt. The old single-message entries scan is ALSO wrong
+// the other way: one attempt spans several assistant messages (text block in
+// message N, toolCall in message N+1, thinking tail in N+2) — a last-MESSAGE
+// scan would flag the real answer's attempt as textless. So: sum text blocks
+// of ALL assistant entries back to the last user entry (the attempt) —
+// consistent with attemptTextChars; thinking stays last-message-only, which
+// preserves the v0.15.1 stray-tail protection (a thinking-only TAIL after a
+// real answer still counts as stray). If entries find 0 text while the RPC
+// view has some, log the divergence (diagnostic) and let the RPC view through
+// so a future entries-side regression cannot flip a healthy completion into a
+// steer-storm in the opposite direction.
+// v0.35.6: RpcClient.getLastAssistantText() returns a plain string or
+// undefined (pi 1.5.1). run48's empty-final misfire started by reading a
+// `.text` property on that string (always undefined) — normalize the shape
+// once instead of re-deriving it at each call site.
+function rpcTextOf(v) { return typeof v === "string" ? v : (v?.text ?? ""); }
+
 async function inspectSettle() {
   const info = { textChars: 0, thinkingChars: 0 };
+  let rpcText = null;
   try {
-    info.textChars = ((await client.getLastAssistantText())?.text ?? "").trim().length;
+    rpcText = await client.getLastAssistantText();
   } catch { /* best effort */ }
   try {
     const { entries } = await client.getEntries();
     const list = entries ?? [];
+    let start = 0;
+    for (let i = list.length - 1; i >= 0; i--) {
+      const e = list[i];
+      if (e?.type === "message" && e.message?.role === "user") { start = i + 1; break; }
+    }
+    let chars = 0;
+    for (let i = start; i < list.length; i++) {
+      const e = list[i];
+      if (e?.type !== "message" || e.message?.role !== "assistant") continue;
+      for (const b of e.message?.content ?? []) {
+        if (b?.type === "text") chars += (b.text ?? "").length;
+      }
+    }
+    info.textChars = chars;
     for (let i = list.length - 1; i >= 0; i--) {
       const e = list[i];
       if (e?.type === "message" && e.message?.role === "assistant") {
@@ -1429,6 +1469,16 @@ async function inspectSettle() {
     }
   } catch (e) {
     logSup(`[guard] settle inspection warn: ${e.message}`);
+  }
+  const rpcLen = rpcTextOf(rpcText).trim().length;
+  if (info.textChars === 0 && rpcLen > 0) {
+    // Divergence (the run48 shape): entries say no text, RPC says there is
+    // some. Trust the RPC view rather than steer a healthy completion.
+    info.textChars = rpcLen;
+    logSup(`[guard] settle text-source divergence: entries=0 chars, RPC=${rpcLen} — RPC view accepted (v0.35.6)`);
+  } else if (info.textChars > 0 && rpcLen === 0) {
+    // The run48 divergence (entries full, RPC empty): entries already win.
+    logSup(`[guard] settle text-source divergence: entries=${info.textChars} chars, RPC=0 — entries win (v0.35.6)`);
   }
   return info;
 }
@@ -2459,9 +2509,24 @@ try {
   }
 
   let finalText = "";
+  // v0.35.6: entries-first (same rationale as inspectSettle) — the RPC view
+  // returned EMPTY for a non-empty final message in run48.
   try {
-    finalText = (await client.getLastAssistantText())?.text ?? "";
+    const { entries } = await client.getEntries();
+    const list = entries ?? [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      const e = list[i];
+      if (e?.type === "message" && e.message?.role === "assistant") {
+        for (const b of e.message?.content ?? []) {
+          if (b?.type === "text") finalText += (b.text ?? "");
+        }
+        break;
+      }
+    }
   } catch { /* best effort */ }
+  if (!finalText.trim()) {
+    try { finalText = rpcTextOf(await client.getLastAssistantText()); } catch { /* best effort */ }
+  }
   if (!finalText) finalText = finalTextAcc.trim();
   // v0.14.0: full final text on disk for host mode too (previously only the
   // 4000-char manifest slice; the user-variant mode already wrote this file).
