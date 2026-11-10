@@ -1456,6 +1456,45 @@ console.log("DECISION: OK");`);
     `4=${b4} 5=${b5} 6=${b6} labels=${labels} ${lines.filter((l) => /tool call [456]:|parent judging/.test(l)).map((l) => l.trim().slice(0, 60)).join(" | ").slice(0, 260)}`);
 }
 
+// ---- R51: v0.35.9 (run63, 7.4) — the per-call lines come from the guard's
+// progress log (pi-child-progress.log): one bright line per COMPLETED call,
+// even when the status snapshot coalesces a burst. Calls 4+5 land inside one
+// fast-tick gap (status jumps 3→5 in a single tick): the snapshot line alone
+// would show "tool call 5" only. The log has 5 [tool] lines → calls 4 AND 5
+// must each get their own line (5 with the ERR marker), call 6 later its own
+// line, and the attach must NOT replay calls 1–3 from the log.
+{
+  const d = runDir("r51");
+  const prog = path.join(d, "pi-child-progress.log");
+  const T = (i, extra) => `[tool] 2026-11-10T00:00:0${i}.000Z tools=${i} bash${extra}\n`;
+  writeFileSync(prog, `[start] 2026-11-10T00:00:00.000Z pid=1 task=1chars hard=1min session=? consult=off\n${T(1, " 11ms")}${T(2, " 20ms")}${T(3, " 6ms")}`);
+  mkStatus(d, { toolCalls: 3 });
+  const child = spawn(NODE, rmArgs(d, STUB_SLOWER, ["--cycle-sec", "1000"]), {
+    stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, RM_HEARTBEAT_SEC: "60", RM_FAST_TICK_SEC: "1" },
+  });
+  let err = "";
+  child.stderr.on("data", (x) => { err += x; });
+  await waitMs(1500);               // judgment in flight (STUB_SLOWER: ~12 s)
+  // calls 4+5 in ONE burst (5 ms apart in run63) → status jumps 3→5 in one tick
+  writeFileSync(prog, readFileSync(prog, "utf8") + T(4, " 10ms") + T(5, " ERR 6ms"));
+  mkStatus(d, { toolCalls: 5 });
+  await waitMs(1200);
+  writeFileSync(prog, readFileSync(prog, "utf8") + T(6, " 40ms"));
+  mkStatus(d, { toolCalls: 6 });
+  await waitMs(2700);               // fast ticks (~1 s) must catch everything
+  child.kill("SIGINT");
+  await new Promise((r) => child.on("exit", r));
+  const lines = err.split("\n");
+  const b4 = lines.filter((l) => /· tool call 4: bash/.test(l)).length;
+  const b5 = lines.filter((l) => /· tool call 5: bash ERR/.test(l)).length;
+  const b5dup = lines.filter((l) => /· tool call 5: bash(?! ERR)/.test(l)).length;
+  const b6 = lines.filter((l) => /· tool call 6: bash/.test(l)).length;
+  const replay = lines.filter((l) => /· tool call [123]:/.test(l)).length;
+  report("R51 per-call lines from the progress log (burst 4+5 in one status jump, ERR marker, no replay)",
+    b4 === 1 && b5 === 1 && b6 === 1 && b5dup === 0 && replay === 0,
+    `4=${b4} 5ERR=${b5} 5dup=${b5dup} 6=${b6} replay=${replay} ${lines.filter((l) => /· tool call [1-6]:/.test(l)).map((l) => l.trim().slice(0, 60)).join(" | ").slice(0, 260)}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);

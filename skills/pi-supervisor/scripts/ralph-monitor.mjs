@@ -223,13 +223,57 @@ const childPhase = (s) => {
   return Number.isFinite(cd) && Date.now() >= cd ? "finalizing" : s.status;
 };
 // (A) per tool call — BRIGHT, and the tool name IS the message: "tool call
-// N" is the latest call's index = the total count (5s snapshots: calls inside
-// one poll gap show as one line with the final count).
+// N" is the latest call's index = the total count. v0.35.9 (run63, 7.4):
+// this is now the FALLBACK line — the normal path prints ONE line per
+// completed call from the guard's progress log (emitToolChange), because the
+// status file is a snapshot: calls inside one poll gap coalesce (run63 lost
+// calls 1+2, 5 ms apart, and call 4, 2.3 s before call 5).
 const childToolLine = (s) => {
   const tc = Number(s.toolCalls) || 0;
   const tool = s.lastTool ? `: ${s.lastTool}` : "";
   const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
   tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${childPhase(s)} · tool call ${tc}${tool}${C(0)}${C(2)}${left}${C(0)}`);
+};
+// v0.35.9 (run63, 7.4): the guard appends one `[tool]` line per COMPLETED
+// tool call to pi-child-progress.log (append-only; each attempt starts with
+// its own [start] line, and the `tools=` counter is attempt-scoped). Parse
+// the current attempt's calls; null when the log is missing or has no
+// [start] yet (the monitor then falls back to the snapshot line).
+const progressCalls = () => {
+  let txt = "";
+  try { txt = readFileSync(path.join(A.runDir, "pi-child-progress.log"), "utf8"); } catch { return null; }
+  const lines = txt.split("\n");
+  let si = -1;
+  for (let i = lines.length - 1; i >= 0; i--) if (lines[i].startsWith("[start] ")) { si = i; break; }
+  if (si < 0) return null;
+  const calls = [];
+  for (let i = si + 1; i < lines.length; i++) {
+    const m = lines[i].match(/^\[tool\] \S+ tools=(\d+) (\S+)( ERR)?/);
+    if (m) calls.push({ tool: m[2], err: !!m[3] });
+  }
+  return { key: lines[si], count: calls.length, calls };
+};
+// v0.35.9: print the bright per-call lines for every completed call the
+// tracker has not printed yet (usually exactly one; a burst inside one poll
+// gap prints one line PER CALL — 7.4). Fallback: the snapshot line when the
+// progress log is unreadable. Call on EVERY tool-count change (main loop AND
+// fast tick); it does not touch seen.tc (the caller owns that).
+const emitToolChange = (s) => {
+  const p = progressCalls();
+  if (p) {
+    if (p.key !== seen.progKey) { seen.progKey = p.key; seen.progCount = 0; }  // new attempt (distill/relaunch)
+    if (p.count > seen.progCount) {
+      const phase = childPhase(s);
+      const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
+      for (let i = seen.progCount; i < p.count; i++) {
+        const c = p.calls[i];
+        tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${phase} · tool call ${i + 1}: ${c.tool}${c.err ? " ERR" : ""}${C(0)}${C(2)}${left}${C(0)}`);
+      }
+      seen.progCount = p.count;
+      return;
+    }
+  }
+  childToolLine(s);
 };
 // (B) liveness line — GRAY (C(2), the same grey as the other status lines):
 // a liveness proof, not an event.
@@ -246,13 +290,17 @@ const childLiveLine = (s, { idleMs = null, bright = false, withLeft = true } = {
 // available (attach: real idle, not 0) — and v0.25.7: PRINTS the launch
 // baseline line (gray, count + last + left) right after "child launched".
 const QUIET_SEC = Math.max(1, Number(process.env.RM_QUIET_SEC) || 60);
-let seen = { tc: null, lastToolAt: 0, lastQuiet: 0 };
+let seen = { tc: null, lastToolAt: 0, lastQuiet: 0, progKey: null, progCount: 0 };
 // v0.35.7 (run61, 7.4): re-anchor the child-line state to a NEW window's child
 // (followSlot / handBackToLaunch). The old window's count would otherwise
 // cross-contaminate the first poll: run61 attached to the sub window and
 // printed a spurious bright "tool call 0" line 39 s before its first real
-// call (0 ≠ the parent window's count of 5).
-const resetSeen = () => { seen.tc = null; seen.lastToolAt = 0; seen.lastQuiet = 0; };
+// call (0 ≠ the parent window's count of 5). v0.35.9: progKey/progCount are
+// the per-call tracker (the guard's progress log, see emitToolChange).
+const resetSeen = () => {
+  seen.tc = null; seen.lastToolAt = 0; seen.lastQuiet = 0;
+  seen.progKey = null; seen.progCount = 0;
+};
 const beatMaybe = (s) => {
   const tc = Number(s.toolCalls);
   if (!Number.isFinite(tc)) return;
@@ -263,13 +311,15 @@ const beatMaybe = (s) => {
     seen.lastToolAt = Number.isFinite(lts) ? lts : now;
     seen.lastQuiet = now;
     childLiveLine(s);                       // launch baseline (gray)
+    const p0 = progressCalls();             // v0.35.9: prime the per-call tracker (attach: no replay of history)
+    if (p0) { seen.progKey = p0.key; seen.progCount = p0.count; }
     return;
   }
   if (tc !== seen.tc) {                     // a tool call happened → bright
     seen.tc = tc;
     seen.lastToolAt = now;
     seen.lastQuiet = now;
-    childToolLine(s);
+    emitToolChange(s);                      // v0.35.9: one line per completed call
     return;
   }
   if (now - seen.lastQuiet >= QUIET_SEC * 1000) {   // quiet for a minute → gray
@@ -681,12 +731,14 @@ const heartbeat = (label) => {
         // beatMaybe never runs, so every tool call made during the judgment
         // lost its bright per-call line (run61: a 235 s judgment swallowed
         // calls 1–4; only gray liveness lines showed the counts climbing).
-        // Emit the SAME type-A line the poll loop emits, and advance `seen`
+        // v0.35.9 (run63, 7.4): per-call lines from the progress log even
+        // here (the snapshot merges bursts at the fast-tick rate too). Emit
+        // the SAME type-A lines the poll loop emits, and advance `seen`
         // so the resumed loop does not re-emit (its count is unchanged since).
         seen.tc = tc;
         seen.lastToolAt = Number.isFinite(lts) ? lts : Date.now();
         seen.lastQuiet = Date.now();
-        childToolLine(s);
+        emitToolChange(s);
       } else if (labelDue) {
         // v0.25.7: the heartbeat child line is the SAME liveness line as the
         // per-minute quiet line (gray, count + idle + last + left) — the old
