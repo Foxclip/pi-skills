@@ -641,19 +641,32 @@ let lastJudgment = 0; // 0 = judgment due immediately
 // per RM_HEARTBEAT_SEC (default 60s) with the elapsed wait + the child's live
 // state, read fresh from disk on every tick. Returns a stop function.
 const HEARTBEAT_SEC = Math.max(1, Number(process.env.RM_HEARTBEAT_SEC) || 60);
+// v0.35.8 (run62, 7.4): the child state is re-checked on a FAST tick (default
+// 5 s, RM_FAST_TICK_SEC; never slower than the label rate) so a tool call made
+// during the in-flight LLM wait gets its own bright line within one poll
+// interval — run62: a 143 s judgment with 60 s ticks coalesced calls 3–5 into
+// a single line (only the latest count was ever shown). The dim label line and
+// the quiet liveness line keep the RM_HEARTBEAT_SEC rate (default 60 s).
+const FAST_TICK_SEC = Math.max(1, Math.min(HEARTBEAT_SEC, Number(process.env.RM_FAST_TICK_SEC) || 5));
 const heartbeat = (label) => {
   const startedAt = Date.now();
+  let lastLabelEl = 0;   // elapsed seconds at the last dim label line
   const iv = setInterval(() => {
-    const el = Math.round((Date.now() - startedAt) / 1000);
+    const now = Date.now();
+    const el = Math.round((now - startedAt) / 1000);
+    // v0.35.8: the label keeps the HEARTBEAT_SEC rate; the child state below
+    // is checked on every fast tick.
+    const labelDue = el - lastLabelEl >= HEARTBEAT_SEC;
+    if (labelDue) lastLabelEl = el;
     const s = readStatus();
-    const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
+    const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - now)} left` : "";
     // v0.25.3: the parent's wait and the child's state are SEPARATE messages —
     // they used to share one line (… parent judging · 60s · child running · …).
     // v0.25.4: the child line only while the child is RUNNING — a terminal
     // child's state is announced once, as an EVENT, in stopLoop before the
     // STOP line; repeating it every tick read like a late event (run11:
     // "child completed" printed 60s AFTER the lines that reacted to it).
-    tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${label}${C(0)}${C(2)} · ${el}s${left}${C(0)}`);
+    if (labelDue) tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${label}${C(0)}${C(2)} · ${el}s${left}${C(0)}`);
     if (s && s.status === "running") {
       const tc = Number(s.toolCalls);
       const lts = s.lastToolStartedAt ? Date.parse(s.lastToolStartedAt) : NaN;
@@ -674,15 +687,17 @@ const heartbeat = (label) => {
         seen.lastToolAt = Number.isFinite(lts) ? lts : Date.now();
         seen.lastQuiet = Date.now();
         childToolLine(s);
-      } else {
+      } else if (labelDue) {
         // v0.25.7: the heartbeat child line is the SAME liveness line as the
         // per-minute quiet line (gray, count + idle + last + left) — the old
         // bright count-only line read as a different message (run13).
+        // v0.35.8: still tied to the label rate (one per quiet minute) even
+        // though the fast tick runs much more often.
         const anchor = Number.isFinite(lts) ? lts : (seen.lastToolAt || 0);
-        childLiveLine(s, { idleMs: anchor ? Date.now() - anchor : null });
+        childLiveLine(s, { idleMs: anchor ? now - anchor : null });
       }
     }
-  }, HEARTBEAT_SEC * 1000);
+  }, FAST_TICK_SEC * 1000);
   iv.unref?.();
   return () => clearInterval(iv);
 };

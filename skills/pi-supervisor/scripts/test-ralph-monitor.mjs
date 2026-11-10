@@ -1423,6 +1423,39 @@ console.log("DECISION: OK");`);
     `brights=${brights} ${lines.filter((l) => /tool call 5|parent judging/.test(l)).map((l) => l.trim().slice(0, 60)).join(" | ").slice(0, 260)}`);
 }
 
+// ---- R50: v0.35.8 (run62, 7.4) — production-rate beat (60 s) with the FAST
+// tick time-scaled to 1 s (RM_FAST_TICK_SEC=1 stands in for the 5 s default):
+// three SEPARATE calls land inside a single 60 s beat window. v0.35.7 printed
+// nothing until the 60 s beat (all three coalesced into one line — run62:
+// calls 3–5 missing). The fast tick must give EACH call its own bright line,
+// and the dim label must stay out (no 60 s boundary crossed yet).
+{
+  const d = runDir("r50");
+  mkStatus(d, { toolCalls: 3 });
+  const child = spawn(NODE, rmArgs(d, STUB_SLOWER, ["--cycle-sec", "1000"]), {
+    stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, RM_HEARTBEAT_SEC: "60", RM_FAST_TICK_SEC: "1" },
+  });
+  let err = "";
+  child.stderr.on("data", (x) => { err += x; });
+  await waitMs(1500);               // judgment in flight (STUB_SLOWER: ~12 s)
+  mkStatus(d, { toolCalls: 4 });    // call 4
+  await waitMs(1200);
+  mkStatus(d, { toolCalls: 5 });    // call 5
+  await waitMs(1200);
+  mkStatus(d, { toolCalls: 6 });    // call 6
+  await waitMs(1500);               // fast ticks (~1 s) must catch all three
+  child.kill("SIGINT");
+  await new Promise((r) => child.on("exit", r));
+  const lines = err.split("\n");
+  const b4 = lines.filter((l) => /· tool call 4: bash/.test(l)).length;
+  const b5 = lines.filter((l) => /· tool call 5: bash/.test(l)).length;
+  const b6 = lines.filter((l) => /· tool call 6: bash/.test(l)).length;
+  const labels = lines.filter((l) => /… cycle 1 — parent judging · \d+s/.test(l)).length;
+  report("R50 per-call line for EACH call inside one 60 s beat window (fast tick)",
+    b4 === 1 && b5 === 1 && b6 === 1 && labels === 0,
+    `4=${b4} 5=${b5} 6=${b6} labels=${labels} ${lines.filter((l) => /tool call [456]:|parent judging/.test(l)).map((l) => l.trim().slice(0, 60)).join(" | ").slice(0, 260)}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
