@@ -23,6 +23,7 @@ import {
   supNodePath, ensureRootNode, registerChild, projectOfNode,
   nodePathOfProject, windowProjectOf, nestedParent, nodeJsonAt,
   nodeRunsDir, stateFileOf, commitDetached, readNode, ensureStateMdAt,
+  renderTree,
 } from "./lib/node.mjs";
 
 const KEEP = process.argv.includes("--keep");
@@ -396,6 +397,26 @@ section("N14 — STATE.md + node.json locations");
   ok(stateFileOf(p, "auth") === path.join(p, "auth", "STATE.md"), "sub STATE.md at the sub-project root");
   ok(nodeJsonAt(p, "auth") === supNodePath(path.join(p, "auth")), "node.json in the sub-project's dot dir");
   ok(readNode(p, "auth")?.name === "auth" || true, "readNode resolves through the registry");
+}
+
+// --------------------------------------------------------------------------
+section("N15 — v0.35.7 (run61, spec 7.8): the tree banner shows the LOCAL deadline");
+{
+  // On-disk deadlines are UTC ISO; the terminal must show local (7.8: ISO-8601
+  // appears in files only, never in the terminal). The expected form is
+  // computed independently of the implementation.
+  const dl = "2026-11-10T16:02:40.000Z";
+  const p = proj("p-local");
+  ensureRootNode(p, { deadline: dl });
+  const d = new Date(dl);
+  const P = (x) => String(x).padStart(2, "0");
+  const local = `${P(d.getMonth() + 1)}-${P(d.getDate())} ${P(d.getHours())}:${P(d.getMinutes())}`;
+  const utcSlice = dl.slice(5, 16).replace("T", " ");
+  const banner = renderTree(p);
+  const line = banner.split("\n").find((l) => l.includes("deadline")) || "";
+  ok(line.includes(`deadline ${local}`), "banner deadline is local", line.trim());
+  if (utcSlice !== local)
+    ok(!line.includes(utcSlice), "banner never shows the raw UTC slice", line.trim());
 }
 
 // --------------------------------------------------------------------------

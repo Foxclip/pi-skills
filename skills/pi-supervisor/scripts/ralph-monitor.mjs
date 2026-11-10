@@ -247,6 +247,12 @@ const childLiveLine = (s, { idleMs = null, bright = false, withLeft = true } = {
 // baseline line (gray, count + last + left) right after "child launched".
 const QUIET_SEC = Math.max(1, Number(process.env.RM_QUIET_SEC) || 60);
 let seen = { tc: null, lastToolAt: 0, lastQuiet: 0 };
+// v0.35.7 (run61, 7.4): re-anchor the child-line state to a NEW window's child
+// (followSlot / handBackToLaunch). The old window's count would otherwise
+// cross-contaminate the first poll: run61 attached to the sub window and
+// printed a spurious bright "tool call 0" line 39 s before its first real
+// call (0 ≠ the parent window's count of 5).
+const resetSeen = () => { seen.tc = null; seen.lastToolAt = 0; seen.lastQuiet = 0; };
 const beatMaybe = (s) => {
   const tc = Number(s.toolCalls);
   if (!Number.isFinite(tc)) return;
@@ -649,12 +655,32 @@ const heartbeat = (label) => {
     // "child completed" printed 60s AFTER the lines that reacted to it).
     tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(36)}…${C(0)} ${C(2)}${label}${C(0)}${C(2)} · ${el}s${left}${C(0)}`);
     if (s && s.status === "running") {
-      // v0.25.7: the heartbeat child line is the SAME liveness line as the
-      // per-minute quiet line (gray, count + idle + last + left) — the old
-      // bright count-only line read as a different message (run13).
+      const tc = Number(s.toolCalls);
       const lts = s.lastToolStartedAt ? Date.parse(s.lastToolStartedAt) : NaN;
-      const anchor = Number.isFinite(lts) ? lts : (seen.lastToolAt || 0);
-      childLiveLine(s, { idleMs: anchor ? Date.now() - anchor : null });
+      if (seen.tc === null) {
+        // first look at this child (attach mid-run): gray baseline, anchor.
+        if (Number.isFinite(tc)) seen.tc = tc;
+        seen.lastToolAt = Number.isFinite(lts) ? lts : Date.now();
+        seen.lastQuiet = Date.now();
+        childLiveLine(s, { idleMs: Number.isFinite(lts) ? Date.now() - lts : null });
+      } else if (Number.isFinite(tc) && tc !== seen.tc) {
+        // v0.35.7 (run61, 7.4): the main loop is BLOCKED in this LLM call —
+        // beatMaybe never runs, so every tool call made during the judgment
+        // lost its bright per-call line (run61: a 235 s judgment swallowed
+        // calls 1–4; only gray liveness lines showed the counts climbing).
+        // Emit the SAME type-A line the poll loop emits, and advance `seen`
+        // so the resumed loop does not re-emit (its count is unchanged since).
+        seen.tc = tc;
+        seen.lastToolAt = Number.isFinite(lts) ? lts : Date.now();
+        seen.lastQuiet = Date.now();
+        childToolLine(s);
+      } else {
+        // v0.25.7: the heartbeat child line is the SAME liveness line as the
+        // per-minute quiet line (gray, count + idle + last + left) — the old
+        // bright count-only line read as a different message (run13).
+        const anchor = Number.isFinite(lts) ? lts : (seen.lastToolAt || 0);
+        childLiveLine(s, { idleMs: anchor ? Date.now() - anchor : null });
+      }
     }
   }, HEARTBEAT_SEC * 1000);
   iv.unref?.();
@@ -820,6 +846,7 @@ function followSlot() {
     for (const line of renderTree(A.projectDir).split("\n")) glog("", 2, line);
   } catch { /* the tree is decoration — the re-point is the substance */ }
   flog(`handoff: ${from} → ${to} (node ${p.node || "?"} · ${p.window || "?"})`);
+  resetSeen();   // v0.35.7 (run61, 7.4): new window = new child
   return true;
 }
 // v0.35.4 (run35, 7.7): the hand-back re-point for the SLOT-LESS case. stopLoop
@@ -850,6 +877,7 @@ function handBackToLaunch() {
     for (const line of renderTree(A.projectDir).split("\n")) glog("", 2, line);
   } catch { /* the tree is decoration — the re-point is the substance */ }
   flog(`hand-back: ${from} → ${to} (slot consumed — re-point to the launch window)`);
+  resetSeen();   // v0.35.7 (run61, 7.4): new window = new child instance
   return true;
 }
 

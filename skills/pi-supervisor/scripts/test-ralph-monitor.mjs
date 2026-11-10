@@ -1395,6 +1395,34 @@ console.log("DECISION: OK");`);
     `exit=${r.status} repSub=${existsSync(repSub)} repRun=${existsSync(repRun)} logLaunch=${logLaunch.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
 }
 
+// ---- R49: v0.35.7 (run61, 7.4) — the per-tool-call line fires DURING an
+// in-flight judgment. The main loop is blocked in the LLM call, so the
+// HEARTBEAT (not beatMaybe) must emit the type-A line — run61: a 235 s
+// judgment swallowed calls 1–4; only gray liveness lines showed the counts
+// climbing. And it must advance `seen` so the resumed loop does not re-emit.
+{
+  const d = runDir("r49");
+  mkStatus(d, { toolCalls: 3 });
+  const child = spawn(NODE, rmArgs(d, STUB_SLOWER, ["--cycle-sec", "1000"]), {
+    stdio: ["ignore", "ignore", "pipe"], env: { ...process.env, RM_HEARTBEAT_SEC: "1" },
+  });
+  let err = "";
+  child.stderr.on("data", (x) => { err += x; });
+  await waitMs(1500);               // judgment in flight (STUB_SLOWER: ~12 s)
+  mkStatus(d, { toolCalls: 5 });    // calls 4+5 land inside the judgment
+  await waitMs(4500);               // the ~2 s tick must catch tc=5 → bright line
+  child.kill("SIGINT");
+  await new Promise((r) => child.on("exit", r));
+  const lines = err.split("\n");
+  const iBright = lines.findIndex((l) => /· tool call 5: bash/.test(l));
+  const hbAfter = iBright >= 0 && lines.some((l, i) =>
+    i > iBright && /… cycle 1 — parent judging · \d+s/.test(l));
+  const brights = lines.filter((l) => /· tool call 5: bash/.test(l)).length;
+  report("R49 per-call line DURING an in-flight judgment (heartbeat emits, no dup after)",
+    brights === 1 && hbAfter,
+    `brights=${brights} ${lines.filter((l) => /tool call 5|parent judging/.test(l)).map((l) => l.trim().slice(0, 60)).join(" | ").slice(0, 260)}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);

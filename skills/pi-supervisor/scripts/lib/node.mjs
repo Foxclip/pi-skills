@@ -594,7 +594,17 @@ const humanDur = (ms) => {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
   return h > 0 ? `${h}h ${m}m` : m > 0 ? `${m}m ${r}s` : `${r}s`;
 };
-const shortIso = (iso) => (iso ? String(iso).slice(5, 16).replace("T", " ") : null);
+// v0.35.7 (run61, spec 7.8): LOCAL date+time, not the raw UTC slice — the
+// tree banner printed `deadline 11-10 16:02` (UTC) where local was
+// `11-11 02:02`; 7.8: displayed times are local, ISO-8601 (UTC) appears in
+// files only, never in the terminal.
+const shortIso = (iso) => {
+  if (!iso) return null;
+  const d = new Date(String(iso));
+  if (!Number.isFinite(d.getTime())) return String(iso).slice(5, 16).replace("T", " ");
+  const p = (x) => String(x).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+};
 
 /**
  * The sub-runs tree as a boxed, append-only banner (plan §5.5) — printed on
