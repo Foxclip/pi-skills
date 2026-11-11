@@ -825,16 +825,24 @@ function readHaltContext() {
   if (!halt) return null;
   return { reason: halt.reason || "no reason recorded" };
 }
-async function stopLoop(pc) {
+async function stopLoop(pc, trigger = null) {
   // v0.35.11 (run79): the stale-instance marker (see markStaleIfMatch).
   // Deferred only while the on-disk file is still the last-watched instance's
   // UNCHANGED terminal; a changed file (the re-entry child wrote) or an
   // expired grace (it never came) falls through to the normal stop.
+  // v0.35.12 (run81-2nd): the marker is checked against `trigger` — the SAME
+  // status read that produced pc — not a fresh file read. run81-2nd: the
+  // fresh read landed AFTER the re-entry guard's first write (1 ms later)
+  // and cleared the marker, so the stop proceeded on the stale terminal
+  // (the monitor exited 14 s before the re-entry child's true terminal).
   if (/child-terminal/.test(pc.reason)) {
-    const raw = rawStatus();
+    const raw = trigger ?? rawStatus();
     if (markerHolds(raw)) {
       if (!staleMarker.told) { staleMarker.told = true; glog("…", 2, `terminal deferred: stale instance-${staleMarker.p} terminal unchanged on file — waiting for the re-entry child to write`); }
       flog(`terminal deferred: stale child status (instance ${staleMarker.p}, at=${raw ? raw.at : "?"} unchanged) — polling`);
+      // v0.35.12: pace the deferred polls — the pre-fix branch returned with
+      // no sleep and tight-looped (run81-2nd: ~33 000 flog lines in 1.85 s).
+      await sleep(1000);
       return;
     }
   }
@@ -1029,7 +1037,7 @@ for (;;) {
   const status = readStatus();
   noteRunning(status);   // v0.35.11: remember the instance we are watching
   const pc = preCheck(status);
-  if (pc.stop) { await stopLoop(pc); continue; }   // stopLoop exits — or re-pointed (handoff), in which case the loop restarts on the new window
+  if (pc.stop) { await stopLoop(pc, status); continue; }   // stopLoop exits — or re-pointed (handoff), in which case the loop restarts on the new window
   // v0.24.3: the grace-bounded finalization wait (deadline passed, child still
   // finishing its turn) was the last silent stretch — announce entry once; the
   // 60s child beats keep the wait visible until it ends.

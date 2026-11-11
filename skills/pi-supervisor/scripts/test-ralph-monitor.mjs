@@ -1670,6 +1670,91 @@ console.log("DECISION: OK");`);
     `watched=${watched} handoff=${handedOff} back=${rePointed} marker=${markerSet} deferred=${deferred} beat0=${beat0} earlyStop=${earlyStop} subReport=${subReport} reEntry3=${reEntryCall} exit=${exited} launchReport=${launchReport}`);
 }
 
+// ---- R54: v0.35.12 (run81-2nd, 7.7) — the marker is checked against the
+// triggering read, and the deferred polls are paced. run81-2nd: the re-entry
+// guard's first write (new pgid, "starting") landed between the preCheck read
+// (the SPAWN terminal → stop) and stopLoop's FRESH file read (the new write →
+// "marker cleared" → the stop proceeded on the stale terminal): the monitor
+// exited 14 s before the re-entry child's true terminal, and the deferred
+// branch (pre-fix: no sleep) tight-looped ~33 000 flog lines in 1.85 s.
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const until = async (fn, ms) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) { if (fn()) return true; await sleep(250); }
+    return fn();
+  };
+  const proj = path.join(root, "r54-proj");
+  const runsRoot = path.join(proj, ".pi-supervisor", "runs");
+  const dLaunch = path.join(runsRoot, "runL");
+  mkdirSync(path.join(dLaunch, ".pi-supervisor"), { recursive: true });
+  const dSub = path.join(root, "r54-subwin");
+  mkdirSync(path.join(dSub, ".pi-supervisor"), { recursive: true });
+  const slot = path.join(proj, ".pi-supervisor", "active.json");
+  const slotTo = (dir, win) => writeFileSync(slot, JSON.stringify({
+    run_dir: dir, node: "auth", guard_pid: process.pid, window: win,
+    started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+  }));
+  const mkSt = (dir, over = {}) => writeFileSync(path.join(dir, "pi-child-status.json"),
+    JSON.stringify({ v: 2, at: new Date().toISOString(), status: "running", guardPid: null, childPid: 4242,
+      attempt: 1, rewinds: 0, toolCalls: 0, lastTool: "bash", elapsedMs: 1000, sessionId: "fake-rm",
+      exitReason: null, childPgid: 99, ...over }, null, 1));
+  // 1. the spawn child is RUNNING in the launch window (the marker's condition).
+  mkSt(dLaunch, { status: "running", toolCalls: 10, childPgid: 111 });
+  writeFileSync(path.join(dLaunch, "child-pgid"), "111\npichild\n");
+  const mon = spawn(NODE, rmArgs(dLaunch, STUB_OK, ["--project-dir", proj]),
+    { stdio: ["ignore", "ignore", "pipe"] });
+  let err = "";
+  mon.stderr.on("data", (x) => { err += x; });
+  const watched = await until(() => /child running · 10 tool call/.test(err), 25000);
+  // 2. the spawn child finishes (its terminal drove the chain); the sub runs.
+  const atSpawnEnd = new Date().toISOString();
+  mkSt(dLaunch, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 10, childPgid: 111, at: atSpawnEnd });
+  mkSt(dSub, { status: "running", toolCalls: 1, childPgid: 77 });
+  writeFileSync(path.join(dSub, "child-pgid"), "77\npichild\n");
+  slotTo(dSub, "run-1");
+  const handedOff = await until(() => /handoff: runL → r54-subwin/.test(err), 25000);
+  // 3. the sub finishes; the chain CONSUMES the slot; the monitor hands back
+  //    (marker set on the re-point onto the spawn terminal).
+  mkSt(dSub, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 7, childPgid: 77 });
+  rmSync(slot);
+  const rePointed = await until(() => /hand-back: r54-subwin → runL/.test(err), 25000);
+  const markerSet = await until(() => /stale-marker set: terminal of last-watched instance p=111|stale terminal on file \(instance 111/.test(err + readLog(dLaunch)), 25000);
+  // 4. the file stays the spawn terminal for 3 s: the deferred polls must be
+  //    paced (1 s) — the pre-fix branch tight-looped (33 k lines in 1.85 s in
+  //    run81-2nd), so a bounded count is the regression proof.
+  await sleep(3000);
+  const deferCount = (readLog(dLaunch).match(/terminal deferred/g) || []).length;
+  // 5. the re-entry guard's first write (new pgid, tc=0) replaces the marked
+  //    terminal on disk. The stop must NOT have fired on the stale terminal
+  //    (the run81-2nd bug), and the per-call lines must keep flowing (7.4).
+  writeFileSync(path.join(dLaunch, "child-pgid"), "222\npichild\n");
+  mkSt(dLaunch, { status: "running", toolCalls: 0, childPgid: 222 });
+  const beat0 = await until(() => /child running · 0 tool call/.test(err), 25000);
+  mkSt(dLaunch, { status: "running", toolCalls: 3, childPgid: 222 });
+  const reEntryCall = await until(() => /· tool call 3: bash/.test(err), 25000);
+  // 6. the re-entry child finishes — a GENUINE terminal of the new instance:
+  //    the marker clears (the file changed) and the run ends at the launch window.
+  const atReEntryEnd = new Date().toISOString();
+  mkSt(dLaunch, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 3, childPgid: 222 });
+  let exited = null;
+  await new Promise((res) => {
+    let done = false;
+    mon.on("exit", (c) => { if (!done) { done = true; exited = c; res(); } });
+    setTimeout(() => { if (!done) { done = true; res(); } }, 30000);
+  });
+  if (exited === null) { try { mon.kill("SIGINT"); } catch { /* already gone */ } }
+  const launchReport = existsSync(path.join(dLaunch, "FINAL-REPORT.md")) || existsSync(path.join(dLaunch, "FINAL-REPORT.monitor.md"));
+  const earlyStop = readLog(dLaunch).split("\n").some((l) => {
+    const m = l.match(/^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\] final-report: written/);
+    return m && m[1] < atReEntryEnd;
+  });
+  const markerCleared = /stale-marker cleared/.test(readLog(dLaunch));
+  const subReport = existsSync(path.join(dSub, "FINAL-REPORT.md"));
+  report("R54 marker checked against the triggering read + paced defer (run81-2nd TOCTOU)",
+    watched && handedOff && rePointed && markerSet && deferCount < 30 && beat0 && reEntryCall && !earlyStop && markerCleared && !subReport && exited === 0 && launchReport,
+    `watched=${watched} handoff=${handedOff} back=${rePointed} marker=${markerSet} deferCount=${deferCount} beat0=${beat0} reEntry3=${reEntryCall} earlyStop=${earlyStop} cleared=${markerCleared} subReport=${subReport} exit=${exited} launchReport=${launchReport}`);
+}
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
