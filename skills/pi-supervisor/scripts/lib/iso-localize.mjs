@@ -22,6 +22,20 @@ export function localizeUtcInText(text, now = new Date()) {
       return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
     }
   );
+  // v0.35.18 (7.8, run95): zoneless ISO — 2026-11-11T20:50:14. The judge
+  // quotes status-file UTC times and drops the Z; the pass above requires a
+  // zone and let the bare form reach the terminal. It is the file's UTC time;
+  // parse as UTC (JS Date treats zoneless ISO as LOCAL — hence the +"Z") and
+  // localize. (A genuinely local time the LLM re-wrote in T-form is the
+  // accepted edge, same class as the bare-HH:MM:SSZ day assumption below.)
+  out = out.replace(
+    /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?!Z|[+-]\d)/g,
+    (m) => {
+      const d = new Date(m + "Z");
+      if (Number.isNaN(d.getTime())) return m;
+      return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`;
+    }
+  );
   // bare time + Z: 10:21:56Z → [local HH:MM:SS] on the current UTC day
   out = out.replace(/\b([01]\d|2[0-3]):[0-5]\d:[0-5]\dZ\b/g, (m) => {
     const [h, mi, s] = m.slice(0, 8).split(":").map(Number);

@@ -262,6 +262,19 @@ grep -qE '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] · child launched' $T/C.log \
 grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}\.[0-9]{3}Z\] cycle=' $T/projC/.pi-supervisor/runs/run1/ralph-monitor.log 2>/dev/null \
   && ok "K: ralph-monitor.log keeps ISO UTC" || bad "K: log file format"
 
+# ---- K2: v0.35.18 (7.8) — the display-localizer covers ZONELESS ISO --------
+# run95: the judge quoted a status-file UTC time with the Z dropped ("started
+# 2026-11-11T20:50:14"); the full-ISO pass requires a zone and let the bare
+# T-form reach the terminal. The zoneless form is the file's UTC time —
+# localize it too. Space-separated local times stay untouched.
+K2IN='started 2026-11-11T20:50:14, deadline 2026-11-11T21:20:10.000Z, beat 20:50:42Z, local 2026-11-12 07:20 kept'
+K2OUT=$(printf '%s' "$K2IN" | node "$T/sandbox/scripts/lib/iso-localize.mjs" 2>/dev/null)
+if printf '%s' "$K2OUT" | grep -qE '[0-9]{4}-[0-9]{2}-[0-9]{2}T'; then
+  bad "K2: ISO T-form reached the display: $K2OUT"
+else
+  ok "K2: zoneless + zoned ISO localized for display (7.8)"
+fi
+
 # ---- S: v0.26.0 sub-runs — the PI_SUP_CHILD gate + the spawn API --------------
 # S1: a CHILD session (PI_SUP_CHILD set in env — launch.mjs always does for
 # children) may never launch: zero-arg mode must refuse BEFORE launch.mjs.
