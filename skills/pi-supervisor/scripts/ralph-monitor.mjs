@@ -898,11 +898,25 @@ async function stopLoop(pc, trigger = null) {
   // BEFORE following the slot, so a hand-back that landed first cannot steal
   // the report (hello-sub/run-1 had no FINAL-REPORT.md: the old order
   // re-pointed first and skipped it).
-  const spawnPending = existsSync(path.join(A.runDir, "spawn-request.json"));
+  // v0.35.15 (run88, 7.7): a REJECTED spawn request is not pending — the
+  // chain has already decided (spawn-decision.json ok:false), no hand-off
+  // slot will ever land, and the run is ending (root halts blocked). Pre-fix
+  // the stale request file sent the run-end down the pause path: the final
+  // report (with the halt context) was skipped and the monitor sat through a
+  // 10 s slot poll before exiting with no box and no FINAL-REPORT.md
+  // (run88: status=halted, no final-report judge, no box).
+  const spawnPending = () => {
+    if (!existsSync(path.join(A.runDir, "spawn-request.json"))) return false;
+    try {
+      const d = JSON.parse(readFileSync(path.join(A.runDir, "spawn-decision.json"), "utf8"));
+      if (d && d.ok === false) return false;   // rejected — no slot can land
+    } catch { /* no decision yet → still pending */ }
+    return true;
+  };
   // run11 fix: code 5 (child-terminal, non-completed) is ALSO the run's end
   // when nothing is pending — 7.7 requires the final report at every end
   // (ping9's error-stop would otherwise have exited silently).
-  if (!spawnPending && (pc.code === 0 || pc.code === 4 || pc.code === 5)) {
+  if (!spawnPending() && (pc.code === 0 || pc.code === 4 || pc.code === 5)) {
     // run4 fix (F2, 7.7): a chain HALT also ends the run — and it is decided
     // by the deterministic chain step (no LLM in the guard), so the final
     // report must carry the halt context from the durable marker (reason,
@@ -929,12 +943,20 @@ async function stopLoop(pc, trigger = null) {
   // Poll it boundedly (~10 s) instead of exiting while the spawn is in
   // flight (run4: the terminal exited 1.7 s before the slot landed and the
   // sub-window ran with no monitor). No slotPath → no slot can ever land.
-  if (spawnPending && slotPath) {
+  if (spawnPending() && slotPath) {
     for (let i = 0; i < 40; i++) {
       if (followSlot()) return;
       await new Promise((r) => setTimeout(r, 250));
     }
-    glog("…", 33, "hand-off slot not observed after 10 s — chain may still be spawning; a later-attaching terminal follows the tree");
+    // v0.35.15 (run88): a REJECT can land while we polled (the chain step
+    // runs in parallel) — re-check before giving up; a fresh reject means
+    // the run truly ends and still owes its final report.
+    if (!spawnPending()) {
+      const hc = readHaltContext();
+      await writeFinalReport(hc ? `${pc.reason} — CHAIN HALT (the run is over): ${hc.reason}` : pc.reason);
+    } else {
+      glog("…", 33, "hand-off slot not observed after 10 s — chain may still be spawning; a later-attaching terminal follows the tree");
+    }
   }
   // the slot can also land while the final report was being written (the
   // guard's chain step runs in parallel) — one last check before we exit.

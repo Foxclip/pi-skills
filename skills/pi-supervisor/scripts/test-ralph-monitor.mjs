@@ -1811,6 +1811,60 @@ console.log("DECISION: OK");`);
     && outJ.includes(localBare) && outJ.includes(localDl)
     && jOut.includes("10:21:56Z") && jOut.includes("2026-11-11T10:40:00.000Z"),
     `rc=${r55.status} tick=${outJ.includes("cycle 1 · OK")} termIso=${isoFullRe.test(outJ) || isoBareRe.test(outJ)} localBare=${outJ.includes(localBare)} localDl=${outJ.includes(localDl)} fileIso=${jOut.includes("10:21:56Z") && jOut.includes("2026-11-11T10:40:00.000Z")} out=${outJ.trim().split("\n").slice(-6).join(" | ").slice(0, 200)}`);
+
+  // R56: v0.35.15 (run88, 7.7) — a REJECTED spawn request is not "pending":
+  // the chain has decided (spawn-decision.json ok:false), no hand-off slot
+  // will ever land, so the run's end still owes its final report (with the
+  // halt context). Pre-fix the stale request file sent stopLoop down the
+  // pause path: run88 exited with no box and no FINAL-REPORT.md.
+  const p56 = path.join(root, "p56"); const rd56 = path.join(p56, "run1");
+  mkdirSync(rd56, { recursive: true });
+  writeFileSync(path.join(p56, "TASK.md"), "# T56");
+  writeFileSync(path.join(rd56, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed-finalized", guardPid: 999999, childPid: 999999, attempt: 1, rewinds: 0, toolCalls: 20, elapsedMs: 1500000, deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
+  writeFileSync(path.join(rd56, "spawn-request.json"), JSON.stringify({ kind: "spawn", node: "sub56", task: "/tmp/sub56-task.md", deadline: null, runtime_min: 20, reason: "test", at: new Date().toISOString() }));
+  writeFileSync(path.join(rd56, "spawn-decision.json"), JSON.stringify({ ok: false, reason: "leaves no work time: only 2min until it, and 10min is reserved for finalization", node: "sub56", at: new Date().toISOString() }));
+  writeFileSync(path.join(rd56, "chain-halt.json"), JSON.stringify({ v: 1, at: new Date().toISOString(), kind: "completed", node: "(root)", reason: "spawn request rejected (leaves no work time) — all windows completed — manual attention", window: "run1" }));
+  const stub56 = mkStub("pi-r56-report.mjs", `
+console.log("## Final report (R56)");
+console.log("run ended halted on a rejected spawn request.");`);
+  const logf56 = path.join(root, "r56.log");
+  const child56 = spawn("bash", [SBX_RALPH, rd56], { cwd: p56, stdio: ["ignore", "ignore", openSync(logf56, "w")],
+    env: { ...process.env, PI: stub56, NO_COLOR: "1" } });
+  const rc56 = await waitExit(child56, 25000);
+  const out56 = readFileSync(logf56, "utf8");
+  const rep56 = [path.join(rd56, "FINAL-REPORT.md"), path.join(rd56, "FINAL-REPORT.monitor.md")]
+    .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
+  // the monitor's flog IS ralph-monitor.log (see flog() → logPath); there is
+  // no separate .flog file
+  const flog56 = existsSync(path.join(rd56, "ralph-monitor.log")) ? readFileSync(path.join(rd56, "ralph-monitor.log"), "utf8") : "";
+  report("R56 rejected spawn request → run-end final report + halt context (no 10 s slot wait)",
+    rc56 === 0 && rep56.includes("Final report (R56)")
+    && out56.includes("┌ final report")
+    && flog56.includes("CHAIN HALT")
+    && !out56.includes("hand-off slot not observed"),
+    `rc=${rc56} report=${rep56.includes("Final report (R56)")} boxed=${out56.includes("┌ final report")} haltCtx=${flog56.includes("CHAIN HALT")} polled=${out56.includes("hand-off slot not observed")} tail=${out56.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
+
+  // R56b (regression, run4 F4): a request the chain has NOT decided (no
+  // spawn-decision.json) is still pending — pause path: no report, bounded
+  // 10 s slot poll, the "not observed" line, exit 0.
+  const p56b = path.join(root, "p56b"); const rd56b = path.join(p56b, "run1");
+  mkdirSync(rd56b, { recursive: true });
+  writeFileSync(path.join(p56b, "TASK.md"), "# T56b");
+  writeFileSync(path.join(rd56b, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed", guardPid: 999999, childPid: 999999, attempt: 1, rewinds: 0, toolCalls: 5, elapsedMs: 1234, deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
+  writeFileSync(path.join(rd56b, "spawn-request.json"), JSON.stringify({ kind: "spawn", node: "sub56b", task: "/tmp/sub56b-task.md", deadline: null, runtime_min: 10, reason: "test", at: new Date().toISOString() }));
+  const stub56b = mkStub("pi-r56b-report.mjs", `
+console.log("SHOULD-NOT-BE-WRITTEN");`);
+  const logf56b = path.join(root, "r56b.log");
+  const child56b = spawn("bash", [SBX_RALPH, rd56b], { cwd: p56b, stdio: ["ignore", "ignore", openSync(logf56b, "w")],
+    env: { ...process.env, PI: stub56b, NO_COLOR: "1" } });
+  const rc56b = await waitExit(child56b, 25000);
+  const out56b = readFileSync(logf56b, "utf8");
+  const rep56b = [path.join(rd56b, "FINAL-REPORT.md"), path.join(rd56b, "FINAL-REPORT.monitor.md")]
+    .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
+  report("R56b undecided request stays pending: pause path, bounded poll, no report",
+    rc56b === 0 && !rep56b.trim() && out56b.includes("hand-off slot not observed after 10 s")
+    && !out56b.includes("┌ final report"),
+    `rc=${rc56b} noReport=${!rep56b.trim()} polled=${out56b.includes("hand-off slot not observed after 10 s")} boxed=${out56b.includes("┌ final report")} tail=${out56b.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
 }
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
