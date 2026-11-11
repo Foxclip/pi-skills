@@ -349,6 +349,54 @@ const pidAlive = (pid) => {
 // the new guard overwrites the status within seconds, and the deadline/stale
 // caps bound the wait if the re-activation never materializes.
 let slotStartedAtMs = null;   // followSlot: launch time of the window we just moved to
+// v0.35.11 (run79): the stale-instance marker. run79: after the hand-back
+// re-point the launch window still held the SPAWN child's terminal (completed,
+// childPgid = the spawn instance) until the re-entry child's guard overwrote
+// it — the monitor read it, stopped, and wrote the run report 339 s BEFORE the
+// re-entry child's terminal (run-summary snapshotted status=running; the
+// re-entry's per-call lines were lost). The v0.35.5 checks can't see this
+// gap: at re-point the child-pgid file still names the SPAWN instance (the
+// pgid check matches) and handBackToLaunch has no slot time (slotStartedAtMs
+// null). The marker is set on a re-point ONLY when the file on disk is the
+// terminal of the very instance we last watched RUNNING in that window
+// (prevInstance) — a fresh instance's terminal (the re-entry child already
+// done: run35/R47, childPgid ≠ spawn pgid) never matches, and a window we
+// never watched running (R47's sub) has no prevInstance entry. While the
+// marker holds and the file is unchanged, a child-terminal stop is deferred
+// (we poll); the re-entry child's first write (new at/pgid) clears it; if the
+// file never changes the grace expires and the terminal is trusted (a blocked
+// re-activation — the run ends, bounded, instead of polling to the deadline).
+const STALE_MARKER_GRACE_MS = 60_000;
+const prevInstance = new Map();   // runDir → childPgid last seen RUNNING there
+let staleMarker = null;           // { at, tc, p, until, told } for the current window
+const rawStatus = () => { try { return JSON.parse(readFileSync(path.join(A.runDir, "pi-child-status.json"), "utf8")); } catch { return null; } };
+const noteRunning = (s) => { if (s && s.status === "running" && Number.isFinite(Number(s.childPgid))) prevInstance.set(A.runDir, Number(s.childPgid)); };
+const markStaleIfMatch = () => {   // called at the end of every successful re-point
+  staleMarker = null;
+  const s = rawStatus();
+  if (!s || s.status === "running" || s.status === "starting") return;
+  const p = Number(s.childPgid);
+  if (!Number.isFinite(p)) return;
+  if (prevInstance.get(A.runDir) === p) {
+    staleMarker = { at: s.at, tc: s.toolCalls, p, until: Date.now() + STALE_MARKER_GRACE_MS, told: false };
+    glog("…", 33, `stale terminal on file (instance ${p} — the one last watched here) — the re-entry child will overwrite it; waiting (grace ${STALE_MARKER_GRACE_MS / 1000}s)`);
+    flog(`stale-marker set: terminal of last-watched instance p=${p} at=${s.at} tc=${s.toolCalls} — polling until it changes or the grace expires`);
+  }
+};
+const markerHolds = (raw) => {   // true → a child-terminal stop must be deferred (poll)
+  if (!staleMarker) return false;
+  if (!raw || raw.at !== staleMarker.at || Number(raw.toolCalls) !== Number(staleMarker.tc) || Number(raw.childPgid) !== staleMarker.p) {
+    flog(`stale-marker cleared: the window's status changed (a new instance wrote)`);
+    staleMarker = null;
+    return false;
+  }
+  if (Date.now() >= staleMarker.until) {
+    flog(`stale-marker expired (grace ${STALE_MARKER_GRACE_MS / 1000}s, file unchanged — the re-entry child never wrote); trusting the terminal`);
+    staleMarker = null;
+    return false;
+  }
+  return true;
+};
 const currentChildPgid = () => {
   try { return Number(readFileSync(path.join(A.runDir, "child-pgid"), "utf8").trim().split("\n")[0]); }
   catch { return NaN; }   // no file yet (pre-first-launch) — not a staleness signal
@@ -778,6 +826,18 @@ function readHaltContext() {
   return { reason: halt.reason || "no reason recorded" };
 }
 async function stopLoop(pc) {
+  // v0.35.11 (run79): the stale-instance marker (see markStaleIfMatch).
+  // Deferred only while the on-disk file is still the last-watched instance's
+  // UNCHANGED terminal; a changed file (the re-entry child wrote) or an
+  // expired grace (it never came) falls through to the normal stop.
+  if (/child-terminal/.test(pc.reason)) {
+    const raw = rawStatus();
+    if (markerHolds(raw)) {
+      if (!staleMarker.told) { staleMarker.told = true; glog("…", 2, `terminal deferred: stale instance-${staleMarker.p} terminal unchanged on file — waiting for the re-entry child to write`); }
+      flog(`terminal deferred: stale child status (instance ${staleMarker.p}, at=${raw ? raw.at : "?"} unchanged) — polling`);
+      return;
+    }
+  }
   // v0.31.0 conform (6.2/6.3): the handoff slot is written by the EXITING
   // window's own guard in its final seconds (the chain step runs after the
   // status is durable), so it can land after the loop's own followSlot ran.
@@ -927,6 +987,7 @@ function followSlot() {
   } catch { /* the tree is decoration — the re-point is the substance */ }
   flog(`handoff: ${from} → ${to} (node ${p.node || "?"} · ${p.window || "?"})`);
   resetSeen();   // v0.35.7 (run61, 7.4): new window = new child
+  markStaleIfMatch();   // v0.35.11: stale-instance marker for the re-pointed window
   return true;
 }
 // v0.35.4 (run35, 7.7): the hand-back re-point for the SLOT-LESS case. stopLoop
@@ -958,6 +1019,7 @@ function handBackToLaunch() {
   } catch { /* the tree is decoration — the re-point is the substance */ }
   flog(`hand-back: ${from} → ${to} (slot consumed — re-point to the launch window)`);
   resetSeen();   // v0.35.7 (run61, 7.4): new window = new child instance
+  markStaleIfMatch();   // v0.35.11: the launch window's spawn terminal may be stale
   return true;
 }
 
@@ -965,6 +1027,7 @@ function handBackToLaunch() {
 for (;;) {
   followSlot();   // v0.26.0: re-point if the chain handed off to another window
   const status = readStatus();
+  noteRunning(status);   // v0.35.11: remember the instance we are watching
   const pc = preCheck(status);
   if (pc.stop) { await stopLoop(pc); continue; }   // stopLoop exits — or re-pointed (handoff), in which case the loop restarts on the new window
   // v0.24.3: the grace-bounded finalization wait (deadline passed, child still

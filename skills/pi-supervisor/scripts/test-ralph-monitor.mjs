@@ -1578,6 +1578,98 @@ console.log("DECISION: OK");`);
     `handoff=${handedOff} back=${rePointed} back<report=${backBeforeReport} noSubReport=${noSubReport} reEntry4=${reEntryCall} exit=${exited} launchReport=${launchReport}`);
 }
 
+// ---- R53: v0.35.11 (run79, 7.4/6.2/7.7) — hand-back onto a STALE SPAWN terminal.
+// The production sequence (run79): the monitor watches the spawn child RUNNING
+// in the launch window; the spawn child finishes (its terminal drove the
+// chain); the sub completes; the chain CONSUMES the slot; the monitor hands
+// back to the launch window, whose file STILL holds the spawn child's terminal
+// until the re-entry child's guard overwrites it. Pre-v0.35.11 the monitor
+// stopped on that stale terminal: run79 wrote the run report 339 s before the
+// re-entry child's terminal (run-summary snapshotted status=running; the
+// re-entry's per-call lines were lost). The v0.35.5 pgid check cannot catch
+// it: at re-point the child-pgid file still names the SPAWN instance. Now: a
+// re-point onto the terminal of the very instance we last watched RUNNING sets
+// the stale marker — the stop is deferred (poll) until the file changes (the
+// re-entry child wrote) or the 60 s grace expires.
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const until = async (fn, ms) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) { if (fn()) return true; await sleep(250); }
+    return fn();
+  };
+  const proj = path.join(root, "r53-proj");
+  const runsRoot = path.join(proj, ".pi-supervisor", "runs");
+  const dLaunch = path.join(runsRoot, "runL");
+  mkdirSync(path.join(dLaunch, ".pi-supervisor"), { recursive: true });
+  const dSub = path.join(root, "r53-subwin");      // sub-project window, outside runsRoot
+  mkdirSync(path.join(dSub, ".pi-supervisor"), { recursive: true });
+  const slot = path.join(proj, ".pi-supervisor", "active.json");
+  const slotTo = (dir, win) => writeFileSync(slot, JSON.stringify({
+    run_dir: dir, node: "auth", guard_pid: process.pid, window: win,
+    started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+  }));
+  const mkSt = (dir, over = {}) => writeFileSync(path.join(dir, "pi-child-status.json"),
+    JSON.stringify({ v: 2, at: new Date().toISOString(), status: "running", guardPid: null, childPid: 4242,
+      attempt: 1, rewinds: 0, toolCalls: 0, lastTool: "bash", elapsedMs: 1000, sessionId: "fake-rm",
+      exitReason: null, childPgid: 99, ...over }, null, 1));
+  // 1. the spawn child is RUNNING in the launch window — the monitor must watch
+  //    it: that is what records prevInstance, the marker's condition.
+  mkSt(dLaunch, { status: "running", toolCalls: 10, childPgid: 111 });
+  writeFileSync(path.join(dLaunch, "child-pgid"), "111\npichild\n");
+  const mon = spawn(NODE, rmArgs(dLaunch, STUB_SLOW, ["--project-dir", proj]),
+    { stdio: ["ignore", "ignore", "pipe"] });
+  let err = "";
+  mon.stderr.on("data", (x) => { err += x; });
+  const watched = await until(() => /child running · 10 tool call/.test(err), 25000);
+  // 2. the spawn child finishes (its terminal drove the chain); the sub runs.
+  const atSpawnEnd = new Date().toISOString();
+  mkSt(dLaunch, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 10, childPgid: 111, at: atSpawnEnd });
+  mkSt(dSub, { status: "running", toolCalls: 1, childPgid: 77 });
+  writeFileSync(path.join(dSub, "child-pgid"), "77\npichild\n");
+  slotTo(dSub, "run-1");
+  const handedOff = await until(() => /handoff: runL → r53-subwin/.test(err), 25000);
+  // 3. the sub finishes; the chain CONSUMES the slot (its terminal step) — the
+  //    monitor must hand back via the slot-less path (no slotStartedAtMs).
+  mkSt(dSub, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 7, childPgid: 77 });
+  rmSync(slot);
+  const rePointed = await until(() => /hand-back: r53-subwin → runL/.test(err), 25000);
+  // 4. THE stale read: dLaunch's file still holds the spawn terminal. The
+  //    marker (last-watched instance 111) must defer the stop.
+  const markerSet = await until(() => /stale-marker set: terminal of last-watched instance p=111|stale terminal on file \(instance 111/.test(err + readLog(dLaunch)), 25000);
+  const deferred = await until(() => /terminal deferred/.test(err + readLog(dLaunch)), 25000);
+  // 5. the re-entry child starts (guard rewrites child-pgid + status) — its
+  //    first fresh write is what clears the marker on the next stop.
+  writeFileSync(path.join(dLaunch, "child-pgid"), "222\npichild\n");
+  mkSt(dLaunch, { status: "running", toolCalls: 0, childPgid: 222 });
+  const beat0 = await until(() => /child running · 0 tool call/.test(err), 25000);
+  // ...works (per-call lines must still flow after the re-point, 7.4)
+  mkSt(dLaunch, { status: "running", toolCalls: 3, childPgid: 222 });
+  const reEntryCall = await until(() => /· tool call 3: bash/.test(err), 25000);
+  // ...and finishes → the RUN's report lands at the launch window, exit 0.
+  const atReEntryEnd = new Date().toISOString();
+  mkSt(dLaunch, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 3, childPgid: 222 });
+  let exited = null;
+  await new Promise((res) => {
+    let done = false;
+    mon.on("exit", (c) => { if (!done) { done = true; exited = c; res(); } });
+    setTimeout(() => { if (!done) { done = true; res(); } }, 30000);
+  });
+  if (exited === null) { try { mon.kill("SIGINT"); } catch { /* already gone */ } }
+  const launchReport = existsSync(path.join(dLaunch, "FINAL-REPORT.md")) || existsSync(path.join(dLaunch, "FINAL-REPORT.monitor.md"));
+  // the stale terminal must not have ended the run: no report written before
+  // the re-entry child's terminal. (Deferred cycles still log pre-check STOP
+  // lines — the report line is the stop's own proof.)
+  const earlyStop = readLog(dLaunch).split("\n").some((l) => {
+    const m = l.match(/^\[(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z)\] final-report: written/);
+    return m && m[1] < atReEntryEnd;
+  });
+  const subReport = existsSync(path.join(dSub, "FINAL-REPORT.md"));
+  report("R53 hand-back onto a stale spawn terminal → marker defers, live re-entry calls, stop at the re-entry terminal",
+    watched && handedOff && rePointed && markerSet && deferred && beat0 && !earlyStop && !subReport && reEntryCall && exited === 0 && launchReport,
+    `watched=${watched} handoff=${handedOff} back=${rePointed} marker=${markerSet} deferred=${deferred} beat0=${beat0} earlyStop=${earlyStop} subReport=${subReport} reEntry3=${reEntryCall} exit=${exited} launchReport=${launchReport}`);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
