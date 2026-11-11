@@ -823,6 +823,19 @@ async function stopLoop(pc) {
     // report must carry the halt context from the durable marker (reason,
     // sub-run report location), not just the pre-check reason.
     const hc = readHaltContext();
+    // v0.35.10 (run73, 7.4/6.2): a FOLLOWED sub window's plain child-terminal
+    // is not the run's end — the chain is handing back to the launch window
+    // (the re-entry child runs there) or halting. Pre-v0.35.10 this blocked the
+    // loop here on the sub window's report (a parent summarize, ~3 min): the
+    // hand-back line landed late and the re-entry child's per-call lines were
+    // swallowed (run73: 3 calls, no lines). Re-point instead: the loop keeps
+    // the re-entry monitored live and the RUN's report is written at the launch
+    // window's terminal (followedSub is false there). On clean runs this
+    // stopLoop is never reached — the main loop's followSlot consumes the
+    // hand-back first — so only the race changes behavior.
+    const followedSub = !!slotPath && path.resolve(A.runDir) !== path.resolve(A.origRunDir);
+    if (!hc && followedSub && !pc.reason.startsWith("deadline")
+        && (followSlot() || handBackToLaunch())) return;
     await writeFinalReport(hc ? `${pc.reason} — CHAIN HALT (the run is over): ${hc.reason}` : pc.reason);
   }
   // run4 fix (F4, 6.2/7.6): on the pause path (child-terminal + pending

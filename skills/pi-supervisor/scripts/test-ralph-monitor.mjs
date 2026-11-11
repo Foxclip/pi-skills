@@ -1269,8 +1269,11 @@ console.log("DECISION: OK");`);
 // time (run35: the report took 167 s; the run ended 9 s after the re-entry
 // child quit). The slot-less exit then left the RUN's final report unwritten
 // (run35 had no FINAL-REPORT.md — only the sub window's). The stop path must
-// re-point to the launch window and let the loop end the run there, so both
-// reports land: the sub window's own (5.1) and the run's (7.7).
+// re-point to the launch window and let the loop end the run there, so the
+// RUN's report (7.7) lands. v0.35.10: the sub window no longer gets its own
+// report from the root monitor — the immediate re-point replaces the blocking
+// sub-report that run73 showed delayed the hand-back and swallowed the
+// re-entry's per-call lines (clean runs never had a sub report either).
 {
   const proj = path.join(root, "r47-proj");
   const runsRoot = path.join(proj, ".pi-supervisor", "runs");
@@ -1284,7 +1287,10 @@ console.log("DECISION: OK");`);
   mkStatus(dSub, { status: "completed", exitReason: "completed-finalized", guardPid: null, toolCalls: 7 });
   mkStatus(dLaunch, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 4 });
   // the slot still points at the sub window at launch (the follow must happen);
-  // the stub deletes it during the report call (the chain's terminal clear).
+  // the chain's terminal step clears it (run35: "slot consumed") — the writer
+  // emulates that clear at +300 ms. (v0.35.10: the old report-time clear is
+  // unreachable — the sub window no longer gets a report, so the monitor must
+  // settle on the launch window with the slot gone or re-pointing.)
   mkdirSync(path.join(proj, ".pi-supervisor"), { recursive: true });
   const slot = path.join(proj, ".pi-supervisor", "active.json");
   // started_at = the sub window's LAUNCH time (before its child went terminal)
@@ -1295,26 +1301,29 @@ console.log("DECISION: OK");`);
     started_at: new Date(Date.now() - 60_000).toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
   }));
   const stub = mkStub("pi-r47.mjs", `
-import { rmSync, appendFileSync } from "node:fs";
-const p = process.argv[process.argv.length - 1];
-const isReport = p.includes("final report writer");
-if (isReport) rmSync(${JSON.stringify(slot)}, { force: true });   // the chain's terminal clear
-appendFileSync(process.env.RM_INV_LOG || "/dev/null", (isReport ? "REPORT" : "JUDGE") + "\\n");
+import { appendFileSync } from "node:fs";
+appendFileSync(process.env.RM_INV_LOG || "/dev/null", (process.argv[process.argv.length - 1].includes("final report writer") ? "REPORT" : "JUDGE") + "\\n");
 console.log("r47 report body");
 console.log("DECISION: OK");`);
+  const writer = mkStub("writer-r47.mjs", `
+import { rmSync } from "node:fs";
+await new Promise((r) => setTimeout(r, 300));
+rmSync(${JSON.stringify(slot)}, { force: true });   // the chain's terminal clear
+`);
+  const wproc = spawn(NODE, [writer], { stdio: "ignore" });
   process.env.RM_INV_LOG = path.join(root, "inv-r47.log");
   const r = runRm(dLaunch, stub, ["--project-dir", proj, "--once"]);
+  wproc.kill("SIGINT");
   process.env.RM_INV_LOG = "";
-  const repSub = path.join(dSub, "FINAL-REPORT.md");
   const repRun = path.join(dLaunch, "FINAL-REPORT.md");
   const logLaunch = readLog(dLaunch);
   report("R47 hand-back slot consumed during the report → re-point to the launch window, run report written there",
     r.status === 0
-    && existsSync(repSub)                                   // the sub window's own report (5.1)
+    && !existsSync(path.join(dSub, "FINAL-REPORT.md"))   // v0.35.10: no sub window report — the re-point replaces it
     && existsSync(repRun)                                  // 7.7 — the run's report (run35 was missing it)
     && /hand-back: r47-subwin → run28/.test(logLaunch)     // the re-point is visible in the launch window's log
-    && (invLog("r47").match(/REPORT/g) || []).length === 2, // both reports, no judgment
-    `exit=${r.status} repSub=${existsSync(repSub)} repRun=${existsSync(repRun)} inv=${JSON.stringify(invLog("r47"))} logLaunch=${logLaunch.trim().split("\n").slice(0, 1).join(" | ").slice(0, 120)}`);
+    && (invLog("r47").match(/REPORT/g) || []).length === 1, // the run report only, no judgment
+    `exit=${r.status} repSub=${existsSync(path.join(dSub, "FINAL-REPORT.md"))} repRun=${existsSync(repRun)} inv=${JSON.stringify(invLog("r47"))} logLaunch=${logLaunch.trim().split("\n").slice(0, 1).join(" | ").slice(0, 120)}`);
 }
 
 // ---- R48: v0.35.5 (run40, 7.7/6.3) — the re-entry child's status has not
@@ -1353,6 +1362,14 @@ const st = (over) => writeFileSync(${JSON.stringify(path.join(dLaunch, "pi-child
   childPid: ${String(process.pid + 1)}, attempt: 1, rewinds: 0, toolCalls: 0, lastTool: "bash",
   elapsedMs: 1000, sessionId: "fake-r48", childPgid: 222, deadlineIso: new Date(Date.now() + 3600e3).toISOString(), ...over,
 }, null, 2));
+await sleep(0.5);
+// the chain's hand-back write: the slot re-points to the (re-activated) launch
+// window — without it the monitor would re-point between sub and launch every
+// cycle (the slot would still name the dead sub window).
+writeFileSync(${JSON.stringify(path.join(proj, ".pi-supervisor", "active.json"))}, JSON.stringify({
+  run_dir: ${JSON.stringify(dLaunch)}, node: "auth", guard_pid: ${String(process.pid)}, window: "run29",
+  started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+}));
 await sleep(2);
 st({});
 await sleep(3);
@@ -1387,7 +1404,7 @@ console.log("DECISION: OK");`);
   const logLaunch = readLog(dLaunch);
   report("R48 stale terminal on re-entry → poll through, stop on the NEW child's terminal",
     r.status === 0
-    && existsSync(repSub)                                  // the sub report still lands
+    && !existsSync(repSub)                                 // v0.35.10: no sub window report — the re-point replaces it
     && existsSync(repRun)                                  // the run report lands…
     && /child completed · 3 tool calls/.test(logLaunch)   // …on the NEW child (3), not the stale one (10)
     && !/child completed · 10 tool calls/.test(logLaunch) // the stale terminal never stopped the loop
@@ -1493,6 +1510,72 @@ console.log("DECISION: OK");`);
   report("R51 per-call lines from the progress log (burst 4+5 in one status jump, ERR marker, no replay)",
     b4 === 1 && b5 === 1 && b6 === 1 && b5dup === 0 && replay === 0,
     `4=${b4} 5ERR=${b5} 5dup=${b5dup} 6=${b6} replay=${replay} ${lines.filter((l) => /· tool call [1-6]:/.test(l)).map((l) => l.trim().slice(0, 60)).join(" | ").slice(0, 260)}`);
+}
+
+// ---- R52: v0.35.10 (run73, 7.4/6.2) — a FOLLOWED sub window's plain
+// child-terminal is NOT the run's end: the chain is handing back to the launch
+// window (the re-entry child runs there) or halts. Pre-v0.35.10 stopLoop
+// blocked the loop on the sub window's final report (a parent summarize) before
+// re-pointing — run73: the hand-back line landed ~3 min late and the re-entry
+// child's per-call lines were swallowed (3 calls, no lines). Now: re-point
+// IMMEDIATELY (the report is written at the launch window's terminal, as on
+// clean runs where the sub window never gets a report file), and the re-entry
+// child's per-call lines keep flowing (7.4). STUB_SLOW (4 s) makes the report
+// path slow enough that the ORDER assertion (re-point before any report line)
+// discriminates the old from the new behavior.
+{
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const until = async (fn, ms) => {
+    const t0 = Date.now();
+    while (Date.now() - t0 < ms) { if (fn()) return true; await sleep(250); }
+    return fn();
+  };
+  const proj = path.join(root, "r52-proj");
+  const runsRoot = path.join(proj, ".pi-supervisor", "runs");
+  const dLaunch = path.join(runsRoot, "runL");
+  mkdirSync(dLaunch, { recursive: true });
+  const dSub = path.join(root, "r52-subwin");      // sub-project window, outside runsRoot
+  mkdirSync(path.join(dSub, ".pi-supervisor"), { recursive: true });
+  const slot = path.join(proj, ".pi-supervisor", "active.json");
+  const slotTo = (dir, win) => writeFileSync(slot, JSON.stringify({
+    run_dir: dir, node: "auth", guard_pid: process.pid, window: win,
+    started_at: new Date().toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString(),
+  }));
+  mkStatus(dLaunch, { status: "running" });        // the spawn turn (running)
+  slotTo(dSub, "run-1");                            // the chain already handed off
+  mkStatus(dSub, { status: "running" });
+  const mon = spawn(NODE, rmArgs(dLaunch, STUB_SLOW, ["--project-dir", proj]),
+    { stdio: ["ignore", "ignore", "pipe"] });
+  let err = "";
+  mon.stderr.on("data", (x) => { err += x; });
+  const handedOff = await until(() => /handoff: runL → r52-subwin/.test(err), 25000);
+  // the sub window's child goes terminal; the slot STILL points at the sub
+  // window (the chain's hand-back write hasn't landed — the run73 race)
+  mkStatus(dSub, { status: "completed", exitReason: "completed", guardPid: null });
+  const rePointed = await until(() => /hand-back: r52-subwin → runL/.test(err), 25000);
+  slotTo(dLaunch, "runL");                         // chain hand-back catch-up (prevents re-point oscillation)
+  const lines = err.split("\n");
+  const iBack = lines.findIndex((l) => /hand-back: r52-subwin → runL/.test(l));
+  const iReport = lines.findIndex((l) => /final-report/.test(l));
+  const backBeforeReport = iBack >= 0 && (iReport < 0 || iBack < iReport);
+  const noSubReport = !existsSync(path.join(dSub, "FINAL-REPORT.md")) && !existsSync(path.join(dSub, "FINAL-REPORT.monitor.md"));
+  // the re-entry child (new instance, launch window) makes its first call →
+  // the per-call line must still flow after the re-point (7.4)
+  mkStatus(dLaunch, { status: "running", toolCalls: 4 });
+  const reEntryCall = await until(() => /· tool call 4: bash/.test(err), 25000);
+  // the re-entry finishes → the RUN's report lands at the launch window
+  mkStatus(dLaunch, { status: "completed", exitReason: "completed", guardPid: null });
+  let exited = null;
+  await new Promise((res) => {
+    let done = false;
+    mon.on("exit", (c) => { if (!done) { done = true; exited = c; res(); } });
+    setTimeout(() => { if (!done) { done = true; res(); } }, 30000);
+  });
+  if (exited === null) { try { mon.kill("SIGINT"); } catch { /* already gone */ } }
+  const launchReport = existsSync(path.join(dLaunch, "FINAL-REPORT.md")) || existsSync(path.join(dLaunch, "FINAL-REPORT.monitor.md"));
+  report("R52 followed-sub terminal → immediate hand-back, no sub report, live re-entry calls, run report at launch window",
+    handedOff && rePointed && backBeforeReport && noSubReport && reEntryCall && exited === 0 && launchReport,
+    `handoff=${handedOff} back=${rePointed} back<report=${backBeforeReport} noSubReport=${noSubReport} reEntry4=${reEntryCall} exit=${exited} launchReport=${launchReport}`);
 }
 
 if (KEEP) console.log(`(kept artifacts in ${root})`);
