@@ -19,6 +19,15 @@ function check(name, cond, extra = "") {
 const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-sup-tree-"));
 const NOW = new Date("2026-11-04T08:00:00Z");
 const DL = "2026-11-05T06:00:00Z";
+// v0.35.7 (spec 7.8): the banner renders deadlines in LOCAL time (shortIso in
+// node.mjs) — derive the expected string from the host TZ, don't hardcode the
+// UTC rendering (the old "11-05 06:00" only matched on a UTC host).
+const loc = (iso) => {
+  const d = new Date(iso);
+  const p = (x) => String(x).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+};
+const DL_SHORT = loc(DL);
 
 // Empty project: just the root, state unknown (no node.json yet is not an
 // error — the banner must never throw).
@@ -53,11 +62,11 @@ check("fixture: box shape (equal width, corners)", (() => {
 check("fixture: title has project basename", t.split("\n")[0].includes(path.basename(projectDir)), t.split("\n")[0]);
 check("fixture: root line ACTIVE + deadline", (() => {
   const l = t.split("\n").find((l) => l.includes("(root)") && !l.startsWith("╭"));
-  return l && /ACTIVE/.test(l) && /deadline 11-05 06:00/.test(l);
+  return l && /ACTIVE/.test(l) && new RegExp(`deadline ${DL_SHORT}`).test(l);
 })());
 check("fixture: auth line is live (run-1 + 2h age)", (() => {
   const l = t.split("\n").find((l) => l.includes("auth"));
-  return l && /ACTIVE/.test(l) && /run-1, 2h 0m in/.test(l) && /deadline 11-05 06:00/.test(l);
+  return l && /ACTIVE/.test(l) && /run-1, 2h 0m in/.test(l) && new RegExp(`deadline ${DL_SHORT}`).test(l);
 })(), (t.split("\n").find((l) => l.includes("auth")) || ""));
 check("fixture: docs line PAUSED waiting root", (() => {
   const l = t.split("\n").find((l) => l.includes("docs"));

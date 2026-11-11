@@ -290,16 +290,22 @@ const childLiveLine = (s, { idleMs = null, bright = false, withLeft = true } = {
 // available (attach: real idle, not 0) — and v0.25.7: PRINTS the launch
 // baseline line (gray, count + last + left) right after "child launched".
 const QUIET_SEC = Math.max(1, Number(process.env.RM_QUIET_SEC) || 60);
-let seen = { tc: null, lastToolAt: 0, lastQuiet: 0, progKey: null, progCount: 0 };
+let seen = { tc: null, lastToolAt: 0, lastQuiet: 0, progKey: null, progCount: 0, landed: true };
 // v0.35.7 (run61, 7.4): re-anchor the child-line state to a NEW window's child
 // (followSlot / handBackToLaunch). The old window's count would otherwise
 // cross-contaminate the first poll: run61 attached to the sub window and
 // printed a spurious bright "tool call 0" line 39 s before its first real
 // call (0 ≠ the parent window's count of 5). v0.35.9: progKey/progCount are
 // the per-call tracker (the guard's progress log, see emitToolChange).
+// v0.35.13: landed=false marks a RE-LAND (a re-point onto a window the
+// monitor was not on last poll) so beatMaybe's prime can emit the re-entry
+// child's latest call instead of swallowing it (R52 flake: the re-entry
+// child's "tool call 4" line only fired when the monitor happened to read
+// tc=0 before the count jumped — timing-dependent).
 const resetSeen = () => {
   seen.tc = null; seen.lastToolAt = 0; seen.lastQuiet = 0;
   seen.progKey = null; seen.progCount = 0;
+  seen.landed = false;
 };
 const beatMaybe = (s) => {
   const tc = Number(s.toolCalls);
@@ -313,6 +319,14 @@ const beatMaybe = (s) => {
     childLiveLine(s);                       // launch baseline (gray)
     const p0 = progressCalls();             // v0.35.9: prime the per-call tracker (attach: no replay of history)
     if (p0) { seen.progKey = p0.key; seen.progCount = p0.count; }
+    // v0.35.13 (R52 flake, 7.4): a RE-LAND onto a window whose child has
+    // already made calls used to prime silently — the latest call's bright
+    // line was lost unless the count grew again (the re-entry child's first
+    // visible calls were swallowed). On a re-land with tc > 0, emit the
+    // latest-call line. tc === 0 stays silent (the run61 spurious
+    // "tool call 0" line). Initial attach (landed=true) is unchanged.
+    if (!seen.landed && tc > 0) emitToolChange(s);
+    seen.landed = true;
     return;
   }
   if (tc !== seen.tc) {                     // a tool call happened → bright
@@ -1037,7 +1051,18 @@ for (;;) {
   const status = readStatus();
   noteRunning(status);   // v0.35.11: remember the instance we are watching
   const pc = preCheck(status);
-  if (pc.stop) { await stopLoop(pc, status); continue; }   // stopLoop exits — or re-pointed (handoff), in which case the loop restarts on the new window
+  if (pc.stop) {
+    await stopLoop(pc, status);
+    // v0.35.13 (run81-2nd / R52 flake): reaching here means stopLoop returned
+    // WITHOUT stopping — it deferred (stale marker), re-pointed (handoff /
+    // hand-back) or had the STOP refused (slot in flux). The window is being
+    // re-activated by the chain; pace the re-check at 1 s. Unpaced, the cycle
+    // tight-looped: R52's handoff ⇄ hand-back pair re-fired every iteration
+    // (886 flog lines in 1 s while the chain's hand-back slot was in flight),
+    // resetting the per-call anchors faster than they could emit.
+    await sleep(1000);
+    continue;
+   }   // stopLoop exits the process on a real stop; only defer/re-point returns here
   // v0.24.3: the grace-bounded finalization wait (deadline passed, child still
   // finishing its turn) was the last silent stretch — announce entry once; the
   // 60s child beats keep the wait visible until it ends.
