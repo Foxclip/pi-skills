@@ -823,6 +823,26 @@ let finalWaitAnnounced = false;   // v0.24.3: announce the finalization wait onc
 // also runs on deadline/stuck endings — that is exactly when the user needs
 // the "what happened" answer, and the child is terminal here, so the model
 // slot is free for the report (a failed report never changes the exit code).
+// v0.35.16 (run89): the run_dir of this window's CONSUMED spawn, or null —
+// the spawn decision is ok, the spawned window is terminal, and its own
+// chain step has run (chain-done.json). Before v0.35.16 the launch window
+// stayed "spawn pending" FOREVER once its sub window died: the decision file
+// persists, spawnPending() stayed true, and every stop cycle re-entered the
+// 10 s slot poll, re-followed the dead sub window and re-wrote reports —
+// run89's subrun67/run-1 (child died 1 s after launch) ping-ponged for
+// 68+ minutes on a window with no chain-done.json (its guard's error path
+// skipped the chain step; fixed in guard.mjs v0.35.16).
+function consumedSpawnRunDir() {
+  try {
+    const d = JSON.parse(readFileSync(path.join(A.runDir, "spawn-decision.json"), "utf8"));
+    if (!d || d.ok !== true || !d.run_dir) return null;
+    const rd = path.resolve(d.run_dir);
+    if (!existsSync(path.join(rd, "chain-done.json"))) return null;
+    const st = JSON.parse(readFileSync(path.join(rd, "pi-child-status.json"), "utf8"));
+    if (!st || ["starting", "running", "consult"].includes(st.status)) return null;
+    return rd;
+  } catch { return null; }
+}
 // run4 fix (F2): the halt context for the final report — the durable
 // chain-halt.json marker first (greppable, written by the chain step), the
 // chain-done.json outcome as fallback. Null when the run did not end on a
@@ -838,6 +858,27 @@ function readHaltContext() {
       const d = JSON.parse(readFileSync(path.join(A.runDir, "chain-done.json"), "utf8"));
       if (d && d.outcome && d.outcome.next === "halted") halt = d.outcome;
     } catch { /* no marker */ }
+  }
+  // v0.35.16 (run89): the RUN's report is written at the launch window — but
+  // a halted SUB window's halt marker lives in the sub window's dir (the
+  // chain step writes it next to its own chain-done.json). The launch window
+  // carries no marker of its own; without this, the run's report would lack
+  // the halt reason (the sub window's report has it, but the RUN's report is
+  // what the human reads at the run's end).
+  if (!halt) {
+    const rd = consumedSpawnRunDir();
+    if (rd) {
+      try {
+        const h = JSON.parse(readFileSync(path.join(rd, "chain-halt.json"), "utf8"));
+        if (h && (h.reason || h.outcome)) halt = h;
+      } catch { /* no marker */ }
+      if (!halt) {
+        try {
+          const d = JSON.parse(readFileSync(path.join(rd, "chain-done.json"), "utf8"));
+          if (d && d.outcome && d.outcome.next === "halted") halt = d.outcome;
+        } catch { /* no marker */ }
+      }
+    }
   }
   if (!halt) return null;
   return { reason: halt.reason || "no reason recorded" };
@@ -907,10 +948,15 @@ async function stopLoop(pc, trigger = null) {
   // (run88: status=halted, no final-report judge, no box).
   const spawnPending = () => {
     if (!existsSync(path.join(A.runDir, "spawn-request.json"))) return false;
-    try {
-      const d = JSON.parse(readFileSync(path.join(A.runDir, "spawn-decision.json"), "utf8"));
-      if (d && d.ok === false) return false;   // rejected — no slot can land
-    } catch { /* no decision yet → still pending */ }
+    let d = null;
+    try { d = JSON.parse(readFileSync(path.join(A.runDir, "spawn-decision.json"), "utf8")); } catch { /* no decision yet → still pending */ }
+    if (d && d.ok === false) return false;   // rejected — no slot can land
+    // v0.35.16 (run89): an ACCEPTED spawn is CONSUMED once the spawned window
+    // is terminal and its chain step has run — the spawn lifecycle is over
+    // (whatever its outcome), and the launch window's stop path must be able
+    // to end the run (final report + halt context) instead of re-entering
+    // the 10 s slot poll on a window that will never hand back again.
+    if (consumedSpawnRunDir()) return false;
     return true;
   };
   // run11 fix: code 5 (child-terminal, non-completed) is ALSO the run's end

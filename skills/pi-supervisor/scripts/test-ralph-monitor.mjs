@@ -1865,6 +1865,72 @@ console.log("SHOULD-NOT-BE-WRITTEN");`);
     rc56b === 0 && !rep56b.trim() && out56b.includes("hand-off slot not observed after 10 s")
     && !out56b.includes("┌ final report"),
     `rc=${rc56b} noReport=${!rep56b.trim()} polled=${out56b.includes("hand-off slot not observed after 10 s")} boxed=${out56b.includes("┌ final report")} tail=${out56b.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
+
+  // R57: v0.35.16 (run89, 7.7) — a CONSUMED spawn (decision ok, the spawned
+  // window terminal, its own chain step done) is NOT pending: the launch
+  // window's stop path ends the run — final report WITH the halt context
+  // taken from the sub window's own markers. Pre-fix the persistent
+  // decision file kept the launch window "pending" forever: run89's monitor
+  // ping-ponged 68+ minutes with no run report (its guard's error path had
+  // skipped the chain step — fixed in guard.mjs v0.35.16).
+  const p57 = path.join(root, "p57"); const rd57 = path.join(p57, "run1");
+  const sub57 = path.join(root, "sub57", "run-1");
+  mkdirSync(rd57, { recursive: true }); mkdirSync(sub57, { recursive: true });
+  writeFileSync(path.join(p57, "TASK.md"), "# T57");
+  writeFileSync(path.join(rd57, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed-finalized", guardPid: 999999, childPid: 999999, attempt: 1, rewinds: 0, toolCalls: 20, elapsedMs: 1500000, deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
+  writeFileSync(path.join(rd57, "spawn-request.json"), JSON.stringify({ kind: "spawn", node: "sub57", task: "/tmp/sub57-task.md", deadline: null, runtime_min: 20, reason: "test", at: new Date().toISOString() }));
+  writeFileSync(path.join(rd57, "spawn-decision.json"), JSON.stringify({ ok: true, node: "sub57", node_path: "sub57", window: "run-1", run_dir: sub57, deadline: null, at: new Date().toISOString() }));
+  writeFileSync(path.join(sub57, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "error", exitReason: "first-prompt child death", toolCalls: 0, attempt: 3 }));
+  writeFileSync(path.join(sub57, "chain-done.json"), JSON.stringify({ v: 1, at: new Date().toISOString(), kind: "blocked", outcome: { next: "halted", reason: "window ended error — human attention needed" } }));
+  writeFileSync(path.join(sub57, "chain-halt.json"), JSON.stringify({ v: 1, at: new Date().toISOString(), kind: "blocked", node: "sub57", reason: "window ended error — human attention needed", window: "run-1" }));
+  const stub57 = mkStub("pi-r57-report.mjs", `
+console.log("## Final report (R57)");
+console.log("run ended halted on a dead sub window.");`);
+  const logf57 = path.join(root, "r57.log");
+  const child57 = spawn("bash", [SBX_RALPH, rd57], { cwd: p57, stdio: ["ignore", "ignore", openSync(logf57, "w")],
+    env: { ...process.env, PI: stub57, NO_COLOR: "1" } });
+  const rc57 = await waitExit(child57, 25000);
+  const out57 = readFileSync(logf57, "utf8");
+  const rep57 = [path.join(rd57, "FINAL-REPORT.md"), path.join(rd57, "FINAL-REPORT.monitor.md")]
+    .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
+  const flog57 = existsSync(path.join(rd57, "ralph-monitor.log")) ? readFileSync(path.join(rd57, "ralph-monitor.log"), "utf8") : "";
+  report("R57 consumed spawn (sub halted) → run report + sub halt context, no slot poll",
+    rc57 === 0 && rep57.includes("Final report (R57)")
+    && out57.includes("┌ final report")
+    && flog57.includes("CHAIN HALT") && flog57.includes("window ended error")
+    && !out57.includes("hand-off slot not observed"),
+    `rc=${rc57} report=${rep57.includes("Final report (R57)")} boxed=${out57.includes("┌ final report")} haltCtx=${flog57.includes("window ended error")} polled=${out57.includes("hand-off slot not observed")} tail=${out57.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
+
+  // R57b (v0.35.16, 7.7): a CONSUMED clean completion (sub window completed,
+  // chain re-entered — outcome next=spawned) is also not pending: the run's
+  // final report IS written at the launch window (pre-fix: 10 s slot poll,
+  // "not observed", silent exit — no run report). No halt context here.
+  const p57b = path.join(root, "p57b"); const rd57b = path.join(p57b, "run1");
+  const sub57b = path.join(root, "sub57b", "run-1");
+  mkdirSync(rd57b, { recursive: true }); mkdirSync(sub57b, { recursive: true });
+  writeFileSync(path.join(p57b, "TASK.md"), "# T57b");
+  writeFileSync(path.join(rd57b, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed", guardPid: 999999, childPid: 999999, attempt: 1, rewinds: 0, toolCalls: 5, elapsedMs: 1234, deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
+  writeFileSync(path.join(rd57b, "spawn-request.json"), JSON.stringify({ kind: "spawn", node: "sub57b", task: "/tmp/sub57b-task.md", deadline: null, runtime_min: 10, reason: "test", at: new Date().toISOString() }));
+  writeFileSync(path.join(rd57b, "spawn-decision.json"), JSON.stringify({ ok: true, node: "sub57b", node_path: "sub57b", window: "run-1", run_dir: sub57b, deadline: null, at: new Date().toISOString() }));
+  writeFileSync(path.join(sub57b, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed", toolCalls: 3, attempt: 1 }));
+  writeFileSync(path.join(sub57b, "chain-done.json"), JSON.stringify({ v: 1, at: new Date().toISOString(), kind: "completed", outcome: { next: "spawned", node_path: "(root)", window: "run2", run_dir: "/nonexistent-r57b" } }));
+  const stub57b = mkStub("pi-r57b-report.mjs", `
+console.log("## Final report (R57b)");
+console.log("run ended after a clean sub completion.");`);
+  const logf57b = path.join(root, "r57b.log");
+  const child57b = spawn("bash", [SBX_RALPH, rd57b], { cwd: p57b, stdio: ["ignore", "ignore", openSync(logf57b, "w")],
+    env: { ...process.env, PI: stub57b, NO_COLOR: "1" } });
+  const rc57b = await waitExit(child57b, 25000);
+  const out57b = readFileSync(logf57b, "utf8");
+  const rep57b = [path.join(rd57b, "FINAL-REPORT.md"), path.join(rd57b, "FINAL-REPORT.monitor.md")]
+    .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
+  const flog57b = existsSync(path.join(rd57b, "ralph-monitor.log")) ? readFileSync(path.join(rd57b, "ralph-monitor.log"), "utf8") : "";
+  report("R57b consumed spawn (sub completed) → run report at launch window, no halt context",
+    rc57b === 0 && rep57b.includes("Final report (R57b)")
+    && out57b.includes("┌ final report")
+    && !flog57b.includes("CHAIN HALT")
+    && !out57b.includes("hand-off slot not observed"),
+    `rc=${rc57b} report=${rep57b.includes("Final report (R57b)")} boxed=${out57b.includes("┌ final report")} haltCtx=${flog57b.includes("CHAIN HALT")} polled=${out57b.includes("hand-off slot not observed")} tail=${out57b.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
 }
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });

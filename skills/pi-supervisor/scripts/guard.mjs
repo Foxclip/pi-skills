@@ -1797,6 +1797,51 @@ function captureStartupTree() {
   return parts.join(" | ");
 }
 
+// v0.35.16 (run89): the chain step runs on EVERY terminal path — not just
+// the happy one. Before this, an error thrown before/inside the main loop
+// (e.g. the transient first-prompt child death) ran writeStatus("error")
+// and exited WITHOUT the chain step: no chain-done.json, the tree still
+// claimed the window, and the monitor could never hand back (run89's
+// subrun67 window ping-ponged for 68+ minutes on the dead window).
+// Contract (plan §5.4): a chain failure must NEVER change this window's
+// exit code — best effort, logged, chain-error.json on failure.
+// v0.26.0 sub-runs: the chain step is the deterministic next-window
+// transition (spawn / continuation / re-entry / halt), run AFTER the final
+// status is durable and BEFORE exit; only for windows launched with a
+// project (PI_SUP_PROJECT set by launch.mjs).
+// v0.27.0: the step runs at the SCHEDULER ROOT (PI_SUP_TREE_ROOT, set by
+// launch.mjs; defaults to this window's own project) — in a v2 tree a
+// sub-project window is decided by its tree root. A root whose
+// .pi-supervisor is gone (the tree moved) is NOT an error here: the chain
+// degrades to standalone mode inside step() (plan §4).
+// MODULE SCOPE on purpose: the top-level catch (below the big try) must
+// reach it, and the try-block scope hides block-local declarations.
+let chainFinalized = false;
+async function runChainStepIfProject() {
+  if (chainFinalized) return;
+  chainFinalized = true;
+  if (!process.env.PI_SUP_PROJECT) return;
+  try {
+    const { step: chainStep } = await import("./lib/chain.mjs");
+    await chainStep(process.env.PI_SUP_TREE_ROOT || process.env.PI_SUP_PROJECT, outDir, {
+      repair: false,
+      launch: {
+        provider: provider || undefined,
+        model: model || undefined,
+        thinking: thinking || undefined,
+        preamble: "standard",
+        idleTimeoutSec: Math.round(idleTimeoutMs / 1000),
+        turnStallSec,
+        finalizeMin,
+        runtimeMin: 90,
+      },
+      log: (line) => logSup(`[chain] ${line}`),
+    });
+  } catch (e) {
+    logSup(`[chain] step failed (window outcome unchanged): ${e.message}`);
+    try { writeFileSync(join(outDir, "chain-error.json"), JSON.stringify({ at: new Date().toISOString(), error: e.message }, null, 2)); } catch { /* best effort */ }
+  }
+}
 let outcome = "error";
 let relayHappened = false; // v0.6.0: an overflow relay ran to completion
 let relayExitCode = 1;
@@ -1866,6 +1911,27 @@ try {
   // MAX_STARTUP_ATTEMPTS times before giving up. Each failed attempt captures
   // the wrapper stderr + a process-tree snapshot so the real killer can be
   // identified (diagnostics only — the retry is the fix).
+  // v0.35.16: the startup clock is pinned BEFORE the retry loop (previously
+  // after it) — the first prompt is now part of the startup (loop below) and
+  // needs the deadline note; the resume path re-pins startTs from its consult
+  // file. Side effect: with retries the deadline is up to ~20 s earlier than
+  // pre-v0.35.16 (startup time now counts against it).
+  startTs = Date.now();
+  lastEventAt = startTs;
+  computeDeadline();
+  let disp0 = null; // fresh-launch first-prompt disposition (set in the loop)
+  // Deadline awareness: the child never knew its wall clock existed — a run
+  // can be killed mid-item with no report. State the deadline in the first
+  // prompt so the child can pace itself (and the finalization window, when
+  // enabled, becomes meaningful).
+  const deadlineNote = hardTimeoutMs > 0
+    ? `\n\n[guard] HARD DEADLINE: the wall clock for this run ends at ${deadlineLocal} ` +
+      `(${deadlineIso} UTC; ${Math.round(hardTimeoutMs / 60000)} minutes from start).` +
+      (finalizeMin > 0
+        ? ` After that you get one final chance to write your final report, then the process is force-killed.`
+        : ` The process is force-killed at that point with no chance to report.`) +
+      ` Plan to finish the task — and any required report files — before the deadline.`
+    : ""; // --timeout 0 = unlimited: there is no wall clock to pace against
   const MAX_STARTUP_ATTEMPTS = 3;
   let startupAttempt = 0;
   let childReady = false;
@@ -1918,9 +1984,48 @@ try {
       logSup(`[diag] startup-failure tree:\n${captureStartupTree()}`);
       try { await client.stop(); } catch { /* already dead */ }
     }
+    // v0.35.16 (run89): the FIRST PROMPT is part of the startup. The transient
+    // 143 death strikes 1-5 s after launch — in run89 it hit AFTER protection
+    // verification, while the first prompt was in flight, so the old retry
+    // window (client.start + verify only) missed it and the window died
+    // dangling. A fresh-launch first-prompt death with ZERO tool calls is the
+    // same transient: relaunch within the same attempt budget. Resume runs
+    // never prompt here (their prompt is the consult payload, below).
+    if (childReady && !resumePayload && disp0 === null && startupAttempt < MAX_STARTUP_ATTEMPTS) {
+      try {
+        disp0 = await promptChild(task + deadlineNote);
+      } catch (e) {
+        const msg = String((e && e.message) || e);
+        let childAliveNow = false;
+        try {
+          const leader = readFileSync(childPidFile, "utf8").trim().split("\n")[0];
+          childAliveNow = !!leader && existsSync(`/proc/${leader}`);
+        } catch { childAliveNow = false; }
+        if (childUser && /Timeout waiting for response to prompt/.test(msg) && childAliveNow) {
+          // v0.26.1 cold child start (unchanged): the prompt is buffered in the
+          // child's stdin and processed once bootstrap finishes; the turn-stall
+          // ladder still bounds a truly lost prompt.
+          logSup(`[guard] first-prompt response timed out during child start (${childUser}) — child alive, assuming the prompt is buffered; continuing`);
+          disp0 = "timeout-assumed-delivered";
+        } else if (/exited/.test(msg) && totalToolCalls === 0) {
+          startupErr = `first-prompt child death: ${msg.slice(0, 300)}`;
+          logSup(`[error] ${startupErr}`);
+          logSup(`[diag] startup-failure tree:\n${captureStartupTree()}`);
+          childReady = false; // relaunch (same attempt budget)
+        } else {
+          throw e; // not the transient — propagate (top-level catch finalizes)
+        }
+      }
+    }
   }
   if (!childReady) {
     writeStatus("error", childUser ? "protection-verification-failed" : "child-startup-failed");
+    // v0.35.16: a window that never started is still a terminal window —
+    // finalize the tree (classifyWindow sees status error → "blocked")
+    // instead of leaving it dangling, and stop the client so the wrapper
+    // bridge doesn't outlive the guard.
+    try { await client.stop().catch(() => {}); } catch { /* best effort */ }
+    await runChainStepIfProject();
     process.exit(49);
   }
 
@@ -1933,9 +2038,6 @@ try {
   } catch { /* diagnostic only */ }
   logSup(`[info] session id=${stateSessionId || "?"} file=${stateSessionFile || "?"}`);
 
-  startTs = Date.now();
-  lastEventAt = startTs;
-  computeDeadline();
   if (resumePayload) {
     // Resume from a consult file: budgets, attempt count and the hard wall
     // clock come from the file, not from flags, so they carry across resumes.
@@ -2020,40 +2122,13 @@ try {
     }
   } else {
     resetAttemptCounters();
-    // Deadline awareness: the child never knew its wall clock existed — a run
-    // can be killed mid-item with no report. State the deadline in the first
-    // prompt so the child can pace itself (and the finalization window, when
-    // enabled, becomes meaningful).
-    const deadlineNote = hardTimeoutMs > 0
-      ? `\n\n[guard] HARD DEADLINE: the wall clock for this run ends at ${deadlineLocal} ` +
-        `(${deadlineIso} UTC; ${Math.round(hardTimeoutMs / 60000)} minutes from start).` +
-        (finalizeMin > 0
-          ? ` After that you get one final chance to write your final report, then the process is force-killed.`
-          : ` The process is force-killed at that point with no chance to report.`) +
-        ` Plan to finish the task — and any required report files — before the deadline.`
-      : ""; // --timeout 0 = unlimited: there is no wall clock to pace against
-    let disp0;
-    try {
+    // v0.35.16: the first prompt is attempted inside the startup retry loop
+    // (the transient 143 death can strike AFTER verification — run89). Only
+    // the LAST attempt's child reaches here un-prompted (attempts exhausted)
+    // — send it once, unretried; a death there propagates to the top-level
+    // catch, which finalizes the window (chain step) and exits 1.
+    if (disp0 === null) {
       disp0 = await promptChild(task + deadlineNote);
-    } catch (e) {
-      // v0.26.1: cold child start. pi's RpcClient gives every RPC response a
-      // hardcoded 30s timeout; a first launch as the child user bootstraps its
-      // pi install for 30-60s+ before the prompt is even read — the prompt IS
-      // buffered in the child's stdin and will be processed. If the child is
-      // alive, continue (the event loop picks up its activity; the turn-stall
-      // ladder still bounds a truly lost prompt).
-      const msg = String((e && e.message) || e);
-      let childAliveNow = false;
-      try {
-        const leader = readFileSync(childPidFile, "utf8").trim().split("\n")[0];
-        childAliveNow = !!leader && existsSync(`/proc/${leader}`);
-      } catch { childAliveNow = false; }
-      if (childUser && /Timeout waiting for response to prompt/.test(msg) && childAliveNow) {
-        logSup(`[guard] first-prompt response timed out during child start (${childUser}) — child alive, assuming the prompt is buffered; continuing`);
-        disp0 = "timeout-assumed-delivered";
-      } else {
-        throw e;
-      }
     }
     logSup(`[guard] prompt disposition=${disp0}`);
     if (hardTimeoutMs > 0) {
@@ -2603,43 +2678,21 @@ try {
     plog(`[result] ${new Date().toISOString()} status=${result.status} exitReason=${outcome} attempts=${attempt} manifest=${manifestPath}\n`);
     writeStatus(result.status, outcome);
     // v0.26.0 sub-runs: the chain step — the deterministic next-window
-    // transition (spawn / continuation / re-entry / halt). Runs AFTER the
-    // final status is durable and BEFORE exit; a chain failure must NEVER
-    // change this window's own exit code (plan §5.4). Only for windows
-    // launched with a project (PI_SUP_PROJECT set by launch.mjs).
-    // v0.27.0: the step runs at the SCHEDULER ROOT (PI_SUP_TREE_ROOT, set by
-    // launch.mjs; defaults to this window's own project) — in a v2 tree a
-    // sub-project window is decided by its tree root. A root whose
-    // .pi-supervisor is gone (the tree moved) is NOT an error here: the chain
-    // degrades to standalone mode inside step() (plan §4).
-    try {
-      if (process.env.PI_SUP_PROJECT) {
-        const { step: chainStep } = await import("./lib/chain.mjs");
-        await chainStep(process.env.PI_SUP_TREE_ROOT || process.env.PI_SUP_PROJECT, outDir, {
-          repair: false,
-          launch: {
-            provider: provider || undefined,
-            model: model || undefined,
-            thinking: thinking || undefined,
-            preamble: "standard",
-            idleTimeoutSec: Math.round(idleTimeoutMs / 1000),
-            turnStallSec,
-            finalizeMin,
-            runtimeMin: 90,
-          },
-          log: (line) => logSup(`[chain] ${line}`),
-        });
-      }
-    } catch (e) {
-      logSup(`[chain] step failed (window outcome unchanged): ${e.message}`);
-      try { writeFileSync(join(outDir, "chain-error.json"), JSON.stringify({ at: new Date().toISOString(), error: e.message }, null, 2)); } catch { /* best effort */ }
-    }
+    // transition (spawn / continuation / re-entry / halt). v0.35.16: every
+    // terminal path funnels through runChainStepIfProject() so an error
+    // before/in the loop cannot leave the window dangling (run89).
+    await runChainStepIfProject();
     process.stdout.write(`\n=== RESULT === ${JSON.stringify(result)}\n`);
     exitCode = isCompleted ? 0 : isConsult ? 4 : 3;
   }
 } catch (err) {
   logSup(`\n[error] ${err.message}`);
-  writeStatus("error", err.message.slice(0, 300));
+  // v0.35.16: never clobber an already-terminal window (e.g. an EPIPE on the
+  // RESULT line after writeStatus(completed)) — the chain step must decide
+  // from the REAL outcome.
+  const terminalAlready = lastStatus && !["starting", "running", "consult"].includes(lastStatus);
+  if (!terminalAlready) writeStatus("error", err.message.slice(0, 300));
+  await runChainStepIfProject(); // the error path finalizes the tree too (run89)
   exitCode = 1;
 } finally {
   await client.stop().catch(() => {});

@@ -226,7 +226,7 @@ writeFileSync(join(fakePkg, "dist", "index.js"), FAKE_INDEX);
 let passCount = 0;
 let failCount = 0;
 
-function run({ name, args = [], phases, expect = [], expectExit = 0, expectNot = [], setup = null, assertFiles = [], extra = null }) {
+function run({ name, args = [], phases, expect = [], expectExit = 0, expectNot = [], setup = null, assertFiles = [], extra = null, env: extraEnv = null }) {
   const dir = mkdtempSync(join(tmpdir(), "pi-sup-test-"));
   const specFile = join(dir, "script.json");
   writeFileSync(specFile, JSON.stringify({ phases, ...(extra ?? {}) }));
@@ -243,6 +243,9 @@ function run({ name, args = [], phases, expect = [], expectExit = 0, expectNot =
       PI_PROVIDER: "fake",
       PI_MODEL: "fake/model",
       NO_COLOR: "1",
+      // v0.35.16: per-test env override (object, or (dir) => object so the
+      // test can reference its scratch dir, e.g. PI_SUP_PROJECT=dir).
+      ...(typeof extraEnv === "function" ? extraEnv(dir) : extraEnv ?? {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
     timeout: 60000,
@@ -1232,6 +1235,41 @@ run({
   expect: ["degenerate settle"],
   expectNot: ["P5b error-stop retry"],
   expectExit: 3,
+});
+
+// ---------------------------------------------------------------------------
+// v0.35.16 (run89): the transient 143 first-prompt death strikes AFTER
+// protection verification (1 s after launch, zero tool calls — run89's
+// subrun67 window), so the startup retry loop must relaunch THROUGH it (the
+// old retry window ended at verification), and the terminal error path must
+// run the chain step — pre-fix the error path skipped it, the tree kept
+// claiming the window, and the monitor ping-ponged 68+ minutes on the
+// dangling window (no chain-done.json, no hand-back, no run report).
+// ---------------------------------------------------------------------------
+run({
+  name: "v0.35.16: first-prompt child death → relaunch budget + chain finalization (exit 1)",
+  args: [TASK, "--out-dir", "sup"],
+  phases: [],
+  extra: {
+    rejectPromptsAfter: 0,
+    rejectPromptMessage: "Agent process exited (code=143 signal=null). Stderr: Warning: No project session found with that id",
+  },
+  env: (dir) => ({ PI_SUP_PROJECT: dir }),
+  setup: (dir) => {
+    mkdirSync(join(dir, ".pi-supervisor"), { recursive: true });
+    writeFileSync(join(dir, ".pi-supervisor", "node.json"), JSON.stringify({
+      v: 2, name: "(root)", path: "/", parent: null, deadline: null,
+      state: "active", children: [], createdAt: new Date().toISOString(),
+    }));
+  },
+  expectExit: 1,
+  expect: ["first-prompt child death", "startup attempt 2/3", "startup attempt 3/3"],
+  assertFiles: [
+    { path: "sup/pi-child-status.json", expect: ["\"status\": \"error\""] },
+    { path: "sup/chain-done.json", expect: ["\"next\": \"halted\""] },
+    { path: "sup/chain-halt.json", expect: ["human attention needed"] },
+    { path: ".pi-supervisor/node.json", expect: ["blocked"] },
+  ],
 });
 
 console.log(`\n=== ${passCount} passed, ${failCount} failed ===`);
