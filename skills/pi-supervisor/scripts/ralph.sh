@@ -1128,7 +1128,13 @@ FR="$RUN_DIR/FINAL-REPORT.md"
 [ -f "$RUN_DIR/FINAL-REPORT.monitor.md" ] && FR="$RUN_DIR/FINAL-REPORT.monitor.md"
 if [ -f "$FR" ]; then
   printf '%s┌ final report (parent)%s %s\n' "$C_B" "$C_N" "$(rule)" >&2
-  while IFS= read -r line; do printf '│ %s\n' "$line" >&2; done < "$FR"
+  # v0.35.14 (7.8): the report is LLM prose and quotes the UTC timestamps it
+  # read from status files — display-localize them (files keep the ISO).
+  # Helper failure must never eat the box: fall back to the raw file.
+  _loc="$RUN_DIR/.final-report-localized.tmp"
+  node "$HERE/lib/iso-localize.mjs" < "$FR" > "$_loc" 2>/dev/null || cat "$FR" > "$_loc"
+  while IFS= read -r line; do printf '│ %s\n' "$line" >&2; done < "$_loc"
+  rm -f "$_loc"
   printf '└%s\n' "$(rule)" >&2
 fi
 exit $rc

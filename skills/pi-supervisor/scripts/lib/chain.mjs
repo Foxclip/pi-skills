@@ -368,7 +368,12 @@ function launchWindow(projectDir, nodePath, wdir, budget, cfg, windowDir, log, s
   if (L.model) args.push("--model", L.model);
   if (L.thinking != null) args.push("--thinking", String(L.thinking));
   if (sessionRef) args.push("--session", String(sessionRef));
-  log(`launch: node=${nodePath || ROOT} window=${path.basename(wdir)} project=${wproj} deadline=${new Date(budget.deadlineMs).toISOString()}${sessionRef ? ` session=${sessionRef}` : ""}`);
+  // v0.35.14 (7.8): file keeps the ISO deadline; the terminal line carries the
+  // local date+time (the terminal never shows ISO-8601).
+  log(
+    `launch: node=${nodePath || ROOT} window=${path.basename(wdir)} project=${wproj} deadline=${new Date(budget.deadlineMs).toISOString()}${sessionRef ? ` session=${sessionRef}` : ""}`,
+    `launch: node=${nodePath || ROOT} window=${path.basename(wdir)} project=${wproj} deadline=${new Date(budget.deadlineMs).toLocaleString("en-CA", { hour12: false })}${sessionRef ? ` session=${sessionRef}` : ""}`
+  );
   let r;
   try {
     r = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 180000, cwd: wproj });
@@ -415,9 +420,11 @@ function resolveWindowNode(projectDir, windowDir) {
 export async function step(projectDir, windowDir, cfg = {}) {
   const marker = path.join(windowDir, "chain-done.json");
   if (fs.existsSync(marker)) return { skipped: "chain-done" };
-  const log = (line) => {
+  // v0.35.14 (7.8): the FILE line (chain.log) keeps ISO; the TERMINAL variant
+  // (2nd arg) may differ so the terminal never shows ISO-8601 (e.g. deadlines).
+  const log = (line, terminal) => {
     clog(projectDir, windowDir, line);
-    if (typeof cfg.log === "function") { try { cfg.log(line); } catch { /* sink must not kill the chain */ } }
+    if (typeof cfg.log === "function") { try { cfg.log(terminal ?? line); } catch { /* sink must not kill the chain */ } }
   };
   // v0.27.0: the scheduler root no longer holds .pi-supervisor (the tree moved
   // away or was deleted) — the window has no parent tree to be decided by.
@@ -986,7 +993,11 @@ async function openChildWindow(projectDir, nodePath, brief, budget, cfg, windowD
     appendState(projectDir, parent,
       `- [${new Date().toISOString()}] child ${childName(nodePath)} spawned — window ${opened.window} launched (deadline ${new Date(budget.deadlineMs).toISOString()}); parent paused`);
   }
-  log(`spawn decision: OK — ${nodePath}/${opened.window} launched (deadline ${new Date(budget.deadlineMs).toISOString()})`);
+  // v0.35.14 (7.8): file keeps ISO; terminal gets the local deadline.
+  log(
+    `spawn decision: OK — ${nodePath}/${opened.window} launched (deadline ${new Date(budget.deadlineMs).toISOString()})`,
+    `spawn decision: OK — ${nodePath}/${opened.window} launched (deadline ${new Date(budget.deadlineMs).toLocaleString("en-CA", { hour12: false })})`
+  );
   return {
     ok: true,
     node: childName(nodePath),

@@ -2057,7 +2057,9 @@ try {
     }
     logSup(`[guard] prompt disposition=${disp0}`);
     if (hardTimeoutMs > 0) {
-      logSup(`[guard] hard deadline: ${deadlineLocal} (${deadlineIso} UTC)` + (finalizeMin > 0 ? ` + ${finalizeMin}min finalization window` : ""));
+      // v0.35.14 (7.8): the terminal never shows ISO — the local date+time is
+      // the display; the ISO lives in the status file (deadlineIso) and files.
+      logSup(`[guard] hard deadline: ${deadlineLocal}` + (finalizeMin > 0 ? ` + ${finalizeMin}min finalization window` : ""));
     }
     checkpointId = await findCheckpoint();
     if (!checkpointId) {

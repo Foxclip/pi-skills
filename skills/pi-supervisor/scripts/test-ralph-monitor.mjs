@@ -1755,6 +1755,63 @@ console.log("DECISION: OK");`);
     watched && handedOff && rePointed && markerSet && deferCount < 30 && beat0 && reEntryCall && !earlyStop && markerCleared && !subReport && exited === 0 && launchReport,
     `watched=${watched} handoff=${handedOff} back=${rePointed} marker=${markerSet} deferCount=${deferCount} beat0=${beat0} reEntry3=${reEntryCall} earlyStop=${earlyStop} cleared=${markerCleared} subReport=${subReport} exit=${exited} launchReport=${launchReport}`);
 }
+// R55 (v0.35.14, 7.8): ISO-8601 (UTC) must never reach the terminal — it
+// belongs in files. LLM prose quotes the UTC timestamps it read from status
+// data; the two display paths (ralph.sh final-report box, monitor tick
+// detail/reasoning) localize it, while the files keep ISO.
+{
+  const p2 = (n) => String(n).padStart(2, "0");
+  const dFull = new Date("2026-11-11T10:35:56.026Z");
+  const localFull = `${dFull.getFullYear()}-${p2(dFull.getMonth() + 1)}-${p2(dFull.getDate())} ${p2(dFull.getHours())}:${p2(dFull.getMinutes())}:${p2(dFull.getSeconds())}`;
+  const nowU = new Date();
+  const dBare = new Date(Date.UTC(nowU.getUTCFullYear(), nowU.getUTCMonth(), nowU.getUTCDate(), 10, 21, 56));
+  const localBare = `[${p2(dBare.getHours())}:${p2(dBare.getMinutes())}:${p2(dBare.getSeconds())}]`;
+  const dDl = new Date("2026-11-11T10:40:00.000Z");
+  const localDl = `${dDl.getFullYear()}-${p2(dDl.getMonth() + 1)}-${p2(dDl.getDate())} ${p2(dDl.getHours())}:${p2(dDl.getMinutes())}:${p2(dDl.getSeconds())}`;
+  const isoFullRe = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
+  const isoBareRe = /\b[01]?\d:[0-5]\d:[0-5]\dZ\b/;
+
+  // R55a: the final report (LLM prose with both ISO forms) is written to the
+  // file AS-IS and printed boxed to the terminal LOCALIZED.
+  const proj = path.join(root, "p55a"); const rd = path.join(proj, "run1");
+  mkdirSync(rd, { recursive: true });
+  writeFileSync(path.join(proj, "TASK.md"), "# T55a");
+  writeFileSync(path.join(rd, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed", guardPid: 999999, childPid: 999999, attempt: 1, rewinds: 0, toolCalls: 5, elapsedMs: 1234, deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
+  writeFileSync(path.join(rd, "pi-child-progress.log"), "tool line 1\n");
+  const stubIso = mkStub("pi-iso-report.mjs", `
+console.log("child done at 2026-11-11T10:35:56.026Z — work spanned 10:21:56Z to 10:24:04Z");`);
+  const logf = path.join(root, "r55a.log");
+  const child = spawn("bash", [SBX_RALPH, rd], { cwd: proj, stdio: ["ignore", "ignore", openSync(logf, "w")],
+    env: { ...process.env, PI: stubIso, NO_COLOR: "1" } });
+  const rc55 = await waitExit(child, 25000);
+  const out55 = readFileSync(logf, "utf8");
+  const repF = [path.join(rd, "FINAL-REPORT.md"), path.join(rd, "FINAL-REPORT.monitor.md")]
+    .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
+  report("R55a final-report box: file keeps ISO, terminal shows localized", 
+    rc55 === 0 && repF.includes("2026-11-11T10:35:56.026Z") && repF.includes("10:21:56Z")
+    && out55.includes("┌ final report (parent)")
+    && !isoFullRe.test(out55) && !isoBareRe.test(out55)
+    && out55.includes(localFull) && out55.includes(localBare),
+    `rc=${rc55} fileIso=${repF.includes("2026-11-11T10:35:56.026Z")} boxed=${out55.includes("┌ final report (parent)")} termIso=${isoFullRe.test(out55) || isoBareRe.test(out55)} localFull=${out55.includes(localFull)} localBare=${out55.includes(localBare)} tail=${out55.trim().split("\n").slice(-4).join(" | ").slice(0, 160)}`);
+
+  // R55b: the judgment's reasoning (LLM prose) is displayed localized under the
+  // tick line; the cycle-N-judgment.out file keeps ISO.
+  const d55 = runDir("r55b");
+  mkStatus(d55, { status: "running" });
+  writeFileSync(path.join(d55, "pi-child-progress.log"), "tool line 1\n");
+  const stubJudge = mkStub("pi-iso-judge.mjs", `
+console.log("child last tool at 10:21:56Z; deadline 2026-11-11T10:40:00.000Z approaches");
+console.log("DECISION: OK");`);
+  const r55 = runRm(d55, stubJudge, ["--once"]);
+  const outJ = (r55.stdout || "") + (r55.stderr || "");
+  const jOut = existsSync(path.join(d55, "llm", "cycle-1-judgment.out")) ? readFileSync(path.join(d55, "llm", "cycle-1-judgment.out"), "utf8") : "";
+  report("R55b judgment reasoning displayed localized; judgment file keeps ISO",
+    r55.status === 0 && outJ.includes("cycle 1 · OK")
+    && !isoFullRe.test(outJ) && !isoBareRe.test(outJ)
+    && outJ.includes(localBare) && outJ.includes(localDl)
+    && jOut.includes("10:21:56Z") && jOut.includes("2026-11-11T10:40:00.000Z"),
+    `rc=${r55.status} tick=${outJ.includes("cycle 1 · OK")} termIso=${isoFullRe.test(outJ) || isoBareRe.test(outJ)} localBare=${outJ.includes(localBare)} localDl=${outJ.includes(localDl)} fileIso=${jOut.includes("10:21:56Z") && jOut.includes("2026-11-11T10:40:00.000Z")} out=${outJ.trim().split("\n").slice(-6).join(" | ").slice(0, 200)}`);
+}
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);
