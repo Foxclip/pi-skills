@@ -737,8 +737,12 @@ export async function reentry(parentPath, projectDir, childPath, childWindowDir,
   // rule launchWindow applies (single source of truth).
   const sized = sizeDeadline({ ts: new Date(dlMs), finalizeMin: Number(cfg.launch?.finalizeMin) || 10, now: new Date() });
   if (!sized.ok) {
+    // v0.35.17 (7.8, run90 streak check): this reason string is human-facing
+    // and IS PRINTED to the terminal (the launch notice, the final report's
+    // halt context) — the terminal never shows ISO-8601. Local date+time here;
+    // the machine-readable deadline stays ISO in the structured fields.
     return haltBlocked(projectDir, parentPath, childWindowDir, log,
-      `child ${childPath} ended (${childState}); the run's deadline (${dlIso}) was reached (3.2) before hand-back — the run is over; the sub-run's report is on disk at ${childFinalDir}; start a fresh run (2.1) to continue`, done);
+      `child ${childPath} ended (${childState}); the run's deadline (${new Date(dlMs).toLocaleString("en-CA", { hour12: false })}) was reached (3.2) before hand-back — the run is over; the sub-run's report is on disk at ${childFinalDir}; start a fresh run (2.1) to continue`, done);
   }
   // ok:true — the budget IS available here (the sizing gate above just
   // rejected the no-budget case); without it budgetLine() renders the

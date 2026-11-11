@@ -849,6 +849,8 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   const r = await step(p, aw, CFG);
   ok("T24b halt (the run's deadline was reached, 3.2)", r.outcome?.next === "halted", JSON.stringify(r.outcome));
   ok("T24b reason names the run's deadline and 3.2", /run's deadline/.test(r.outcome?.reason || "") && /was reached \(3\.2\)/.test(r.outcome?.reason || ""), r.outcome?.reason);
+  // v0.35.17 (7.8): the reason is printed to the terminal — no ISO-8601 in it.
+  ok("T24b reason carries no ISO timestamp (7.8)", !/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(r.outcome?.reason || ""), r.outcome?.reason);
   ok("T24b root blocked", nodeState(p, "(root)") === "blocked");
   ok("T24b no launch (no run-2)", !fs.existsSync(R(p, "run-2")));
   ok("T24b halt marker written (F2)", fs.existsSync(path.join(aw, "chain-halt.json")));
