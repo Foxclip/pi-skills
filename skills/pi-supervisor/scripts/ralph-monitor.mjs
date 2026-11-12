@@ -66,7 +66,7 @@ const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NODE = process.execPath;
 
 function usage() {
-  return "usage: ralph-monitor.mjs --run-dir <dir> --pi <path> [--project-dir <d>] [--model <s>] [--provider <s>] [--session <f|id>] [--cycle-sec 1200] [--max-interventions 3] [--stuck-sec 3600] [--stale-sec 180] [--deadline <ISO|epoch|HH:MM>] [--max-hours 12] [--llm-fail-max 6] [--timeout-sec 600] [--prompt-file <p>] [--log-file <p>] [--once] [--dry-run]";
+  return "usage: ralph-monitor.mjs --run-dir <dir> --pi <path> [--project-dir <d>] [--model <s>] [--provider <s>] [--session <f|id>] [--cycle-sec 1200] [--max-interventions 3] [--stuck-sec 3600] [--stale-sec 180] [--deadline <ISO|epoch|HH:MM>] [--max-hours 12] [--llm-fail-max 6] [--timeout-sec 600] [--final-timeout-sec 900] [--display-only] [--prompt-file <p>] [--log-file <p>] [--once] [--dry-run]";
 }
 
 // ---- args
@@ -76,6 +76,7 @@ const A = {
   runDir: null, pi: null, projectDir: null, model: null, provider: null, session: null,
   cycleSec: 1200, maxInterventions: 3, stuckSec: 3600, staleSec: 180,
   deadline: null, maxHours: 12, llmFailMax: 6, timeoutSec: 600, finalizeGraceSec: 900,
+  finalTimeoutSec: 900, displayOnly: false,
   promptFile: null, logFile: null, once: false, dryRun: false,
 };
 for (let i = 0; i < argv.length; i++) {
@@ -95,6 +96,8 @@ for (let i = 0; i < argv.length; i++) {
   else if (x === "--max-hours") A.maxHours = num(argv[++i]);
   else if (x === "--llm-fail-max") A.llmFailMax = num(argv[++i]);
   else if (x === "--timeout-sec") A.timeoutSec = num(argv[++i]);
+  else if (x === "--final-timeout-sec") A.finalTimeoutSec = num(argv[++i]);
+  else if (x === "--display-only") A.displayOnly = true;
   else if (x === "--prompt-file") A.promptFile = argv[++i];
   else if (x === "--log-file") A.logFile = argv[++i];
   else if (x === "--once") A.once = true;
@@ -386,6 +389,14 @@ let slotStartedAtMs = null;   // followSlot: launch time of the window we just m
 const STALE_MARKER_GRACE_MS = 60_000;
 const prevInstance = new Map();   // runDir → childPgid last seen RUNNING there
 let staleMarker = null;           // { at, tc, p, until, told } for the current window
+// v0.35.19 (run110, 4.9/7.7): the identity (run_dir|started_at|guard_pid) of a
+// slot the hand-back already CONSUMED. The chain's clearActiveSlots is
+// best-effort — when the clear is lost, the file still points at the window we
+// just handed back from; re-following it ping-pongs hand-back → hand-off
+// forever (R58). A FRESH slot (new started_at/guard_pid — e.g. the chain
+// re-launched the parent for re-entry) has a different signature and is
+// followed as before.
+let consumedSlotSig = null;
 const rawStatus = () => { try { return JSON.parse(readFileSync(path.join(A.runDir, "pi-child-status.json"), "utf8")); } catch { return null; } };
 const noteRunning = (s) => { if (s && s.status === "running" && Number.isFinite(Number(s.childPgid))) prevInstance.set(A.runDir, Number(s.childPgid)); };
 const markStaleIfMatch = () => {   // called at the end of every successful re-point
@@ -696,17 +707,29 @@ async function writeFinalReport(reason) {
   const frDur = () => `${Math.round((Date.now() - frStarted) / 1000)}s`;
   try {
     const stopHb = heartbeat("final report — parent summarizing");   // v0.24.3
-    try { r = await runCmd(A.pi, args, A.timeoutSec * 1000, "final-report"); } finally { stopHb(); }
+    // v0.35.19 (run108/run110, 7.7): the final report gets its OWN budget
+    // (--final-timeout-sec, default 900 = the finalize window). A slow local
+    // judge model needs >600s (observed 626–696s); the shared --timeout-sec
+    // killed the call mid-report and the DISCARDED text was a complete report.
+    try { r = await runCmd(A.pi, args, A.finalTimeoutSec * 1000, "final-report"); } finally { stopHb(); }
   } catch (e) {
     glog("✗", 31, `final-report: FAILED (${e.message}) — skipping`);
     flog(`final-report-end dur=${frDur()} outcome=error (${e.message})`);
     return null;
   }
   const text = (r.stdout || "").trim();
-  if (r.status !== 0 || !text) {
+  // v0.35.19 (run108/run110, 7.7): SALVAGE — the report was fully streamed to
+  // stdout but the pi process hung past --final-timeout-sec and was killed
+  // (all three observed cases: complete text, then a 600s+ post-output hang).
+  // A salvaged report, noted as such, beats no report (7.7).
+  const okExit = r.status === 0;
+  if (!okExit && text.length < 40) {
     glog("✗", 31, `final-report: FAILED (exit=${r.status ?? r.signal}) — skipping`);
     flog(`final-report-end dur=${frDur()} outcome=failed exit=${r.status ?? r.signal}`);
     return null;
+  }
+  if (!okExit) {
+    glog("!", 33, `final-report: judge process killed (exit=${r.status ?? r.signal}) — salvaging ${text.length} chars of captured stdout`);
   }
   // v0.26.4: run dirs are child-writable (spawn protocol, sub-run era) — the
   // child's OWN final report may already hold the canonical name (run30
@@ -719,8 +742,8 @@ async function writeFinalReport(reason) {
   catch (e) { if (e.code !== "ENOENT") p = path.join(A.runDir, "FINAL-REPORT.monitor.md"); }
   try {
     writeFileSync(p, text + "\n");
-    glog("✓", 32, `final-report: written (${text.length} chars) → ${p}`);
-    flog(`final-report-end dur=${frDur()} outcome=written chars=${text.length} file=${path.basename(p)}`);
+    glog("✓", 32, `final-report: ${okExit ? "written" : "SALVAGED"} (${text.length} chars) → ${p}`);
+    flog(`final-report-end dur=${frDur()} outcome=${okExit ? "written" : "salvaged"} chars=${text.length} file=${path.basename(p)}`);
     return p;
   } catch (e) {
     glog("✗", 31, `final-report: write failed (${e.message})`);
@@ -979,9 +1002,24 @@ async function stopLoop(pc, trigger = null) {
     // stopLoop is never reached — the main loop's followSlot consumes the
     // hand-back first — so only the race changes behavior.
     const followedSub = !!slotPath && path.resolve(A.runDir) !== path.resolve(A.origRunDir);
-    if (!hc && followedSub && !pc.reason.startsWith("deadline")
-        && (followSlot() || handBackToLaunch())) return;
-    await writeFinalReport(hc ? `${pc.reason} — CHAIN HALT (the run is over): ${hc.reason}` : pc.reason);
+    // v0.35.19 (run110, 4.9/7.7): a FOLLOWED sub window's terminal is never
+    // where the RUN's report is written — re-point to the launch window FIRST,
+    // halt context or not (the launch window's stop path picks the sub window's
+    // halt up via readHaltContext's consumed-spawn fallback) and writes the
+    // report THERE. Pre-fix, WITH a halt context this skipped the re-point and
+    // the RUN's report landed in the sub project's window dir — the "no final
+    // report in a subproject" (4.9) deviation (run110: a 1600-char run110
+    // report in subrun84/run-1/FINAL-REPORT.md, an extra 451s judge call).
+    // The write-below stays as the fallback when no re-point is possible.
+    if (followedSub && (followSlot() || handBackToLaunch())) return;
+    if (A.displayOnly) {
+      // v0.35.19 (6.1/7.10): attach monitors are display — the owning
+      // terminal's monitor writes the report; 6.2 tears the run down with its
+      // owner, so an attach never becomes the de-facto supervisor.
+      flog(`final-report skipped (display-only attach, 6.1): reason=${JSON.stringify(pc.reason)}`);
+    } else {
+      await writeFinalReport(hc ? `${pc.reason} — CHAIN HALT (the run is over): ${hc.reason}` : pc.reason);
+    }
   }
   // run4 fix (F4, 6.2/7.6): on the pause path (child-terminal + pending
   // spawn request) the handoff slot is written by the EXITING window's guard
@@ -1055,6 +1093,16 @@ function followSlot() {
     const t = path.resolve(rd);
     if (t !== path.resolve(A.origRunDir) && (t === root || t.startsWith(root + path.sep))) return false;
   }
+  // v0.35.19 (run110, 4.9/7.7): a STALE slot the hand-back already consumed
+  // (the chain's clearActiveSlots is best-effort; a lost clear leaves the file
+  // pointing at the window we just left). Re-following it ping-pongs hand-back
+  // → hand-off forever without ever stopping at the launch window (R58). The
+  // signature (run_dir|started_at|guard_pid) only matches the exact slot we
+  // consumed — a fresh slot is followed as before.
+  if (consumedSlotSig && `${rd}|${p.started_at || ""}|${p.guard_pid ?? ""}` === consumedSlotSig) {
+    flog(`stale slot consumed by hand-back — not re-following ${path.basename(rd)}`);
+    return false;
+  }
   const from = path.basename(A.runDir);
   const to = path.basename(rd);
   A.runDir = rd;
@@ -1093,6 +1141,18 @@ function handBackToLaunch() {
   const target = path.resolve(A.origRunDir);
   if (path.resolve(A.runDir) === target) return false;
   if (!existsSync(target)) return false;
+  // v0.35.19 (run110, 4.9/7.7): consume the slot that pointed at the window we
+  // are leaving — its lifecycle ended (the chain's terminal step ran, hence
+  // the hand-back). If the chain's clearActiveSlots lost the clear, the file
+  // still points here; followSlot refuses this exact identity so the run's
+  // stop path at the launch window actually runs instead of re-following a
+  // dead window forever (R58).
+  try {
+    const p = JSON.parse(readFileSync(slotPath, "utf8"));
+    if (p && p.run_dir && path.resolve(p.run_dir) === path.resolve(A.runDir)) {
+      consumedSlotSig = `${p.run_dir}|${p.started_at || ""}|${p.guard_pid ?? ""}`;
+    }
+  } catch { /* no slot — nothing to consume */ }
   const from = path.basename(A.runDir);
   const to = path.basename(target);
   A.runDir = target;
@@ -1155,6 +1215,16 @@ for (;;) {
   const nowMs = Date.now();
   if (nowMs - lastJudgment < A.cycleSec * 1000 - 500) {
     await sleep(Math.min(POLL_SEC * 1000, Math.max(5000, A.cycleSec * 1000 - (nowMs - lastJudgment))));
+    continue;
+  }
+  if (A.displayOnly) {
+    // v0.35.19 (6.1/7.10): attach monitors are display-only — they render the
+    // view and ride the hand-offs, but never judge: the owning terminal's
+    // monitor is the supervisor (6.2 tears the run down with its owner, so an
+    // attach never becomes de-facto owner). No LLM call, no state advance —
+    // the state file is SHARED with the owner's monitor on this window.
+    flog(`display-only: judgment skipped (attach, 6.1/7.10) child=${status ? status.status : "?"}`);
+    lastJudgment = nowMs;
     continue;
   }
   state.cycles += 1;

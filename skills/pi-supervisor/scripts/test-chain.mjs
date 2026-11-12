@@ -503,6 +503,46 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("S3 parent node blocked", nodeState(p, "(root)") === "blocked", nodeState(p, "(root)"));
 }
 
+// ================= T-RB — v0.35.19 (run110, 3.2/7.8): the re-entry halt reason
+// must be TRUE. A budget that CANNOT BE SIZED (remaining < finalize reservation,
+// deadline still in the FUTURE) must not claim the deadline "was reached".
+{
+  const p = mkproj("t-rb-nobudget");
+  ensureRootNode(p, { deadline: ISO(inMin(4)) });   // 4 min left < finalizeMin 5 → un-sizable, deadline NOT yet reached
+  const aproj = path.join(p, "auth");
+  fs.mkdirSync(path.join(aproj, ".pi-supervisor", "runs", "run-1"), { recursive: true });
+  fs.writeFileSync(path.join(aproj, ".pi-supervisor", "node.json"), JSON.stringify({
+    v: 2, name: "auth", path: "auth", parent: "(root)", deadline: ISO(inMin(4)), state: "active", children: [],
+  }, null, 2));
+  fs.writeFileSync(path.join(aproj, ".pi-supervisor", "runs", "run-1", "pi-child-status.json"),
+    JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(4)) }));
+  registerChild(p, "auth", "auth", { parentPath: "(root)" });
+  const win = path.join(p, ".pi-supervisor", "runs", "run-1");
+  fs.mkdirSync(win, { recursive: true });
+  let outcome = null;
+  await reentry("(root)", p, "auth", win, CFG, () => {}, "done", (o) => { outcome = o; });
+  ok("T-RB un-sizable budget (deadline still in the FUTURE) → halt with the true reason",
+    outcome && outcome.next === "halted" && /cannot hold a re-entry window/.test(outcome.reason || "") && !/was reached/.test(outcome.reason || ""), outcome?.reason);
+}
+// ================= T-RB2 — the deadline-past branch keeps its (accurate) wording
+{
+  const p = mkproj("t-rb-past");
+  ensureRootNode(p, { deadline: ISO(inMin(-5)) });  // 5 min PAST the deadline
+  const aproj = path.join(p, "auth");
+  fs.mkdirSync(path.join(aproj, ".pi-supervisor", "runs", "run-1"), { recursive: true });
+  fs.writeFileSync(path.join(aproj, ".pi-supervisor", "node.json"), JSON.stringify({
+    v: 2, name: "auth", path: "auth", parent: "(root)", deadline: ISO(inMin(-5)), state: "active", children: [],
+  }, null, 2));
+  fs.writeFileSync(path.join(aproj, ".pi-supervisor", "runs", "run-1", "pi-child-status.json"),
+    JSON.stringify({ v: 2, at: ISO(Date.now() - 60000), status: "completed", exitReason: "completed-finalized", guardPid: deadPid(), deadlineIso: ISO(inMin(-5)) }));
+  registerChild(p, "auth", "auth", { parentPath: "(root)" });
+  const win = path.join(p, ".pi-supervisor", "runs", "run-1");
+  fs.mkdirSync(win, { recursive: true });
+  let outcome = null;
+  await reentry("(root)", p, "auth", win, CFG, () => {}, "done", (o) => { outcome = o; });
+  ok("T-RB2 past deadline → halt says the deadline was reached (3.2)",
+    outcome && outcome.next === "halted" && /deadline \(.*\) was reached \(3\.2\)/.test(outcome.reason || ""), outcome?.reason);
+}
 // ================= S4 — v2: standalone completion after move (no re-entry, idle, parent demoted to null)
 // The whole sub-tree is moved away; a window inside it completes. The registry
 // cannot resolve it → standalone: the project decides its own root, and its

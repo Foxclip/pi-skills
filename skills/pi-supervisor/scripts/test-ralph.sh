@@ -212,11 +212,26 @@ echo "done" > $T/projH/STATUS.md
 cat > $SD/pi-child-status.json <<EOF
 {"v":2,"at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","status":"completed","exitReason":"completed","guardPid":99997,"childPid":99996,"attempt":1,"rewinds":0,"toolCalls":5,"elapsedMs":1000,"deadlineIso":"$(date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%SZ)"}
 EOF
+# v0.35.19 (6.1/7.10): attach is DISPLAY-ONLY — the report box shows the
+# OWNER's report. This synthetic attach has no owner, so the fixture pre-writes
+# the owner's FINAL-REPORT.md (the exact text the pi-REPORT stub would write);
+# a real attach rides an owner terminal whose monitor wrote the file.
+cat > $SD/FINAL-REPORT.md <<'REP'
+# Final report — E2E stub
+## What was requested
+run the e2e case
+## What was done
+stub wrote this report
+## Outcome
+done
+## Remaining
+none
+REP
 cd $T/projH
 PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-REPORT ralph.sh $SD > $T/H.log 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && [ -f $SD/FINAL-REPORT.md ] && grep -q "E2E stub" $SD/FINAL-REPORT.md \
-  && ok "H: completed → FINAL-REPORT.md written, exit 0" || bad "H: rc=$RC $(tail -3 $T/H.log)"
+  && ok "H: completed → FINAL-REPORT.md present, exit 0" || bad "H: rc=$RC $(tail -3 $T/H.log)"
 grep -q "final report" $T/H.log && ok "H: ralph.sh printed the final report to the terminal" || bad "H: report not printed"
 grep -q '"code":0' $SD/monitor-exit.json 2>/dev/null && ok "H: monitor-exit.json records the monitor's own code=0 (v0.25.14)" || bad "H: monitor-exit.json missing: $(cat $SD/monitor-exit.json 2>/dev/null)"
 
@@ -232,9 +247,9 @@ grep -qE "monitor wait rc=0 \(mon_pid=[0-9]+, waited [0-9]+s\)" $RL 2>/dev/null 
 grep -q "exit rc=0 interrupted=0" $RL 2>/dev/null && grep -q "final: .*done · exit 0" $RL 2>/dev/null \
   && ok "O: ralph.log has exit + final lines" || bad "O: ralph.log exit/final: $(tail -3 $RL 2>/dev/null)"
 
-# ---- I: v0.20.0 — parent STOP → FINAL-REPORT.md + exit 4 ----------------------
-# (30s pre-check sleep first — status is fresh so pre-checks pass, then the
-#  STOP-stub judgment fires)
+# ---- I: v0.35.19 (6.1/7.10) — attach is read-only: a DEAD child ends the
+# ATTACH (exit 2 via the child-dead pre-check) with no judgment and no report —
+# STOP decisions and the final report belong to the OWNER's monitor (7.7).
 mkproj $T/projI
 SD=$T/projI/.pi-supervisor/runs/run1; mkdir -p $SD
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -244,9 +259,11 @@ EOF
 cd $T/projI
 PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-STOP ralph.sh $SD > $T/I.log 2>&1
 RC=$?
-[ "$RC" -eq 4 ] && [ -f $SD/FINAL-REPORT.md ] \
-  && ok "I: parent STOP → FINAL-REPORT.md, exit 4" || bad "I: rc=$RC $(tail -3 $T/I.log)"
-grep -q "decision=STOP" $SD/ralph-monitor.log 2>/dev/null && ok "I: decision=STOP logged" || bad "I: reason not in log"
+[ "$RC" -eq 2 ] \
+  && ok "I: attach rides a dead child → exit 2 (child-dead pre-check)" || bad "I: rc=$RC $(tail -3 $T/I.log)"
+grep -q "pre-check STOP: child-dead" $SD/ralph-monitor.log 2>/dev/null && ok "I: child-dead pre-check logged" || bad "I: reason not in log"
+[ ! -f $SD/FINAL-REPORT.md ] && [ ! -f $SD/FINAL-REPORT.monitor.md ] \
+  && ok "I: display-only attach wrote no report (6.1)" || bad "I: attach wrote a report"
 
 # ---- J: v0.20.0 — RUN-REPORT.md embeds the final report -----------------------
 cd $T/projH

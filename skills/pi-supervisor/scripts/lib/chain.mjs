@@ -735,14 +735,25 @@ export async function reentry(parentPath, projectDir, childPath, childWindowDir,
   }
   // 1.3/3.2: the run may not re-activate if its deadline is spent — the SAME
   // rule launchWindow applies (single source of truth).
-  const sized = sizeDeadline({ ts: new Date(dlMs), finalizeMin: Number(cfg.launch?.finalizeMin) || 10, now: new Date() });
+  const finMin = Number(cfg.launch?.finalizeMin) || 10;
+  const sized = sizeDeadline({ ts: new Date(dlMs), finalizeMin: finMin, now: new Date() });
   if (!sized.ok) {
     // v0.35.17 (7.8, run90 streak check): this reason string is human-facing
     // and IS PRINTED to the terminal (the launch notice, the final report's
     // halt context) — the terminal never shows ISO-8601. Local date+time here;
     // the machine-readable deadline stays ISO in the structured fields.
+    // v0.35.19 (run110, 3.2/7.8): the reason must be TRUE. run110's halt said
+    // "the deadline (12:38:05) was reached" at 12:30:38 — 7m27s BEFORE it.
+    // sizeDeadline also rejects when the REMAINING budget cannot hold a re-entry
+    // window (work time < 1min after the finalize reservation); the run ends
+    // now because re-entry can never be sized, not because the deadline
+    // passed. Two distinct facts, two distinct strings.
+    const dlLocal = new Date(dlMs).toLocaleString("en-CA", { hour12: false });
+    const why = Date.now() >= dlMs
+      ? `the run's deadline (${dlLocal}) was reached (3.2) before hand-back`
+      : `the run's remaining budget (${Math.max(0, Math.round((dlMs - Date.now()) / 60000))} min until ${dlLocal}) cannot hold a re-entry window — ${finMin} min is reserved for finalization (3.2)`;
     return haltBlocked(projectDir, parentPath, childWindowDir, log,
-      `child ${childPath} ended (${childState}); the run's deadline (${new Date(dlMs).toLocaleString("en-CA", { hour12: false })}) was reached (3.2) before hand-back — the run is over; the sub-run's report is on disk at ${childFinalDir}; start a fresh run (2.1) to continue`, done);
+      `child ${childPath} ended (${childState}); ${why} — the run is over; the sub-run's report is on disk at ${childFinalDir}; start a fresh run (2.1) to continue`, done);
   }
   // ok:true — the budget IS available here (the sizing gate above just
   // rejected the no-budget case); without it budgetLine() renders the

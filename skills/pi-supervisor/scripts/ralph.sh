@@ -797,7 +797,14 @@ if [ $# -ge 1 ]; then
     fi
   fi
   RALPH_MODE=attach   # the banner prints before the monitor starts
-  MONITOR_ARGS=(--run-dir "$RUN_DIR" "${ralph_flags[@]}" "${EXTRA[@]}")
+  # v0.35.19 (6.1/7.10): attach is DISPLAY — the monitor rides the tree and
+  # renders the view but never judges, nudges or writes final reports. The
+  # owning terminal's monitor supervises; 6.2 tears the run down with its
+  # owner, so an attach never becomes the de-facto supervisor. Pre-fix every
+  # attach started a FULL monitor: two attaches = 2× judgment LLM calls per
+  # cycle plus competing final reports (run110: 2 monitors on subrun84/run-1,
+  # two final reports, 451s of wasted judge time).
+  MONITOR_ARGS=(--run-dir "$RUN_DIR" --display-only "${ralph_flags[@]}" "${EXTRA[@]}")
   if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/node.json" ]; then
     SUBRUNS_ATTACH_TREE=1   # sub-runs project → the tree banner is the view
   fi

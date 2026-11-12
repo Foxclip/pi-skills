@@ -141,6 +141,12 @@ const rmArgs = (d, stub, extra = []) => [
 ];
 const runRm = (d, stub, extra = []) =>
   spawnSync(NODE, rmArgs(d, stub, extra), { encoding: "utf8", timeout: 60_000 });
+// v0.35.19: the OWNER monitor in full mode (report-writing path). ralph.sh's
+// attach is --display-only by design (6.1), so report/pause/halt-context
+// behavior is exercised at the monitor level, not through an attach.
+const runRmFull = (d, proj, stub, extra = []) =>
+  spawnSync(NODE, [path.join(HERE, "ralph-monitor.mjs"), "--run-dir", d, "--project-dir", proj, "--pi", stub, "--cycle-sec", "2", ...extra],
+    { encoding: "utf8", timeout: 90_000, env: { ...process.env, NO_COLOR: "1" } });
 const readLog = (d) => { try { return readFileSync(path.join(d, "ralph-monitor.log"), "utf8"); } catch { return ""; } };
 const readState = (d) => { try { return JSON.parse(readFileSync(path.join(d, "ralph-monitor-state.json"), "utf8")); } catch { return null; } };
 const waitMs = (ms) => spawnSync("sleep", [String(Math.ceil(ms / 1000))], { timeout: ms + 5000 });
@@ -761,8 +767,11 @@ const waitExit = (p, ms) => new Promise((resolve) => {
     `rc=${rc18} banner=${out.includes("┌ ralph")} relDl=${relDlOk} shortTs=${shortTsOk} epochLeak=${epochLeak} closer=${/done · exit/.test(out)} launch=${JSON.stringify(la)} fileFmt=${fileFmtOk} harvest=${harvestShortOk}(${hlines.length})`);
 }
 
-// R19 power-user attach: pre-check completed → exit 0, parent writes FINAL-REPORT.md,
-// ralph.sh prints it boxed
+// R19 power-user attach (v0.35.19, 6.1/7.10): attach is DISPLAY-ONLY — it
+// rides the tree and renders the view but never judges and never writes
+// final reports (the owning terminal's monitor supervises; 6.2 tears the run
+// down with its owner, so an attach is never the de-facto supervisor).
+// Completed pre-check → exit 0, NO report file, NO box.
 {
   const proj = path.join(root, "p19"); const rd = path.join(proj, "run1");
   mkdirSync(rd, { recursive: true });
@@ -775,9 +784,11 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   const rc19 = await waitExit(child, 25000);
   const out = readFileSync(logf, "utf8");
   const rep = existsSync(path.join(rd, "FINAL-REPORT.md")) ? readFileSync(path.join(rd, "FINAL-REPORT.md"), "utf8") : "";
-  report("R19 attach: completed pre-check → exit 0 + FINAL-REPORT.md + boxed in terminal",
-    rc19 === 0 && rep.length > 0 && out.includes("┌ final report (parent)") && out.includes("│ thinking about") && /done · exit 0/.test(out),
-    `rc=${rc19} report=${rep.length}B boxed=${out.includes("┌ final report (parent)")} closer=${/done · exit 0/.test(out)} outTail=${out.trim().split("\n").slice(-3).join(" | ").slice(0, 120)}`);
+  const mlog19 = readLog(rd);
+  report("R19 attach is display-only (6.1): completed pre-check → exit 0, no report, no box",
+    rc19 === 0 && rep === "" && !out.includes("┌ final report") && /done · exit 0/.test(out)
+    && mlog19.includes("final-report skipped (display-only"),
+    `rc=${rc19} noReport=${rep === ""} noBox=${!out.includes("┌ final report")} closer=${/done · exit 0/.test(out)} skipFlog=${mlog19.includes("final-report skipped (display-only")}`);
 
   // R20 pty → ANSI colors; NO_COLOR → plain
   const ttyLog = path.join(root, "r20.tty"), plainLog = path.join(root, "r20.plain");
@@ -795,11 +806,14 @@ const waitExit = (p, ms) => new Promise((resolve) => {
     `ttyEsc=${t.includes("\x1b[")} plainEsc=${pl.includes("\x1b[")} ttyBanner=${t.includes("┌ ralph")} plainBanner=${pl.includes("┌ ralph")} greenDone=${greenDone}`);
 }
 
-// R37 (v0.26.4): filename collision — since sub-runs the run dir is
-// child-writable and the child's own report may hold FINAL-REPORT.md (run30
-// re-entry, 2026-11-04: the parent's overwrite hit EACCES). The monitor must
-// fall back to FINAL-REPORT.monitor.md, leave the child's file intact, and
-// ralph.sh must print the parent box from the fallback file.
+// R37 (v0.26.4, re-targeted v0.35.19): filename collision — since sub-runs
+// the run dir is child-writable and the child's own report may hold
+// FINAL-REPORT.md (run30 re-entry, 2026-11-04: the parent's overwrite hit
+// EACCES). The OWNER monitor must fall back to FINAL-REPORT.monitor.md and
+// leave the child's file intact; ralph.sh must box the PARENT report (the
+// .monitor fallback preferred). Stage 1: owner monitor (full mode — attach
+// is display-only by 6.1, so report-writing is a monitor-level concern).
+// Stage 2: an attach boxes the parent report read-only.
 {
   const proj = path.join(root, "p34"); const rd = path.join(proj, "run1");
   mkdirSync(rd, { recursive: true });
@@ -811,18 +825,23 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   chmodSync(claimed, 0o444);
   writeFileSync(path.join(rd, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed", guardPid: 999999, childPid: 999999, attempt: 1, rewinds: 0, toolCalls: 5, elapsedMs: 1234, deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
   writeFileSync(path.join(rd, "pi-child-progress.log"), "tool line 1\n");
+  // stage 1: the owner monitor (full mode)
+  const r37 = runRmFull(rd, proj, STUB_OK);
+  const alt = path.join(rd, "FINAL-REPORT.monitor.md");
+  const altText = existsSync(alt) ? readFileSync(alt, "utf8") : "";
+  let claimedIntact = false;
+  try { claimedIntact = readFileSync(claimed, "utf8") === "# the child's own report\n"; } catch {}
+  // stage 2: the attach (display-only) boxes the PARENT report — the
+  // .monitor fallback preferred over the child's file
   const logf = path.join(root, "r37.log");
   const child = spawn("bash", [SBX_RALPH, rd], { cwd: proj, stdio: ["ignore", "ignore", openSync(logf, "w")],
     env: { ...process.env, PI: STUB_OK, NO_COLOR: "1" } });
   const rc37 = await waitExit(child, 25000);
   const out = readFileSync(logf, "utf8");
-  const alt = path.join(rd, "FINAL-REPORT.monitor.md");
-  const altText = existsSync(alt) ? readFileSync(alt, "utf8") : "";
-  let claimedIntact = false;
-  try { claimedIntact = readFileSync(claimed, "utf8") === "# the child's own report\n"; } catch {}
-  report("R37 attach: child-claimed FINAL-REPORT.md → parent falls back to FINAL-REPORT.monitor.md (printed, child file intact)",
-    rc37 === 0 && altText.length > 0 && claimedIntact && out.includes("┌ final report (parent)"),
-    `rc=${rc37} alt=${altText.length}B claimedIntact=${claimedIntact} boxed=${out.includes("┌ final report (parent)")}`);
+  report("R37 child-claimed FINAL-REPORT.md → owner writes FINAL-REPORT.monitor.md; attach boxes the parent report (v0.26.4)",
+    r37.status === 0 && altText.length > 0 && claimedIntact
+    && rc37 === 0 && out.includes("┌ final report (parent)") && !out.includes("the child's own report"),
+    `mon=${r37.status} alt=${altText.length}B claimedIntact=${claimedIntact} box=${out.includes("┌ final report (parent)")} noChildText=${!out.includes("the child's own report")}`);
   try { chmodSync(claimed, 0o644); } catch {}
 }
 
@@ -1780,19 +1799,22 @@ console.log("DECISION: OK");`);
   writeFileSync(path.join(rd, "pi-child-progress.log"), "tool line 1\n");
   const stubIso = mkStub("pi-iso-report.mjs", `
 console.log("child done at 2026-11-11T10:35:56.026Z — work spanned 10:21:56Z to 10:24:04Z");`);
+  // v0.35.19: stage 1 = owner monitor (full mode) writes the report file;
+  // stage 2 = attach (display-only) boxes it — the box is ralph.sh's view.
+  const r55a = runRmFull(rd, proj, stubIso);
+  const repF = [path.join(rd, "FINAL-REPORT.md"), path.join(rd, "FINAL-REPORT.monitor.md")]
+    .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
   const logf = path.join(root, "r55a.log");
   const child = spawn("bash", [SBX_RALPH, rd], { cwd: proj, stdio: ["ignore", "ignore", openSync(logf, "w")],
     env: { ...process.env, PI: stubIso, NO_COLOR: "1" } });
   const rc55 = await waitExit(child, 25000);
   const out55 = readFileSync(logf, "utf8");
-  const repF = [path.join(rd, "FINAL-REPORT.md"), path.join(rd, "FINAL-REPORT.monitor.md")]
-    .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
-  report("R55a final-report box: file keeps ISO, terminal shows localized", 
-    rc55 === 0 && repF.includes("2026-11-11T10:35:56.026Z") && repF.includes("10:21:56Z")
-    && out55.includes("┌ final report (parent)")
+  report("R55a final report: owner writes ISO file, attach box shows localized",
+    r55a.status === 0 && repF.includes("2026-11-11T10:35:56.026Z") && repF.includes("10:21:56Z")
+    && rc55 === 0 && out55.includes("┌ final report (parent)")
     && !isoFullRe.test(out55) && !isoBareRe.test(out55)
     && out55.includes(localFull) && out55.includes(localBare),
-    `rc=${rc55} fileIso=${repF.includes("2026-11-11T10:35:56.026Z")} boxed=${out55.includes("┌ final report (parent)")} termIso=${isoFullRe.test(out55) || isoBareRe.test(out55)} localFull=${out55.includes(localFull)} localBare=${out55.includes(localBare)} tail=${out55.trim().split("\n").slice(-4).join(" | ").slice(0, 160)}`);
+    `mon=${r55a.status} fileIso=${repF.includes("2026-11-11T10:35:56.026Z")} box=${out55.includes("┌ final report (parent)")} termIso=${isoFullRe.test(out55) || isoBareRe.test(out55)} localFull=${out55.includes(localFull)} localBare=${out55.includes(localBare)}`);
 
   // R55b: the judgment's reasoning (LLM prose) is displayed localized under the
   // tick line; the cycle-N-judgment.out file keeps ISO.
@@ -1827,22 +1849,21 @@ console.log("DECISION: OK");`);
   const stub56 = mkStub("pi-r56-report.mjs", `
 console.log("## Final report (R56)");
 console.log("run ended halted on a rejected spawn request.");`);
-  const logf56 = path.join(root, "r56.log");
-  const child56 = spawn("bash", [SBX_RALPH, rd56], { cwd: p56, stdio: ["ignore", "ignore", openSync(logf56, "w")],
-    env: { ...process.env, PI: stub56, NO_COLOR: "1" } });
-  const rc56 = await waitExit(child56, 25000);
-  const out56 = readFileSync(logf56, "utf8");
+  // v0.35.19: owner monitor in full mode — attach is display-only by 6.1,
+  // so the report/halt-context behavior is tested at the monitor level.
+  const r56 = runRmFull(rd56, p56, stub56);
+  const out56 = (r56.stdout || "") + (r56.stderr || "");
   const rep56 = [path.join(rd56, "FINAL-REPORT.md"), path.join(rd56, "FINAL-REPORT.monitor.md")]
     .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
   // the monitor's flog IS ralph-monitor.log (see flog() → logPath); there is
   // no separate .flog file
-  const flog56 = existsSync(path.join(rd56, "ralph-monitor.log")) ? readFileSync(path.join(rd56, "ralph-monitor.log"), "utf8") : "";
+  const flog56 = readLog(rd56);
   report("R56 rejected spawn request → run-end final report + halt context (no 10 s slot wait)",
-    rc56 === 0 && rep56.includes("Final report (R56)")
-    && out56.includes("┌ final report")
+    r56.status === 0 && rep56.includes("Final report (R56)")
+    && out56.includes("final report — asking parent to summarize")
     && flog56.includes("CHAIN HALT")
     && !out56.includes("hand-off slot not observed"),
-    `rc=${rc56} report=${rep56.includes("Final report (R56)")} boxed=${out56.includes("┌ final report")} haltCtx=${flog56.includes("CHAIN HALT")} polled=${out56.includes("hand-off slot not observed")} tail=${out56.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
+    `rc=${r56.status} report=${rep56.includes("Final report (R56)")} haltCtx=${flog56.includes("CHAIN HALT")} polled=${out56.includes("hand-off slot not observed")} tail=${out56.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
 
   // R56b (regression, run4 F4): a request the chain has NOT decided (no
   // spawn-decision.json) is still pending — pause path: no report, bounded
@@ -1854,17 +1875,15 @@ console.log("run ended halted on a rejected spawn request.");`);
   writeFileSync(path.join(rd56b, "spawn-request.json"), JSON.stringify({ kind: "spawn", node: "sub56b", task: "/tmp/sub56b-task.md", deadline: null, runtime_min: 10, reason: "test", at: new Date().toISOString() }));
   const stub56b = mkStub("pi-r56b-report.mjs", `
 console.log("SHOULD-NOT-BE-WRITTEN");`);
-  const logf56b = path.join(root, "r56b.log");
-  const child56b = spawn("bash", [SBX_RALPH, rd56b], { cwd: p56b, stdio: ["ignore", "ignore", openSync(logf56b, "w")],
-    env: { ...process.env, PI: stub56b, NO_COLOR: "1" } });
-  const rc56b = await waitExit(child56b, 25000);
-  const out56b = readFileSync(logf56b, "utf8");
+  // v0.35.19: owner monitor in full mode (attach is display-only by 6.1)
+  const r56b = runRmFull(rd56b, p56b, stub56b);
+  const out56b = (r56b.stdout || "") + (r56b.stderr || "");
   const rep56b = [path.join(rd56b, "FINAL-REPORT.md"), path.join(rd56b, "FINAL-REPORT.monitor.md")]
     .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
   report("R56b undecided request stays pending: pause path, bounded poll, no report",
-    rc56b === 0 && !rep56b.trim() && out56b.includes("hand-off slot not observed after 10 s")
-    && !out56b.includes("┌ final report"),
-    `rc=${rc56b} noReport=${!rep56b.trim()} polled=${out56b.includes("hand-off slot not observed after 10 s")} boxed=${out56b.includes("┌ final report")} tail=${out56b.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
+    r56b.status === 0 && !rep56b.trim() && out56b.includes("hand-off slot not observed after 10 s")
+    && !out56b.includes("final report — asking parent to summarize"),
+    `rc=${r56b.status} noReport=${!rep56b.trim()} polled=${out56b.includes("hand-off slot not observed after 10 s")} reportCall=${out56b.includes("final report — asking parent to summarize")} tail=${out56b.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
 
   // R57: v0.35.16 (run89, 7.7) — a CONSUMED spawn (decision ok, the spawned
   // window terminal, its own chain step done) is NOT pending: the launch
@@ -1886,20 +1905,18 @@ console.log("SHOULD-NOT-BE-WRITTEN");`);
   const stub57 = mkStub("pi-r57-report.mjs", `
 console.log("## Final report (R57)");
 console.log("run ended halted on a dead sub window.");`);
-  const logf57 = path.join(root, "r57.log");
-  const child57 = spawn("bash", [SBX_RALPH, rd57], { cwd: p57, stdio: ["ignore", "ignore", openSync(logf57, "w")],
-    env: { ...process.env, PI: stub57, NO_COLOR: "1" } });
-  const rc57 = await waitExit(child57, 25000);
-  const out57 = readFileSync(logf57, "utf8");
+  // v0.35.19: owner monitor in full mode (attach is display-only by 6.1)
+  const r57 = runRmFull(rd57, p57, stub57);
+  const out57 = (r57.stdout || "") + (r57.stderr || "");
   const rep57 = [path.join(rd57, "FINAL-REPORT.md"), path.join(rd57, "FINAL-REPORT.monitor.md")]
     .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
-  const flog57 = existsSync(path.join(rd57, "ralph-monitor.log")) ? readFileSync(path.join(rd57, "ralph-monitor.log"), "utf8") : "";
+  const flog57 = readLog(rd57);
   report("R57 consumed spawn (sub halted) → run report + sub halt context, no slot poll",
-    rc57 === 0 && rep57.includes("Final report (R57)")
-    && out57.includes("┌ final report")
+    r57.status === 0 && rep57.includes("Final report (R57)")
+    && out57.includes("final report — asking parent to summarize")
     && flog57.includes("CHAIN HALT") && flog57.includes("window ended error")
     && !out57.includes("hand-off slot not observed"),
-    `rc=${rc57} report=${rep57.includes("Final report (R57)")} boxed=${out57.includes("┌ final report")} haltCtx=${flog57.includes("window ended error")} polled=${out57.includes("hand-off slot not observed")} tail=${out57.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
+    `rc=${r57.status} report=${rep57.includes("Final report (R57)")} haltCtx=${flog57.includes("window ended error")} polled=${out57.includes("hand-off slot not observed")} tail=${out57.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
 
   // R57b (v0.35.16, 7.7): a CONSUMED clean completion (sub window completed,
   // chain re-entered — outcome next=spawned) is also not pending: the run's
@@ -1917,20 +1934,130 @@ console.log("run ended halted on a dead sub window.");`);
   const stub57b = mkStub("pi-r57b-report.mjs", `
 console.log("## Final report (R57b)");
 console.log("run ended after a clean sub completion.");`);
-  const logf57b = path.join(root, "r57b.log");
-  const child57b = spawn("bash", [SBX_RALPH, rd57b], { cwd: p57b, stdio: ["ignore", "ignore", openSync(logf57b, "w")],
-    env: { ...process.env, PI: stub57b, NO_COLOR: "1" } });
-  const rc57b = await waitExit(child57b, 25000);
-  const out57b = readFileSync(logf57b, "utf8");
+  // v0.35.19: owner monitor in full mode (attach is display-only by 6.1)
+  const r57b = runRmFull(rd57b, p57b, stub57b);
+  const out57b = (r57b.stdout || "") + (r57b.stderr || "");
   const rep57b = [path.join(rd57b, "FINAL-REPORT.md"), path.join(rd57b, "FINAL-REPORT.monitor.md")]
     .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
-  const flog57b = existsSync(path.join(rd57b, "ralph-monitor.log")) ? readFileSync(path.join(rd57b, "ralph-monitor.log"), "utf8") : "";
+  const flog57b = readLog(rd57b);
   report("R57b consumed spawn (sub completed) → run report at launch window, no halt context",
-    rc57b === 0 && rep57b.includes("Final report (R57b)")
-    && out57b.includes("┌ final report")
+    r57b.status === 0 && rep57b.includes("Final report (R57b)")
+    && out57b.includes("final report — asking parent to summarize")
     && !flog57b.includes("CHAIN HALT")
     && !out57b.includes("hand-off slot not observed"),
-    `rc=${rc57b} report=${rep57b.includes("Final report (R57b)")} boxed=${out57b.includes("┌ final report")} haltCtx=${flog57b.includes("CHAIN HALT")} polled=${out57b.includes("hand-off slot not observed")} tail=${out57b.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
+    `rc=${r57b.status} report=${rep57b.includes("Final report (R57b)")} haltCtx=${flog57b.includes("CHAIN HALT")} polled=${out57b.includes("hand-off slot not observed")} tail=${out57b.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
+}
+// ---- R58: v0.35.19 (run110, 4.9/7.7) — a FOLLOWED sub window that HALTS
+// must not take the RUN's final report with it. The monitor re-points to the
+// launch window, the report lands THERE (carrying the sub window's halt
+// context), and nothing report-shaped is left in the sub project. The slot is
+// deliberately left UNCLEARED (the chain's clearActiveSlots is best-effort —
+// a lost clear must not loop the monitor): the hand-back consumes the slot's
+// identity and the monitor re-finds the launch window's stop path instead of
+// re-following the dead sub window (hand-off exactly once, no ping-pong).
+{
+  const p58 = path.join(root, "p58");
+  const rd58 = path.join(p58, ".pi-supervisor", "runs", "run1");
+  const subP58 = path.join(root, "subp58");
+  const sub58 = path.join(subP58, ".pi-supervisor", "runs", "run-1");
+  mkdirSync(rd58, { recursive: true }); mkdirSync(sub58, { recursive: true });
+  writeFileSync(path.join(p58, "TASK.md"), "# T58");
+  // launch window: child terminal (it spawned the sub), request + ok decision
+  writeFileSync(path.join(rd58, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "completed", exitReason: "completed-finalized", guardPid: null, childPid: null, attempt: 1, rewinds: 0, toolCalls: 8, lastTool: "bash", elapsedMs: 3600000, sessionId: "r58-root" }));
+  writeFileSync(path.join(rd58, "spawn-request.json"), JSON.stringify({ kind: "spawn", node: "sub58", task: "/tmp/sub58.md", runtime_min: 30, deadline: null, reason: "test", at: new Date().toISOString() }));
+  writeFileSync(path.join(rd58, "spawn-decision.json"), JSON.stringify({ ok: true, node: "sub58", node_path: "sub58", window: "run-1", run_dir: sub58, deadline: null, at: new Date().toISOString() }));
+  // sub window: child RUNNING at arrival (the stub flips it on the judgment call)
+  writeFileSync(path.join(sub58, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "running", guardPid: process.pid, childPid: process.pid + 1, attempt: 1, rewinds: 0, toolCalls: 3, lastTool: "bash", elapsedMs: 1000, sessionId: "sub58" }));
+  // the guard's hand-off slot points at the sub window; started BEFORE the
+  // launch window's terminal so that terminal is not slot-stale
+  writeFileSync(path.join(p58, ".pi-supervisor", "active.json"), JSON.stringify({ node: "sub58", window: "run-1", run_dir: sub58, started_at: new Date(Date.now() - 120000).toISOString(), deadline: new Date(Date.now() + 3600e3).toISOString() }));
+  // the judgment call (call 1) also arranges a LATE rewrite of the launch
+  // window's status (a detached 1.5s writer) — that is what a re-entry child
+  // does (writes fresh state into the window); the launch window's terminal is
+  // the stop trigger either way (no childPgid in these fakes → no stale
+  // instance marker can hold the stop).
+  const lateRewrite = `setTimeout(() => { const fs = require('fs'); fs.writeFileSync(${JSON.stringify(rd58 + "/pi-child-status.json")}, JSON.stringify({ v: 2, at: new Date().toISOString(), status: 'completed', exitReason: 'completed-finalized', guardPid: null, childPid: null, attempt: 2, rewinds: 0, toolCalls: 8, lastTool: 'bash', elapsedMs: 3700000, sessionId: 'r58-reentry' })); }, 1500);`;
+  const stub58 = mkStub("pi-r58.mjs", `
+import { writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+const p = process.argv[process.argv.length - 1];
+const sub = ${JSON.stringify(sub58)};
+if (p.includes("final report writer")) {
+  console.log("## Final report (R58)");
+  console.log("R58-REPORT-MARKER: the run's final report, written at the launch window.");
+} else {
+  const at = new Date().toISOString();
+  writeFileSync(sub + "/pi-child-status.json", JSON.stringify({ v: 2, at, status: "completed", exitReason: "stuck", guardPid: null, childPid: null, attempt: 3, rewinds: 0, toolCalls: 41, lastTool: "bash", elapsedMs: 600000, sessionId: "sub58" }));
+  writeFileSync(sub + "/chain-done.json", JSON.stringify({ v: 1, at, kind: "blocked", outcome: { next: "halted", reason: "the run's remaining budget cannot hold a re-entry window (3.2)" } }));
+  writeFileSync(sub + "/chain-halt.json", JSON.stringify({ v: 1, at, kind: "blocked", node: "sub58", reason: "the run's remaining budget (4 min) cannot hold a re-entry window — 5 min is reserved for finalization (3.2)", window: "run-1" }));
+  spawn(process.execPath, ["-e", ${JSON.stringify(lateRewrite)}], { detached: true, stdio: "ignore" }).unref();
+  console.log("DECISION: OK");
+}
+`);
+  const r58 = runRm(rd58, stub58, ["--project-dir", p58, "--cycle-sec", "2"]);
+  const log58 = readLog(rd58);
+  const subLog58 = readLog(sub58);   // the hand-off flog line lands in the FOLLOWED window's log (logPath re-points first)
+  const rep58 = existsSync(path.join(rd58, "FINAL-REPORT.md")) ? readFileSync(path.join(rd58, "FINAL-REPORT.md"), "utf8") : "";
+  // one follow event = TWO flog lines (glog() also flogs; followSlot then flogs
+  // again) — so "exactly one hand-off" reads as ≤ 2 lines; the guard line in
+  // the launch window's log proves the stale slot was refused.
+  const handoffLines = (subLog58.match(/handoff: run1 → run-1/g) || []).length;
+  const staleGuard = log58.includes("stale slot consumed by hand-back");
+  report("R58 followed sub halts → RUN report at the LAUNCH window, sub project stays clean (4.9/7.7)",
+    r58.status === 0
+    && rep58.includes("R58-REPORT-MARKER")
+    && !existsSync(path.join(sub58, "FINAL-REPORT.md")) && !existsSync(path.join(sub58, "FINAL-REPORT.monitor.md"))
+    && handoffLines <= 2 && staleGuard
+    && /hand-back: run-1 → run1/.test(log58) && /CHAIN HALT/.test(log58),
+    `exit=${r58.status} report=${rep58.includes("R58-REPORT-MARKER")} subClean=${!existsSync(path.join(sub58, "FINAL-REPORT.md"))} handoffLines=${handoffLines} staleGuard=${staleGuard} handback=${/hand-back: run-1 → run1/.test(log58)} haltCtx=${/CHAIN HALT/.test(log58)}`);
+}
+// ---- R59: v0.35.19 (run108/run110, 7.7) — the judge process dies (here:
+// hangs past --final-timeout-sec AFTER streaming the complete report) — the
+// captured text is SALVAGED to disk instead of discarded. A salvaged report
+// beats no report; the flog says so honestly.
+{
+  const d = runDir("r59");
+  mkStatus(d, { status: "completed", exitReason: "completed-finalized", guardPid: null, toolCalls: 55 });
+  const stub59 = mkStub("pi-r59.mjs", `
+import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(path.join(root, "r59-calls.log"))}, "REPORT\\n");
+console.log("## Final report (R59)");
+console.log("R59-SALVAGE-MARKER: the full report text, streamed before the kill.");
+setTimeout(() => {}, 30000);  // hang past --final-timeout-sec, like the real model does after the report
+`);
+  const r59 = runRm(d, stub59, ["--once", "--final-timeout-sec", "2"]);
+  const rep59 = existsSync(path.join(d, "FINAL-REPORT.md")) ? readFileSync(path.join(d, "FINAL-REPORT.md"), "utf8") : "";
+  const log59 = readLog(d);
+  report("R59 report killed mid-hang → SALVAGED to disk (7.7)",
+    r59.status === 0 && rep59.includes("R59-SALVAGE-MARKER") && /SALVAGED/.test(log59) && /outcome=salvaged/.test(log59),
+    `exit=${r59.status} salvaged=${rep59.includes("R59-SALVAGE-MARKER")} log=${/outcome=salvaged/.test(log59)}`);
+}
+// ---- R60: v0.35.19 (6.1/7.10) — --display-only (attach monitors): rides the
+// window, renders the view, but NEVER judges, nudges, writes state, or writes
+// final reports. The child stays untouched; the monitor is signal-stopped at
+// the end (it would run while the child runs).
+{
+  const d = runDir("r60");
+  mkStatus(d);  // running, live guard
+  const marker60 = path.join(root, "r60-inv.log");
+  const stub60 = mkStub("pi-r60.mjs", `
+import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(marker60)}, "CALLED\\n");
+console.log("DECISION: OK");`);
+  const c60 = spawn(NODE, [path.join(HERE, "ralph-monitor.mjs"), "--run-dir", d, "--pi", stub60, "--cycle-sec", "2", "--display-only"], { stdio: ["ignore", "pipe", "pipe"] });
+  const so60 = spawnSync("sleep", ["6"]);
+  try { c60.kill("SIGTERM"); } catch { /* already gone */ }
+  try { c60.kill("SIGKILL"); } catch { /* already gone */ }
+  c60.removeAllListeners();
+  const log60 = readLog(d);
+  const st60 = readState(d);
+  report("R60 --display-only: rides the window, never judges, no state, no report (6.1/7.10)",
+    /display-only: judgment skipped/.test(log60)
+    && !existsSync(marker60)
+    && !existsSync(path.join(d, "FINAL-REPORT.md")) && !existsSync(path.join(d, "FINAL-REPORT.monitor.md"))
+    && (st60 === null || st60.cycles === 0),
+    `skips=${(log60.match(/display-only: judgment skipped/g) || []).length} judged=${existsSync(marker60)} state=${st60 ? st60.cycles : "none"}`);
+  void so60;
 }
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
