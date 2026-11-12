@@ -797,7 +797,7 @@ if [ $# -ge 1 ]; then
     fi
   fi
   RALPH_MODE=attach   # the banner prints before the monitor starts
-  # v0.35.19 (6.1/7.10): attach is DISPLAY — the monitor rides the tree and
+  # v0.35.19 (6.1/7.11): attach is DISPLAY — the monitor rides the tree and
   # renders the view but never judges, nudges or writes final reports. The
   # owning terminal's monitor supervises; 6.2 tears the run down with its
   # owner, so an attach never becomes the de-facto supervisor. Pre-fix every
@@ -1135,13 +1135,11 @@ FR="$RUN_DIR/FINAL-REPORT.md"
 [ -f "$RUN_DIR/FINAL-REPORT.monitor.md" ] && FR="$RUN_DIR/FINAL-REPORT.monitor.md"
 if [ -f "$FR" ]; then
   printf '%s┌ final report (parent)%s %s\n' "$C_B" "$C_N" "$(rule)" >&2
-  # v0.35.14 (7.8): the report is LLM prose and quotes the UTC timestamps it
-  # read from status files — display-localize them (files keep the ISO).
-  # Helper failure must never eat the box: fall back to the raw file.
-  _loc="$RUN_DIR/.final-report-localized.tmp"
-  node "$HERE/lib/iso-localize.mjs" < "$FR" > "$_loc" 2>/dev/null || cat "$FR" > "$_loc"
-  while IFS= read -r line; do printf '│ %s\n' "$line" >&2; done < "$_loc"
-  rm -f "$_loc"
+  # v0.35.20 (7.9): the report is AGENT text — displayed VERBATIM. (v0.35.14
+  # display-localized the UTC timestamps it quotes; the re-specified 7.8 local-
+  # time rule covers monitor messages only, and 7.9 forbids manipulating
+  # agent messages shown in the terminal.)
+  while IFS= read -r line; do printf '│ %s\n' "$line" >&2; done < "$FR"
   printf '└%s\n' "$(rule)" >&2
 fi
 exit $rc

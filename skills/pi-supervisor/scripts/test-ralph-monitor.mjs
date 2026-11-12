@@ -1774,24 +1774,15 @@ console.log("DECISION: OK");`);
     watched && handedOff && rePointed && markerSet && deferCount < 30 && beat0 && reEntryCall && !earlyStop && markerCleared && !subReport && exited === 0 && launchReport,
     `watched=${watched} handoff=${handedOff} back=${rePointed} marker=${markerSet} deferCount=${deferCount} beat0=${beat0} reEntry3=${reEntryCall} earlyStop=${earlyStop} cleared=${markerCleared} subReport=${subReport} exit=${exited} launchReport=${launchReport}`);
 }
-// R55 (v0.35.14, 7.8): ISO-8601 (UTC) must never reach the terminal — it
-// belongs in files. LLM prose quotes the UTC timestamps it read from status
-// data; the two display paths (ralph.sh final-report box, monitor tick
-// detail/reasoning) localize it, while the files keep ISO.
+// R55 (v0.35.20, 7.9): agent text displayed in the terminal must be
+// VERBATIM — the two agent-text display paths (ralph.sh final-report box,
+// monitor judgment detail/reasoning) show the LLM's text exactly as written,
+// even when it quotes ISO-8601 (UTC) timestamps. (v0.35.14–v0.35.19 display-
+// localized them; the re-specified 7.8 local-time rule covers MONITOR
+// messages only, and 7.9 forbids manipulating agent messages.)
 {
-  const p2 = (n) => String(n).padStart(2, "0");
-  const dFull = new Date("2026-11-11T10:35:56.026Z");
-  const localFull = `${dFull.getFullYear()}-${p2(dFull.getMonth() + 1)}-${p2(dFull.getDate())} ${p2(dFull.getHours())}:${p2(dFull.getMinutes())}:${p2(dFull.getSeconds())}`;
-  const nowU = new Date();
-  const dBare = new Date(Date.UTC(nowU.getUTCFullYear(), nowU.getUTCMonth(), nowU.getUTCDate(), 10, 21, 56));
-  const localBare = `[${p2(dBare.getHours())}:${p2(dBare.getMinutes())}:${p2(dBare.getSeconds())}]`;
-  const dDl = new Date("2026-11-11T10:40:00.000Z");
-  const localDl = `${dDl.getFullYear()}-${p2(dDl.getMonth() + 1)}-${p2(dDl.getDate())} ${p2(dDl.getHours())}:${p2(dDl.getMinutes())}:${p2(dDl.getSeconds())}`;
-  const isoFullRe = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/;
-  const isoBareRe = /\b[01]?\d:[0-5]\d:[0-5]\dZ\b/;
-
   // R55a: the final report (LLM prose with both ISO forms) is written to the
-  // file AS-IS and printed boxed to the terminal LOCALIZED.
+  // file AS-IS and printed boxed to the terminal VERBATIM.
   const proj = path.join(root, "p55a"); const rd = path.join(proj, "run1");
   mkdirSync(rd, { recursive: true });
   writeFileSync(path.join(proj, "TASK.md"), "# T55a");
@@ -1809,15 +1800,14 @@ console.log("child done at 2026-11-11T10:35:56.026Z — work spanned 10:21:56Z t
     env: { ...process.env, PI: stubIso, NO_COLOR: "1" } });
   const rc55 = await waitExit(child, 25000);
   const out55 = readFileSync(logf, "utf8");
-  report("R55a final report: owner writes ISO file, attach box shows localized",
+  report("R55a final report: owner writes ISO file, attach box shows it VERBATIM (7.9)",
     r55a.status === 0 && repF.includes("2026-11-11T10:35:56.026Z") && repF.includes("10:21:56Z")
     && rc55 === 0 && out55.includes("┌ final report (parent)")
-    && !isoFullRe.test(out55) && !isoBareRe.test(out55)
-    && out55.includes(localFull) && out55.includes(localBare),
-    `mon=${r55a.status} fileIso=${repF.includes("2026-11-11T10:35:56.026Z")} box=${out55.includes("┌ final report (parent)")} termIso=${isoFullRe.test(out55) || isoBareRe.test(out55)} localFull=${out55.includes(localFull)} localBare=${out55.includes(localBare)}`);
+    && out55.includes("2026-11-11T10:35:56.026Z") && out55.includes("10:21:56Z"),
+    `mon=${r55a.status} fileIso=${repF.includes("2026-11-11T10:35:56.026Z")} box=${out55.includes("┌ final report (parent)")} boxVerbatim=${out55.includes("2026-11-11T10:35:56.026Z") && out55.includes("10:21:56Z")}`);
 
-  // R55b: the judgment's reasoning (LLM prose) is displayed localized under the
-  // tick line; the cycle-N-judgment.out file keeps ISO.
+  // R55b: the judgment's detail/reasoning (LLM prose) are displayed VERBATIM
+  // under the tick line; the cycle-N-judgment.out file keeps ISO.
   const d55 = runDir("r55b");
   mkStatus(d55, { status: "running" });
   writeFileSync(path.join(d55, "pi-child-progress.log"), "tool line 1\n");
@@ -1827,12 +1817,12 @@ console.log("DECISION: OK");`);
   const r55 = runRm(d55, stubJudge, ["--once"]);
   const outJ = (r55.stdout || "") + (r55.stderr || "");
   const jOut = existsSync(path.join(d55, "llm", "cycle-1-judgment.out")) ? readFileSync(path.join(d55, "llm", "cycle-1-judgment.out"), "utf8") : "";
-  report("R55b judgment reasoning displayed localized; judgment file keeps ISO",
+  const reasoningLine = "child last tool at 10:21:56Z; deadline 2026-11-11T10:40:00.000Z approaches";
+  report("R55b judgment reasoning displayed VERBATIM (7.9); judgment file keeps ISO",
     r55.status === 0 && outJ.includes("cycle 1 · OK")
-    && !isoFullRe.test(outJ) && !isoBareRe.test(outJ)
-    && outJ.includes(localBare) && outJ.includes(localDl)
+    && outJ.includes(reasoningLine)
     && jOut.includes("10:21:56Z") && jOut.includes("2026-11-11T10:40:00.000Z"),
-    `rc=${r55.status} tick=${outJ.includes("cycle 1 · OK")} termIso=${isoFullRe.test(outJ) || isoBareRe.test(outJ)} localBare=${outJ.includes(localBare)} localDl=${outJ.includes(localDl)} fileIso=${jOut.includes("10:21:56Z") && jOut.includes("2026-11-11T10:40:00.000Z")} out=${outJ.trim().split("\n").slice(-6).join(" | ").slice(0, 200)}`);
+    `rc=${r55.status} tick=${outJ.includes("cycle 1 · OK")} verbatim=${outJ.includes(reasoningLine)} fileIso=${jOut.includes("10:21:56Z") && jOut.includes("2026-11-11T10:40:00.000Z")} out=${outJ.trim().split("\n").slice(-6).join(" | ").slice(0, 200)}`);
 
   // R56: v0.35.15 (run88, 7.7) — a REJECTED spawn request is not "pending":
   // the chain has decided (spawn-decision.json ok:false), no hand-off slot

@@ -60,7 +60,6 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseDeadline } from "./lib/deadline.mjs";
 import { renderTree } from "./lib/node.mjs";
-import { localizeUtcInText } from "./lib/iso-localize.mjs"; // v0.35.14 (7.8) display-only
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NODE = process.execPath;
@@ -173,10 +172,13 @@ const glog = (glyph, color, line) => {
 };
 const tick = (n, verdict, detail, reasoning) => {
   const sym = verdict === "OK" ? `${C(32)}✓${C(0)}` : verdict === "NUDGE" ? `${C(33)}→${C(0)}` : `${C(31)}✗${C(0)}`;
-  // v0.35.14 (7.8): detail/reasoning are LLM prose (the judge reads UTC status
-  // data and may quote it) — localize for display; the judgment .out files keep ISO.
-  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${sym} ${C(1)}cycle ${n} · ${verdict}${C(0)}${detail ? " — " + localizeUtcInText(detail) : ""}`);
-  for (const line of (reasoning || "").split("\n")) tlog(`${C(2)}    ${localizeUtcInText(line)}${C(0)}`);
+  // v0.35.20 (7.9): the verdict detail/reasoning are AGENT text (the judge's
+  // turn) — displayed VERBATIM, even when they quote UTC timestamps. The
+  // re-specified 7.8 local-time rule covers monitor messages only; 7.9
+  // forbids manipulating agent messages in the terminal. (v0.35.14 localized
+  // them — removed.)
+  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${sym} ${C(1)}cycle ${n} · ${verdict}${C(0)}${detail ? " — " + detail : ""}`);
+  for (const line of (reasoning || "").split("\n")) tlog(`${C(2)}    ${line}${C(0)}`);
 };
 // "in progress" indicator (terminal only — the log file's format is unchanged):
 // a parent LLM call can take a while, and without this the terminal looks frozen
@@ -1013,7 +1015,7 @@ async function stopLoop(pc, trigger = null) {
     // The write-below stays as the fallback when no re-point is possible.
     if (followedSub && (followSlot() || handBackToLaunch())) return;
     if (A.displayOnly) {
-      // v0.35.19 (6.1/7.10): attach monitors are display — the owning
+      // v0.35.19 (6.1/7.11): attach monitors are display — the owning
       // terminal's monitor writes the report; 6.2 tears the run down with its
       // owner, so an attach never becomes the de-facto supervisor.
       flog(`final-report skipped (display-only attach, 6.1): reason=${JSON.stringify(pc.reason)}`);
@@ -1218,12 +1220,12 @@ for (;;) {
     continue;
   }
   if (A.displayOnly) {
-    // v0.35.19 (6.1/7.10): attach monitors are display-only — they render the
+    // v0.35.19 (6.1/7.11): attach monitors are display-only — they render the
     // view and ride the hand-offs, but never judge: the owning terminal's
     // monitor is the supervisor (6.2 tears the run down with its owner, so an
     // attach never becomes de-facto owner). No LLM call, no state advance —
     // the state file is SHARED with the owner's monitor on this window.
-    flog(`display-only: judgment skipped (attach, 6.1/7.10) child=${status ? status.status : "?"}`);
+    flog(`display-only: judgment skipped (attach, 6.1/7.11) child=${status ? status.status : "?"}`);
     lastJudgment = nowMs;
     continue;
   }
