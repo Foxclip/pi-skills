@@ -64,10 +64,11 @@
 - **7.5 Judgment.** One Judge verdict per cycle: the last message of the Judge's turn.
 - **7.6 Handoff and Reentry.** When the active run changes (a handoff to a sub-project, or a re-entry to the parent): a divider and tree banner, and the view re-points to the new run.
 - **7.7 The end.** The final report, printed to the terminal when the run ends.
-- **7.8 Local time.** All displayed time is **local time**, never ISO: each line carries a short local `[HH:MM:SS]`, and the deadline is shown as a local date and time. ISO-8601 (UTC) appears only in the files, not the terminal.
-- **7.9 Append-only; the terminal is for humans, the files for machines.** One line at a time — no redraw, no in-place updates, no cursor control; the output can be piped, tailed, or scrolled back. Color only when the terminal is a TTY, stripped when `NO_COLOR` is set. The terminal's format is free to change for readability; the machine contract lives in the files, not the terminal.
-- **7.10 Read-only.** The display never drives: nothing the terminal shows can change the run, and the only thing a terminal does to the run is **Ctrl-C**. 
-- **7.11 Shared.** Any number of terminals may attach; each shows the same view of the active run, and the death of any of them is irrelevant.
+- **7.8 Local time.** All displayed time is **local time**, never ISO: each line carries a short local `[HH:MM:SS]`, and the deadline is shown as a local date and time. ISO-8601 (UTC) appears only in the files, not the terminal. This applies only to Monitor messages, not agent messages.
+- **7.9 Message manipulation.** Text of any agent messages displayed in the terminal **must not be manipulated or replaced** unless specifically required by the Spec.
+- **7.10 Append-only; the terminal is for humans, the files for machines.** One line at a time — no redraw, no in-place updates, no cursor control; the output can be piped, tailed, or scrolled back. Color only when the terminal is a TTY, stripped when `NO_COLOR` is set. The terminal's format is free to change for readability; the machine contract lives in the files, not the terminal.
+- **7.11 Read-only.** The display never drives: nothing the terminal shows can change the run, and the only thing a terminal does to the run is **Ctrl-C**. 
+- **7.12 Shared.** Any number of terminals may attach; each shows the same view of the active run, and the death of any of them is irrelevant.
 
 ## 8. Durability
 - **8.1** Everything important is on disk and resumable: transcripts, state, reports, the tree.
