@@ -399,12 +399,17 @@ export function allocWindowIn(runsDir) {
 /**
  * A window is LIVE when its pi-child-status.json names a guard pid that is
  * still running. Returns { window, dir, guardPid, status } | null.
+ * ignorePids — pids never to count as liveness. The chain step's own guard is
+ * still alive while it runs the step, and it is the very pid in the
+ * just-ended window's status file — without the ignore, the terminal's own
+ * post-transition tree.json stayed live:true (v0.35.21, TestProject2 run124).
  */
-export function liveWindowIn(dir) {
+export function liveWindowIn(dir, ignorePids = null) {
   for (const w of listWindows(dir)) {
     const wdir = path.join(dir, w);
     const st = readJson(path.join(wdir, "pi-child-status.json"));
-    if (st && st.guardPid != null && pidAlive(st.guardPid)) {
+    if (st && st.guardPid != null && pidAlive(st.guardPid)
+      && !(ignorePids && ignorePids.includes(st.guardPid))) {
       return { window: w, dir: wdir, guardPid: st.guardPid, status: st };
     }
   }
@@ -478,7 +483,7 @@ export function windowBudget({ nodeDeadline = null, runtimeMin = null, now = new
  * "active"); otherwise the persistent node.json state (paused(waiting:…)|
  * done|deadline-expired|stopped|blocked|active).
  */
-export function nodeState(rootProject, nodePath) {
+export function nodeState(rootProject, nodePath, { ignorePids = null } = {}) {
   const full = nodePath || ROOT;
   const { dir, entry } = projectOfNode(rootProject, full);
   if (!dir) {
@@ -499,7 +504,7 @@ export function nodeState(rootProject, nodePath) {
   }
   const runs = path.join(supRoot(dir), "runs");
   const nj = readJson(supNodePath(dir));
-  const live = liveWindowIn(runs);
+  const live = liveWindowIn(runs, ignorePids);
   let state;
   if (live) state = "active";
   else if (nj && nj.state) state = nj.state;
@@ -525,12 +530,12 @@ export function nodeState(rootProject, nodePath) {
 // Nested tree for the terminal banner: { path, name, state, deadline, live,
 // windows, children: [...] } — children ordered as bookkept in the node's
 // registry; a stale entry renders as a DETACHED node (computed live).
-export function deriveTree(rootProject, nodePath = ROOT) {
-  return deriveNode(rootProject, nodePath);
+export function deriveTree(rootProject, nodePath = ROOT, opts = {}) {
+  return deriveNode(rootProject, nodePath, opts);
 }
 
-function deriveNode(rootProject, nodePath) {
-  const s = nodeState(rootProject, nodePath);
+function deriveNode(rootProject, nodePath, opts = {}) {
+  const s = nodeState(rootProject, nodePath, opts);
   return {
     path: s.nodePath,
     name: s.name,
@@ -540,7 +545,7 @@ function deriveNode(rootProject, nodePath) {
     windows: s.windows.length,
     stale: s.stale,
     detached: s.detached,
-    children: s.childrenEntries.map((c) => deriveNode(rootProject, nodePath === ROOT ? c.name : `${nodePath}/${c.name}`)),
+    children: s.childrenEntries.map((c) => deriveNode(rootProject, nodePath === ROOT ? c.name : `${nodePath}/${c.name}`, opts)),
   };
 }
 
@@ -653,9 +658,9 @@ export function renderTree(projectDir, { now = new Date() } = {}) {
 // run dir's own on-disk fact, refreshed by the chain step after every
 // transition and by ralph.sh at launch. Best-effort: a failed snapshot never
 // breaks the step.
-export function writeTreeSnapshots(rootProject, { now = new Date() } = {}) {
+export function writeTreeSnapshots(rootProject, { now = new Date(), ignorePids = null } = {}) {
   let tree;
-  try { tree = deriveTree(rootProject); } catch { return 0; }
+  try { tree = deriveTree(rootProject, ROOT, { ignorePids }); } catch { return 0; }
   const flat = [];
   const walk = (n) => { flat.push(n); for (const c of n.children) walk(c); };
   walk(tree);

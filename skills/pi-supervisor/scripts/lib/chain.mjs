@@ -448,7 +448,16 @@ export async function step(projectDir, windowDir, cfg = {}) {
   // in chain.log instead of invisible.
   const snapshot = (root) => {
     try {
-      const n = writeTreeSnapshots(root);
+      // v0.35.21 (run124): this step's own guard is alive while it runs the
+      // step — it is the very pid in the window's status file, so ignore it:
+      // otherwise the just-ended window's terminal snapshot stayed live:true
+      // (and state forced "active") on a fully finished run.
+      let ignorePids = null;
+      try {
+        const st = JSON.parse(fs.readFileSync(path.join(windowDir, "pi-child-status.json"), "utf8"));
+        if (st?.guardPid != null) ignorePids = [st.guardPid];
+      } catch { /* no status file — nothing to ignore */ }
+      const n = writeTreeSnapshots(root, { ignorePids });
       if (n === 0) clog(projectDir, windowDir, "8.1.2 tree.json snapshot: 0 run dirs (tree derive failed?)");
     } catch (e) {
       clog(projectDir, windowDir, `8.1.2 tree.json snapshot failed: ${e.message}`);

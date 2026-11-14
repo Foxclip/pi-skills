@@ -10,7 +10,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -1021,6 +1021,42 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T29 snapshot is fresh (< 5 min old)", tj && Date.now() - new Date(tj.at).getTime() < 5 * 60000, tj && tj.at);
   ok("T29 root node present with post-transition state done",
     tj?.nodes?.find((n) => n.path === "(root)")?.state === "done", JSON.stringify(tj?.nodes));
+}
+
+// ============ T30 — v0.35.21 (8.1.2): the step's own guard (alive while it
+// runs the step) must not make the just-ended window look live in the
+// post-transition tree.json. Regression: TestProject2 run124 — the final
+// root snapshot stayed live:true / state active because the step's guard
+// read its own alive pid from the window's pi-child-status.json.
+{
+  const p = mkproj("t30-own-guard");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
+  const self = spawn(process.execPath, ["-e", "setTimeout(()=>{},120000)"], { stdio: "ignore" });
+  self.unref();
+  const w = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized", guardPid: self.pid });
+  const r = await step(p, w, CFG);
+  ok("T30 step completed", r.kind === "completed", JSON.stringify(r));
+  const tj = readJsonFile(path.join(w, "tree.json"));
+  const rootN = tj?.nodes?.find((n) => n.path === "(root)");
+  ok("T30 root not live in own terminal snapshot (own guard ignored)", rootN?.live == null, JSON.stringify(rootN));
+  ok("T30 root state done (not forced active)", rootN?.state === "done", JSON.stringify(rootN));
+  try { process.kill(self.pid, "SIGKILL"); } catch { /* gone */ }
+}
+// T30b — a DIFFERENT window with a genuinely live guard still counts as live.
+{
+  const p = mkproj("t30b-other-live");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
+  const other = spawn(process.execPath, ["-e", "setTimeout(()=>{},120000)"], { stdio: "ignore" });
+  other.unref();
+  mkWindow(p, "run-2", { status: "active", guardPid: other.pid });
+  const w = mkWindow(p, "run-3", { status: "completed", exitReason: "completed-finalized" });
+  const r = await step(p, w, CFG);
+  ok("T30b step completed", r.kind === "completed", JSON.stringify(r));
+  const tj = readJsonFile(path.join(w, "tree.json"));
+  const rootN = tj?.nodes?.find((n) => n.path === "(root)");
+  ok("T30b other live window still reported", rootN?.live === "run-2", JSON.stringify(rootN));
+  ok("T30b root active while another window is live", rootN?.state === "active", JSON.stringify(rootN));
+  try { process.kill(other.pid, "SIGKILL"); } catch { /* gone */ }
 }
 
 // ---------- summary ----------
