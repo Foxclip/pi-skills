@@ -3,7 +3,8 @@
 - Goal is fixing problems in pi-supervisor.
 - Problems are:
     1. Bugs
-    2. Spec deviations (Spec is in SPEC.md file)
+    2. Unexpected crashes
+    3. Spec deviations (Spec is in SPEC.md file)
 
 # Previous attempts
 
