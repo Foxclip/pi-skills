@@ -1003,6 +1003,26 @@ const active = (proj) => { try { return JSON.parse(fs.readFileSync(activePath(pr
   ok("T28 halt marker written", fs.existsSync(path.join(aw, "chain-halt.json")));
 }
 
+// ============ T29 — v0.35.15 (8.1.2/9.1): the chain step refreshes tree.json
+// Regression: writeTreeSnapshots was used in step() without an import — the
+// try/catch swallowed a ReferenceError on every transition and chain-step
+// snapshots silently stopped being written (only ralph.sh's own launch-time
+// `node node.mjs snapshots` path ever ran).
+{
+  const p = mkproj("t29-tree-snapshots");
+  mkNode(p, "(root)", { deadline: ISO(inMin(120)) });
+  const w = mkWindow(p, "run-1", { status: "completed", exitReason: "completed-finalized" });
+  const staleAt = "1970-01-01T00:00:00.000Z";
+  fs.writeFileSync(path.join(w, "tree.json"), JSON.stringify({ v: 1, at: staleAt, nodes: [] }, null, 2));
+  const r = await step(p, w, CFG);
+  ok("T29 step completed", r.kind === "completed", JSON.stringify(r));
+  const tj = readJsonFile(path.join(w, "tree.json"));
+  ok("T29 tree.json refreshed by the step (not stale)", tj && tj.at !== staleAt, JSON.stringify(tj));
+  ok("T29 snapshot is fresh (< 5 min old)", tj && Date.now() - new Date(tj.at).getTime() < 5 * 60000, tj && tj.at);
+  ok("T29 root node present with post-transition state done",
+    tj?.nodes?.find((n) => n.path === "(root)")?.state === "done", JSON.stringify(tj?.nodes));
+}
+
 // ---------- summary ----------
 console.log(`\n=== ${passed} passed, ${failed} failed (sandbox: ${T}) ===`);
 if (failed) { console.log("failed:", fails.join(" | ")); process.exit(1); }

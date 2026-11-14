@@ -59,6 +59,7 @@ import {
   isWindowName,
   windowNumber,
   sleep,
+  writeTreeSnapshots,
 } from "./node.mjs";
 import { sizeDeadline } from "./deadline.mjs";
 
@@ -441,7 +442,18 @@ export async function step(projectDir, windowDir, cfg = {}) {
   };
   // 8.1.2: every run dir carries tree.json — a snapshot of the current tree
   // (nodes, states, runs, deadline), refreshed after each transition.
-  const snapshot = (root) => { try { writeTreeSnapshots(root); } catch { /* best-effort */ } };
+  // v0.35.15: a silent catch here was masking a missing import — snapshots
+  // stopped being written and nothing said so. Log failures; also log a
+  // 0-write (tree derive failed) so a silent programming error is findable
+  // in chain.log instead of invisible.
+  const snapshot = (root) => {
+    try {
+      const n = writeTreeSnapshots(root);
+      if (n === 0) clog(projectDir, windowDir, "8.1.2 tree.json snapshot: 0 run dirs (tree derive failed?)");
+    } catch (e) {
+      clog(projectDir, windowDir, `8.1.2 tree.json snapshot failed: ${e.message}`);
+    }
+  };
   // v0.27.0: the scheduler root no longer holds .pi-supervisor (the tree moved
   // away or was deleted) — the window has no parent tree to be decided by.
   // DEGRADE TO STANDALONE (plan §4): the window's own project decides it with
