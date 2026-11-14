@@ -102,7 +102,12 @@ function launch(wdir, nodePath, taskText, deadlineEpoch) {
 function endChild(wdir, { request = null, report = null } = {}) {
   const st = jread(path.join(wdir, "pi-child-status.json"));
   if (request) writeFileSync(path.join(wdir, "spawn-request.json"), JSON.stringify(request, null, 2));
-  if (report) writeFileSync(path.join(wdir, "FINAL-REPORT.md"), report);
+  if (report) {
+    writeFileSync(path.join(wdir, "FINAL-REPORT.md"), report);
+    // the monitor writes this pointer at report time (v0.36 re-entry await);
+    // the chain step breaks its wait on it
+    writeFileSync(path.join(wdir, "final-report.json"), JSON.stringify({ file: "FINAL-REPORT.md" }));
+  }
   try { process.kill(st.guardPid, "SIGKILL"); } catch { /* already gone */ }
   writeFileSync(path.join(wdir, "pi-child-status.json"), JSON.stringify({
     ...st, status: "completed", exitReason: "completed", guardPid: null,

@@ -118,9 +118,9 @@ DL=$(( $(date +%s) + 600 ))
 PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK \
   ralph.sh --deadline $DL --child-model cm-e2e --parent-model pm-e2e > $T/E.log 2>&1 &
 sleep 4
-grep -q "deadline.*$(date -d @"$DL" '+%Y-%m-%d %H:%M')" $T/E.log \
+grep -q "deadline.*$(date -d @"$DL" '+%b %d %H:%M')" $T/E.log \
   && ok "E: --deadline flag parsed" || bad "E: $(head -8 $T/E.log)"
-grep -q "child=cm-e2e" $T/E.log && grep -q "parent=pm-e2e" $T/E.log \
+grep -q "worker    cm-e2e" $T/E.log && grep -q "judge     pm-e2e" $T/E.log \
   && ok "E: --child-model/--parent-model flags parsed" || bad "E: model flags"
 grep -q -- "--model cm-e2e" $T/projE/.pi-supervisor/runs/run1/launch-args.txt 2>/dev/null \
   && ok "E: flags reached launch.mjs (--model cm-e2e)" || bad "E: launch-args ($(cat $T/projE/.pi-supervisor/runs/run1/launch-args.txt 2>/dev/null))"
@@ -132,7 +132,7 @@ DLF=$(( $(date +%s) + 600 ))
 PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-OK \
   ralph.sh --deadline=$DLF --child-model=fv-e2e > $T/F.log 2>&1 &
 sleep 4
-grep -q "child=fv-e2e" $T/F.log && ok "F: --flag=value form parsed (no hang — a spin would print nothing)" || bad "F: $(cat $T/F.log | head -8)"
+grep -q "worker    fv-e2e" $T/F.log && ok "F: --flag=value form parsed (no hang — a spin would print nothing)" || bad "F: $(cat $T/F.log | head -8)"
 stoprun $T/projF
 
 # ---- L: --runtime flag — relative deadline (v0.25.0) ---------------------------
@@ -232,7 +232,7 @@ PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-REPORT ralph.sh $SD > $T/H.log 2>&1
 RC=$?
 [ "$RC" -eq 0 ] && [ -f $SD/FINAL-REPORT.md ] && grep -q "E2E stub" $SD/FINAL-REPORT.md \
   && ok "H: completed → FINAL-REPORT.md present, exit 0" || bad "H: rc=$RC $(tail -3 $T/H.log)"
-grep -q "final report" $T/H.log && ok "H: ralph.sh printed the final report to the terminal" || bad "H: report not printed"
+grep -qi "final report" $T/H.log && ok "H: ralph.sh printed the final report to the terminal" || bad "H: report not printed"
 grep -q '"code":0' $SD/monitor-exit.json 2>/dev/null && ok "H: monitor-exit.json records the monitor's own code=0 (v0.25.14)" || bad "H: monitor-exit.json missing: $(cat $SD/monitor-exit.json 2>/dev/null)"
 
 # ---- O: v0.25.15 — ralph.log: the wrapper's own on-disk record -------------
@@ -244,7 +244,7 @@ grep -q "ralph.sh start" $RL 2>/dev/null && grep -q "monitor launched (mon_pid="
   && ok "O: ralph.log has start + monitor launched (mon_pid)" || bad "O: ralph.log start/launch missing: $(head -5 $RL 2>/dev/null)"
 grep -qE "monitor wait rc=0 \(mon_pid=[0-9]+, waited [0-9]+s\)" $RL 2>/dev/null \
   && ok "O: ralph.log has wait bookends (rc + waited Ns)" || bad "O: ralph.log wait line: $(grep 'monitor wait' $RL 2>/dev/null)"
-grep -q "exit rc=0 interrupted=0" $RL 2>/dev/null && grep -q "final: .*done · exit 0" $RL 2>/dev/null \
+grep -q "exit rc=0 interrupted=0" $RL 2>/dev/null && grep -qE "final: rc=0 · report: .*RUN-REPORT\.md" $RL 2>/dev/null \
   && ok "O: ralph.log has exit + final lines" || bad "O: ralph.log exit/final: $(tail -3 $RL 2>/dev/null)"
 
 # ---- I: v0.35.19 (6.1/7.10) — attach is read-only: a DEAD child ends the
@@ -261,7 +261,7 @@ PATH="$T/sandbox/scripts:$PATH" PI=$T/pi-STOP ralph.sh $SD > $T/I.log 2>&1
 RC=$?
 [ "$RC" -eq 2 ] \
   && ok "I: attach rides a dead child → exit 2 (child-dead pre-check)" || bad "I: rc=$RC $(tail -3 $T/I.log)"
-grep -q "pre-check STOP: child-dead" $SD/ralph-monitor.log 2>/dev/null && ok "I: child-dead pre-check logged" || bad "I: reason not in log"
+grep -q "worker dead (pid 99995 gone)" $T/I.log 2>/dev/null && ok "I: child-dead pre-check (worker dead) announced" || bad "I: reason not in log"
 [ ! -f $SD/FINAL-REPORT.md ] && [ ! -f $SD/FINAL-REPORT.monitor.md ] \
   && ok "I: display-only attach wrote no report (6.1)" || bad "I: attach wrote a report"
 
@@ -274,8 +274,8 @@ grep -q "## Final report (written by the parent)" $T/projH/.pi-supervisor/runs/r
 
 # ---- K: terminal timestamps local; log files keep ISO UTC ---------------------
 # v0.24.0: every terminal line is glyphed — `ralph: child launched` became `· child launched`
-grep -qE '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] · child launched' $T/C.log \
-  && ok "K: terminal timestamps short local [HH:MM:SS] + glyphed lines" || bad "K: $(grep 'child launched' $T/C.log | head -1)"
+grep -qE '^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] · worker launched' $T/C.log \
+  && ok "K: terminal timestamps short local [HH:MM:SS] + glyphed lines" || bad "K: $(grep 'worker launched' $T/C.log | head -1)"
 grep -qE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}\.[0-9]{3}Z\] cycle=' $T/projC/.pi-supervisor/runs/run1/ralph-monitor.log 2>/dev/null \
   && ok "K: ralph-monitor.log keeps ISO UTC" || bad "K: log file format"
 

@@ -85,19 +85,24 @@ const mkStub = (name, body) => {
   chmodSync(p, 0o755);
   return p;
 };
+// 8.3.4: the judge's own lines may use implementation vocabulary (the spec's
+// ban covers what the JUDGE writes into reports, not what it prints while
+// judging) — the cycle judgment stays a "the judge" story, the worker lines
+// stay worker-flavored.
 const STUB_OK = mkStub("pi-ok.mjs", `
 import { appendFileSync } from "node:fs";
 appendFileSync(process.env.RM_INV_LOG || "/dev/null", "OK-STUB\\n");
-console.log("thinking about the child's progress...");
+console.log("thinking about the worker's progress...");
 console.log("DECISION: OK");`);
 const STUB_NUDGE = mkStub("pi-nudge.mjs", `
 import { appendFileSync } from "node:fs";
 appendFileSync(process.env.RM_INV_LOG || "/dev/null", "NUDGE-STUB\\n");
-console.log("DECISION: NUDGE: go run the self-test and commit");`);
+console.log("DECISION: NUDGE: go run the self-test and commit");
+console.log("(the child kept working from the old plan — nudge applied)");`);
 const STUB_STOP = mkStub("pi-stop.mjs", `
 import { appendFileSync } from "node:fs";
 appendFileSync(process.env.RM_INV_LOG || "/dev/null", "STOP-STUB\\n");
-console.log("DECISION: STOP: the child is hopelessly off-track");`);
+console.log("DECISION: STOP: the worker is hopelessly off-track");`);
 // v0.30.0 P5a: DISTILL — context rot judged by the parent.
 const STUB_DISTILL = mkStub("pi-distill.mjs", `
 console.log("DECISION: DISTILL: the child keeps working from the refuted v2 plan — the transcript is now the problem");`);
@@ -127,7 +132,7 @@ const STUB_INV = mkStub("pi-inv.mjs", `
 import { appendFileSync } from "node:fs";
 const p = process.argv[process.argv.length - 1];
 appendFileSync(process.env.RM_INV_LOG || "/dev/null", (p.includes("final report writer") ? "REPORT" : "JUDGE") + "\\n");
-console.log("thinking about the child's progress...");
+console.log("thinking about the worker's progress...");
 console.log("DECISION: OK");`);
 // R33: a `pi` that stays alive (child = sleeps; parent judgment = the same
 // sleep, which is exactly what we want to prove the Ctrl+C handler kills).
@@ -158,7 +163,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   mkStatus(d, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 225 });
   const r = runRm(d, STUB_OK, ["--once"]);
   report("R1 completed child → exit 0, no LLM call",
-    r.status === 0 && invLog("r1") === "" && /child-terminal \(completed\)/.test(readLog(d)),
+    r.status === 0 && invLog("r1") === "" && /worker-terminal \(completed\)/.test(readLog(d)),
     `exit=${r.status} log=${readLog(d).trim().slice(0, 80)}`);
 }
 
@@ -169,7 +174,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   mkStatus(d, { status: "completed", exitReason: "completed-finalized", guardPid: null, toolCalls: 99 });
   const r = runRm(d, STUB_OK, ["--once"]);
   report("R17 completed-finalized child → exit 0",
-    r.status === 0 && /child-terminal \(completed-finalized\)/.test(readLog(d)),
+    r.status === 0 && /worker-terminal \(completed-finalized\)/.test(readLog(d)),
     `exit=${r.status} log=${readLog(d).trim().slice(0, 80)}`);
 }
 
@@ -179,8 +184,8 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   mkStatus(d, { status: "completed", exitReason: "stuck", guardPid: null });
   const r = runRm(d, STUB_OK, ["--once"]);
   report("R2 failed child terminal → exit 5",
-    r.status === 5 && /child-terminal \(stuck\)/.test(readLog(d)),
-    `exit=${r.status}`);
+    r.status === 5 && /worker-terminal \(stuck\)/.test(readLog(d)),
+    `exit=${r.status} log=${readLog(d).trim().slice(0, 80)}`);
 }
 
 // ---- R3: guard dead, age>60s → exit 2
@@ -189,7 +194,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   mkStatus(d, { guardPid: 99999999, at: new Date(Date.now() - 120_000).toISOString() });
   const r = runRm(d, STUB_OK, ["--once"]);
   report("R3 guard dead → exit 2 child-dead",
-    r.status === 2 && /child-dead/.test(readLog(d)),
+    r.status === 2 && /worker dead/.test(readLog(d)),
     `exit=${r.status} log=${readLog(d).trim().slice(0, 80)}`);
 }
 
@@ -199,7 +204,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   mkStatus(d, { at: new Date(Date.now() - 600_000).toISOString() });
   const r = runRm(d, STUB_OK, ["--once", "--stale-sec", "180"]);
   report("R4 stale status → exit 2 child-stale",
-    r.status === 2 && /child-stale/.test(readLog(d)),
+    r.status === 2 && /worker stale/.test(readLog(d)),
     `exit=${r.status}`);
 }
 
@@ -239,7 +244,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   const files = existsSync(inbox) ? readdirSync(inbox).filter((f) => f.endsWith(".txt")) : [];
   const st = readState(d);
   report("R7 NUDGE dead guard → delivered=false, budget slot used, exit 0",
-    r.status === 0 && files.length === 0 && /delivered=false/.test(readLog(d))
+    r.status === 0 && files.length === 0 && /intervention could not be delivered/.test(readLog(d))
     && st && st.interventions === 1,
     `exit=${r.status} files=${JSON.stringify(files)}`);
 }
@@ -280,7 +285,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   }));
   const r = runRm(d, STUB_OK, ["--once", "--stuck-sec", "3600"]);
   report("R10 stall → exit 4, no LLM call",
-    r.status === 4 && /stalled/.test(readLog(d)) && invLog("r10") === "",
+    r.status === 4 && /stop: stall/.test(readLog(d)) && invLog("r10") === "",
     `exit=${r.status}`);
 }
 
@@ -293,7 +298,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   const past = String(Math.floor(Date.now() / 1000) - 60);
   const r = runRm(d, STUB_OK, ["--once", "--deadline", past, "--finalize-grace-sec", "2"]);
   report("R11 deadline past + running child → grace expires → exit 4, no LLM",
-    r.status === 4 && /deadline \(child still running after 2s grace\)/.test(readLog(d)) && invLog("r11") === "",
+    r.status === 4 && /deadline \(worker still running after 2s grace\)/.test(readLog(d)) && invLog("r11") === "",
     `exit=${r.status} log=${readLog(d).trim().slice(0, 200)}`);
 }
 
@@ -342,7 +347,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   // v0.25.7: baseline line back (count + last + left) + one bright tool line
   // per change. No quiet lines — the 60s window never elapses (the anchor
   // resets on every tool line).
-  const lines = err.split("\n").filter((l) => /· child running ·/.test(l));
+  const lines = err.split("\n").filter((l) => /· worker running ·/.test(l));
   report("R23 child lines: baseline + one per toolCalls change (5s poll, no duplicates)",
     lines.length === 3
     && /· 0 tool calls · last: bash · \d+h \d+m left/.test(lines[0])
@@ -369,13 +374,13 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   // v0.25.3: the child state is NO LONGER on the parent-wait line — it is the
   // SEPARATE message right after it.
   const lines = err.split("\n");
-  const hb = lines.filter((l) => /… cycle 1 — parent judging · \d+s/.test(l));
+  const hb = lines.filter((l) => /… cycle 1 — the judge is deciding · \d+s/.test(l));
   let pairs = 0;
   for (let i = 0; i < lines.length - 1; i++)
-    if (/… cycle 1 — parent judging · \d+s/.test(lines[i]) && /· child running · 3 tool calls/.test(lines[i + 1])) pairs++;
+    if (/… cycle 1 — the judge is deciding · \d+s/.test(lines[i]) && /· worker running · 3 tool calls/.test(lines[i + 1])) pairs++;
   report("R24 heartbeat while a judgment is in flight (child state = separate message)",
-    hb.length >= 1 && pairs >= 1 && !hb.some((l) => /· child running/.test(l)),
-    `hb=${hb.length} pairs=${pairs} ${lines.filter((l) => /parent judging|· child running/.test(l)).map((l) => l.trim().slice(0, 70)).join(" | ").slice(0, 260)}`);
+    hb.length >= 1 && pairs >= 1 && !hb.some((l) => /· worker running/.test(l)),
+    `hb=${hb.length} pairs=${pairs} ${lines.filter((l) => /the judge is deciding|· worker running/.test(l)).map((l) => l.trim().slice(0, 70)).join(" | ").slice(0, 260)}`);
 }
 
 // ---- R13: llm-failed cycles in continuous mode → loop survives and recovers
@@ -391,7 +396,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   let recovered = false, sawFail = false;
   while (Date.now() - t0 < 40_000) {
     const log = readLog(d);
-    sawFail = /llm-failed/.test(log);
+    sawFail = /judge failed/.test(log);
     recovered = /decision=OK/.test(log);
     if (recovered && sawFail) break;
     if (child.exitCode !== null) break;
@@ -441,7 +446,7 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
     }, 300);
   });
   report("R15 llm-down after 2 consecutive failures → exit 4",
-    code === 4 && /llm-down/.test(readLog(d)),
+    code === 4 && /judge down: 2 consecutive failed cycles — giving up/.test(readLog(d)),
     `exit=${code} log=${readLog(d).trim().split("\\n").map(l => l.slice(0, 60)).join(" | ")}`);
 }
 
@@ -468,8 +473,8 @@ const invLog = (name) => { const p = path.join(root, `inv-${name}.log`); return 
   });
   const log = readLog(d);
   report("R21 deadline mid-judgment → judgment killed + grace expiry + final report → exit 4",
-    code === 4 && /deadline passed while asking parent/.test(log) &&
-      /child still running after 2s grace/.test(log) &&
+    code === 4 && /deadline passed while the judge was deciding/.test(log) &&
+      /worker still running after 2s grace/.test(log) &&
       /final-report: written/.test(log) && existsSync(path.join(d, "FINAL-REPORT.md")),
     `exit=${code} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
 }
@@ -557,7 +562,7 @@ console.log("DECISION: STOP: looks stuck");`);
   const log = readLog(d);
   const invs = readFileSync(inv, "utf8");
   report("R26 child-finalizing: judgments skipped, completed → exit 0 + report (no JUDGE)",
-    code === 0 && /deadline: child-terminal \(completed-finalized\)/.test(log)
+    code === 0 && /worker-terminal \(completed\)/.test(log)
       && !/JUDGE/.test(invs) && /REPORT/.test(invs) && existsSync(path.join(d, "FINAL-REPORT.md")),
     `exit=${code} inv=${JSON.stringify(invs)} log=${log.trim().split("\n").map((l) => l.slice(0, 70)).join(" | ")}`);
 }
@@ -575,7 +580,7 @@ console.log("DECISION: STOP: looks stuck");`);
   process.env.RM_INV_LOG = "";
   const log = readLog(d);
   report("R27 child-deadline grace expiry → exit 4 + report, no judgment",
-    r.status === 4 && /child still running after 2s grace/.test(log)
+    r.status === 4 && /worker still running after 2s grace/.test(log)
       && readFileSync(inv, "utf8") === "REPORT\n" && existsSync(path.join(d, "FINAL-REPORT.md")),
     `exit=${r.status} log=${log.trim().split("\n").map((l) => l.slice(0, 70)).join(" | ")}`);
 }
@@ -597,7 +602,7 @@ console.log("DECISION: OK");`);
   report("R28 LIVE view in judgment prompt (status/toolCalls/lastTool/deadline state)",
     r.status === 0 && prompt.includes("LIVE (monitor-observed at")
       && prompt.includes("toolCalls=4") && prompt.includes("lastTool=bash@")
-      && /child deadline .* in 2h/.test(prompt),
+      && /worker deadline .* in 2h/.test(prompt),
     `exit=${r.status} live=${/LIVE \(monitor-observed/.test(prompt)} toolCalls=${prompt.includes("toolCalls=4")}`);
 }
 
@@ -622,8 +627,8 @@ console.log("DECISION: OK");`);
   });
   const log = readLog(d);
   report("R29 child-deadline mid-judgment → judgment killed at child deadline → completed → exit 0 + report",
-    code === 0 && /child deadline passed while asking parent — judgment killed/.test(log)
-      && /deadline: child-terminal \(completed-finalized\)/.test(log)
+    code === 0 && /worker deadline passed while the judge was deciding — the judgment was killed/.test(log)
+      && /worker-terminal \(completed\)/.test(log)
       && /final-report: written/.test(log) && existsSync(path.join(d, "FINAL-REPORT.md")),
     `exit=${code} log=${log.trim().split("\n").map((l) => l.slice(0, 80)).join(" | ")}`);
 }
@@ -647,10 +652,10 @@ console.log("DECISION: OK");`);
   child.kill("SIGINT");
   await new Promise((r) => child.on("exit", r));
   delete process.env.RM_QUIET_SEC;
-  // v0.25.7 shapes: baseline = `· child running · 0 tool calls · last: bash · …left`;
-  // tool line = `· child running · tool call 4: bash · …left` (bright);
-  // quiet line = `· child running · N tool calls · no new tool call for … · last: bash · …left`.
-  const lines = err.split("\n").filter((l) => /· child running ·/.test(l));
+  // v0.25.7 shapes: baseline = `· worker running · 0 tool calls · last: bash · …left`;
+  // tool line = `· worker running · tool call 4: bash · …left` (bright);
+  // quiet line = `· worker running · N tool calls · no new tool call for … · last: bash · …left`.
+  const lines = err.split("\n").filter((l) => /· worker running ·/.test(l));
   const toolLines = lines.filter((l) => /· tool call 4: bash/.test(l));
   const quiet = lines.filter((l) => /· no new tool call for \d+s/.test(l));
   const baseline = lines.filter((l) => /· 0 tool calls · last: bash · \d+h/.test(l));
@@ -684,10 +689,10 @@ console.log("DECISION: OK");`);
   await new Promise((r) => child.on("exit", r));
   const lines = err.split("\n");
   report("R31 child finalizing label (past deadlineIso + running) — baseline + tool line",
-    lines.some((l) => /· child running · 1 tool call · last: bash · \d+h/.test(l))
-    && lines.some((l) => /· child finalizing · tool call 2: bash · \d+h/.test(l))
-    && lines.filter((l) => /· child running ·/.test(l)).length === 1,
-    `lines=${lines.filter((l) => /child (running|finalizing)/.test(l)).map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 260)}`);
+    lines.some((l) => /· worker running · 1 tool call · last: bash · \d+h/.test(l))
+    && lines.some((l) => /· worker finalizing · tool call 2: bash · \d+h/.test(l))
+    && lines.filter((l) => /· worker running ·/.test(l)).length === 1,
+    `lines=${lines.filter((l) => /worker (running|finalizing)/.test(l)).map((b) => b.trim().slice(0, 70)).join(" | ").slice(0, 260)}`);
 }
 
 // kernel protection (v0.26.0) has its own suite (test-protect.mjs) — the
@@ -787,8 +792,8 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   const mlog19 = readLog(rd);
   report("R19 attach is display-only (6.1): completed pre-check → exit 0, no report, no box",
     rc19 === 0 && rep === "" && !out.includes("┌ final report") && /done · exit 0/.test(out)
-    && mlog19.includes("final-report skipped (display-only"),
-    `rc=${rc19} noReport=${rep === ""} noBox=${!out.includes("┌ final report")} closer=${/done · exit 0/.test(out)} skipFlog=${mlog19.includes("final-report skipped (display-only")}`);
+    && mlog19.includes("final report skipped (display-only"),
+    `rc=${rc19} noReport=${rep === ""} noBox=${!out.includes("┌ final report")} closer=${/done · exit 0/.test(out)} skipFlog=${mlog19.includes("final report skipped (display-only")}`);
 
   // R20 pty → ANSI colors; NO_COLOR → plain
   const ttyLog = path.join(root, "r20.tty"), plainLog = path.join(root, "r20.plain");
@@ -800,7 +805,7 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   spawnSync("bash", ["-c", `cd ${proj} && PI=${STUB_OK} NO_COLOR=1 script -qec "bash ${SBX_RALPH} ${rd}" /dev/null > ${plainLog} 2>&1 || true`], { timeout: 60000 });
   const t = readFileSync(ttyLog, "utf8"), pl = readFileSync(plainLog, "utf8");
   // v0.24.1: success closer is GREEN (was bold white); failure closer is red
-  const greenDone = t.includes("\x1b[32m✓ done · exit 0");
+  const greenDone = t.includes("\x1b[32m· done · exit 0");
   report("R20 pty → colored banner + box + green success closer; NO_COLOR → plain",
     t.includes("\x1b[") && t.includes("┌ ralph") && greenDone && pl.includes("┌ ralph") && !pl.includes("\x1b["),
     `ttyEsc=${t.includes("\x1b[")} plainEsc=${pl.includes("\x1b[")} ttyBanner=${t.includes("┌ ralph")} plainBanner=${pl.includes("┌ ralph")} greenDone=${greenDone}`);
@@ -840,8 +845,8 @@ const waitExit = (p, ms) => new Promise((resolve) => {
   const out = readFileSync(logf, "utf8");
   report("R37 child-claimed FINAL-REPORT.md → owner writes FINAL-REPORT.monitor.md; attach boxes the parent report (v0.26.4)",
     r37.status === 0 && altText.length > 0 && claimedIntact
-    && rc37 === 0 && out.includes("┌ final report (parent)") && !out.includes("the child's own report"),
-    `mon=${r37.status} alt=${altText.length}B claimedIntact=${claimedIntact} box=${out.includes("┌ final report (parent)")} noChildText=${!out.includes("the child's own report")}`);
+    && rc37 === 0 && out.includes("┌ final report (judge)") && !out.includes("the child's own report"),
+    `mon=${r37.status} alt=${altText.length}B claimedIntact=${claimedIntact} box=${out.includes("┌ final report (judge)")} noChildText=${!out.includes("the child's own report")}`);
   try { chmodSync(claimed, 0o644); } catch {}
 }
 
@@ -1235,7 +1240,7 @@ console.log("DECISION: OK");`);
   const rep45 = path.join(d, "FINAL-REPORT.md");
   report("R45 pre-deadline child error → immediate exit 5 + final report (ping9)",
     r.status === 5
-    && /child-terminal \(Agent process exited/.test(readLog(d))
+    && /worker-terminal \(Agent process exited/.test(readLog(d))
     && existsSync(rep45)
     && invLog("r45") === "REPORT\n",
     `exit=${r.status} inv=${JSON.stringify(invLog("r45"))} report=${existsSync(rep45)} log=${readLog(d).trim().slice(0, 100)}`);
@@ -1340,7 +1345,7 @@ rmSync(${JSON.stringify(slot)}, { force: true });   // the chain's terminal clea
     r.status === 0
     && !existsSync(path.join(dSub, "FINAL-REPORT.md"))   // v0.35.10: no sub window report — the re-point replaces it
     && existsSync(repRun)                                  // 7.7 — the run's report (run35 was missing it)
-    && /hand-back: r47-subwin → run28/.test(logLaunch)     // the re-point is visible in the launch window's log
+    && /reentry: r47-subwin → run28/.test(logLaunch)       // the re-point is visible in the launch window's log
     && (invLog("r47").match(/REPORT/g) || []).length === 1, // the run report only, no judgment
     `exit=${r.status} repSub=${existsSync(path.join(dSub, "FINAL-REPORT.md"))} repRun=${existsSync(repRun)} inv=${JSON.stringify(invLog("r47"))} logLaunch=${logLaunch.trim().split("\n").slice(0, 1).join(" | ").slice(0, 120)}`);
 }
@@ -1427,7 +1432,7 @@ console.log("DECISION: OK");`);
     && existsSync(repRun)                                  // the run report lands…
     && /child completed · 3 tool calls/.test(logLaunch)   // …on the NEW child (3), not the stale one (10)
     && !/child completed · 10 tool calls/.test(logLaunch) // the stale terminal never stopped the loop
-    && /hand-back: r48-subwin → run29/.test(logLaunch),
+    && /reentry: r48-subwin → run29/.test(logLaunch),
     `exit=${r.status} repSub=${existsSync(repSub)} repRun=${existsSync(repRun)} logLaunch=${logLaunch.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
 }
 
@@ -1452,11 +1457,11 @@ console.log("DECISION: OK");`);
   const lines = err.split("\n");
   const iBright = lines.findIndex((l) => /· tool call 5: bash/.test(l));
   const hbAfter = iBright >= 0 && lines.some((l, i) =>
-    i > iBright && /… cycle 1 — parent judging · \d+s/.test(l));
+    i > iBright && /… cycle 1 — the judge is deciding · \d+s/.test(l));
   const brights = lines.filter((l) => /· tool call 5: bash/.test(l)).length;
   report("R49 per-call line DURING an in-flight judgment (heartbeat emits, no dup after)",
     brights === 1 && hbAfter,
-    `brights=${brights} ${lines.filter((l) => /tool call 5|parent judging/.test(l)).map((l) => l.trim().slice(0, 60)).join(" | ").slice(0, 260)}`);
+    `brights=${brights} ${lines.filter((l) => /tool call 5|the judge is deciding/.test(l)).map((l) => l.trim().slice(0, 60)).join(" | ").slice(0, 260)}`);
 }
 
 // ---- R50: v0.35.8 (run62, 7.4) — production-rate beat (60 s) with the FAST
@@ -1486,10 +1491,10 @@ console.log("DECISION: OK");`);
   const b4 = lines.filter((l) => /· tool call 4: bash/.test(l)).length;
   const b5 = lines.filter((l) => /· tool call 5: bash/.test(l)).length;
   const b6 = lines.filter((l) => /· tool call 6: bash/.test(l)).length;
-  const labels = lines.filter((l) => /… cycle 1 — parent judging · \d+s/.test(l)).length;
+  const labels = lines.filter((l) => /… cycle 1 — the judge is deciding · \d+s/.test(l)).length;
   report("R50 per-call line for EACH call inside one 60 s beat window (fast tick)",
     b4 === 1 && b5 === 1 && b6 === 1 && labels === 0,
-    `4=${b4} 5=${b5} 6=${b6} labels=${labels} ${lines.filter((l) => /tool call [456]:|parent judging/.test(l)).map((l) => l.trim().slice(0, 60)).join(" | ").slice(0, 260)}`);
+    `4=${b4} 5=${b5} 6=${b6} labels=${labels} ${lines.filter((l) => /tool call [456]:|the judge is deciding/.test(l)).map((l) => l.trim().slice(0, 60)).join(" | ").slice(0, 260)}`);
 }
 
 // ---- R51: v0.35.9 (run63, 7.4) — the per-call lines come from the guard's
@@ -1567,14 +1572,14 @@ console.log("DECISION: OK");`);
     { stdio: ["ignore", "ignore", "pipe"] });
   let err = "";
   mon.stderr.on("data", (x) => { err += x; });
-  const handedOff = await until(() => /handoff: runL → r52-subwin/.test(err), 25000);
+  const handedOff = await until(() => /handoff: runL → r52-subwin/.test(err), 25000);   // 8.2.1: handoff arrow line
   // the sub window's child goes terminal; the slot STILL points at the sub
   // window (the chain's hand-back write hasn't landed — the run73 race)
   mkStatus(dSub, { status: "completed", exitReason: "completed", guardPid: null });
-  const rePointed = await until(() => /hand-back: r52-subwin → runL/.test(err), 25000);
+  const rePointed = await until(() => /reentry: r52-subwin → runL/.test(err), 25000);
   slotTo(dLaunch, "runL");                         // chain hand-back catch-up (prevents re-point oscillation)
   const lines = err.split("\n");
-  const iBack = lines.findIndex((l) => /hand-back: r52-subwin → runL/.test(l));
+  const iBack = lines.findIndex((l) => /reentry: r52-subwin → runL/.test(l));
   const iReport = lines.findIndex((l) => /final-report/.test(l));
   const backBeforeReport = iBack >= 0 && (iReport < 0 || iBack < iReport);
   const noSubReport = !existsSync(path.join(dSub, "FINAL-REPORT.md")) && !existsSync(path.join(dSub, "FINAL-REPORT.monitor.md"));
@@ -1640,7 +1645,7 @@ console.log("DECISION: OK");`);
     { stdio: ["ignore", "ignore", "pipe"] });
   let err = "";
   mon.stderr.on("data", (x) => { err += x; });
-  const watched = await until(() => /child running · 10 tool call/.test(err), 25000);
+  const watched = await until(() => /worker running · 10 tool call/.test(err), 25000);
   // 2. the spawn child finishes (its terminal drove the chain); the sub runs.
   const atSpawnEnd = new Date().toISOString();
   mkSt(dLaunch, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 10, childPgid: 111, at: atSpawnEnd });
@@ -1652,7 +1657,7 @@ console.log("DECISION: OK");`);
   //    monitor must hand back via the slot-less path (no slotStartedAtMs).
   mkSt(dSub, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 7, childPgid: 77 });
   rmSync(slot);
-  const rePointed = await until(() => /hand-back: r53-subwin → runL/.test(err), 25000);
+  const rePointed = await until(() => /reentry: r53-subwin → runL/.test(err), 25000);
   // 4. THE stale read: dLaunch's file still holds the spawn terminal. The
   //    marker (last-watched instance 111) must defer the stop.
   const markerSet = await until(() => /stale-marker set: terminal of last-watched instance p=111|stale terminal on file \(instance 111/.test(err + readLog(dLaunch)), 25000);
@@ -1661,7 +1666,7 @@ console.log("DECISION: OK");`);
   //    first fresh write is what clears the marker on the next stop.
   writeFileSync(path.join(dLaunch, "child-pgid"), "222\npichild\n");
   mkSt(dLaunch, { status: "running", toolCalls: 0, childPgid: 222 });
-  const beat0 = await until(() => /child running · 0 tool call/.test(err), 25000);
+  const beat0 = await until(() => /worker running · 0 tool call/.test(err), 25000);
   // ...works (per-call lines must still flow after the re-point, 7.4)
   mkSt(dLaunch, { status: "running", toolCalls: 3, childPgid: 222 });
   const reEntryCall = await until(() => /· tool call 3: bash/.test(err), 25000);
@@ -1725,7 +1730,7 @@ console.log("DECISION: OK");`);
     { stdio: ["ignore", "ignore", "pipe"] });
   let err = "";
   mon.stderr.on("data", (x) => { err += x; });
-  const watched = await until(() => /child running · 10 tool call/.test(err), 25000);
+  const watched = await until(() => /worker running · 10 tool call/.test(err), 25000);
   // 2. the spawn child finishes (its terminal drove the chain); the sub runs.
   const atSpawnEnd = new Date().toISOString();
   mkSt(dLaunch, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 10, childPgid: 111, at: atSpawnEnd });
@@ -1737,7 +1742,7 @@ console.log("DECISION: OK");`);
   //    (marker set on the re-point onto the spawn terminal).
   mkSt(dSub, { status: "completed", exitReason: "completed", guardPid: null, toolCalls: 7, childPgid: 77 });
   rmSync(slot);
-  const rePointed = await until(() => /hand-back: r54-subwin → runL/.test(err), 25000);
+  const rePointed = await until(() => /reentry: r54-subwin → runL/.test(err), 25000);
   const markerSet = await until(() => /stale-marker set: terminal of last-watched instance p=111|stale terminal on file \(instance 111/.test(err + readLog(dLaunch)), 25000);
   // 4. the file stays the spawn terminal for 3 s: the deferred polls must be
   //    paced (1 s) — the pre-fix branch tight-looped (33 k lines in 1.85 s in
@@ -1749,7 +1754,7 @@ console.log("DECISION: OK");`);
   //    (the run81-2nd bug), and the per-call lines must keep flowing (7.4).
   writeFileSync(path.join(dLaunch, "child-pgid"), "222\npichild\n");
   mkSt(dLaunch, { status: "running", toolCalls: 0, childPgid: 222 });
-  const beat0 = await until(() => /child running · 0 tool call/.test(err), 25000);
+  const beat0 = await until(() => /worker running · 0 tool call/.test(err), 25000);
   mkSt(dLaunch, { status: "running", toolCalls: 3, childPgid: 222 });
   const reEntryCall = await until(() => /· tool call 3: bash/.test(err), 25000);
   // 6. the re-entry child finishes — a GENUINE terminal of the new instance:
@@ -1802,9 +1807,9 @@ console.log("child done at 2026-11-11T10:35:56.026Z — work spanned 10:21:56Z t
   const out55 = readFileSync(logf, "utf8");
   report("R55a final report: owner writes ISO file, attach box shows it VERBATIM (7.9)",
     r55a.status === 0 && repF.includes("2026-11-11T10:35:56.026Z") && repF.includes("10:21:56Z")
-    && rc55 === 0 && out55.includes("┌ final report (parent)")
+    && rc55 === 0 && out55.includes("┌ final report (judge)")
     && out55.includes("2026-11-11T10:35:56.026Z") && out55.includes("10:21:56Z"),
-    `mon=${r55a.status} fileIso=${repF.includes("2026-11-11T10:35:56.026Z")} box=${out55.includes("┌ final report (parent)")} boxVerbatim=${out55.includes("2026-11-11T10:35:56.026Z") && out55.includes("10:21:56Z")}`);
+    `mon=${r55a.status} fileIso=${repF.includes("2026-11-11T10:35:56.026Z")} box=${out55.includes("┌ final report (judge)")} boxVerbatim=${out55.includes("2026-11-11T10:35:56.026Z") && out55.includes("10:21:56Z")}`);
 
   // R55b: the judgment's detail/reasoning (LLM prose) are displayed VERBATIM
   // under the tick line; the cycle-N-judgment.out file keeps ISO.
@@ -1850,7 +1855,7 @@ console.log("run ended halted on a rejected spawn request.");`);
   const flog56 = readLog(rd56);
   report("R56 rejected spawn request → run-end final report + halt context (no 10 s slot wait)",
     r56.status === 0 && rep56.includes("Final report (R56)")
-    && out56.includes("final report — asking parent to summarize")
+    && out56.includes("final report — asking the judge")
     && flog56.includes("CHAIN HALT")
     && !out56.includes("hand-off slot not observed"),
     `rc=${r56.status} report=${rep56.includes("Final report (R56)")} haltCtx=${flog56.includes("CHAIN HALT")} polled=${out56.includes("hand-off slot not observed")} tail=${out56.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
@@ -1872,8 +1877,8 @@ console.log("SHOULD-NOT-BE-WRITTEN");`);
     .map((p) => (existsSync(p) ? readFileSync(p, "utf8") : "")).join("\n");
   report("R56b undecided request stays pending: pause path, bounded poll, no report",
     r56b.status === 0 && !rep56b.trim() && out56b.includes("hand-off slot not observed after 10 s")
-    && !out56b.includes("final report — asking parent to summarize"),
-    `rc=${r56b.status} noReport=${!rep56b.trim()} polled=${out56b.includes("hand-off slot not observed after 10 s")} reportCall=${out56b.includes("final report — asking parent to summarize")} tail=${out56b.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
+    && !out56b.includes("final report — asking the judge"),
+    `rc=${r56b.status} noReport=${!rep56b.trim()} polled=${out56b.includes("hand-off slot not observed after 10 s")} reportCall=${out56b.includes("final report — asking the judge")} tail=${out56b.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
 
   // R57: v0.35.16 (run89, 7.7) — a CONSUMED spawn (decision ok, the spawned
   // window terminal, its own chain step done) is NOT pending: the launch
@@ -1903,7 +1908,7 @@ console.log("run ended halted on a dead sub window.");`);
   const flog57 = readLog(rd57);
   report("R57 consumed spawn (sub halted) → run report + sub halt context, no slot poll",
     r57.status === 0 && rep57.includes("Final report (R57)")
-    && out57.includes("final report — asking parent to summarize")
+    && out57.includes("final report — asking the judge")
     && flog57.includes("CHAIN HALT") && flog57.includes("window ended error")
     && !out57.includes("hand-off slot not observed"),
     `rc=${r57.status} report=${rep57.includes("Final report (R57)")} haltCtx=${flog57.includes("window ended error")} polled=${out57.includes("hand-off slot not observed")} tail=${out57.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
@@ -1932,7 +1937,7 @@ console.log("run ended after a clean sub completion.");`);
   const flog57b = readLog(rd57b);
   report("R57b consumed spawn (sub completed) → run report at launch window, no halt context",
     r57b.status === 0 && rep57b.includes("Final report (R57b)")
-    && out57b.includes("final report — asking parent to summarize")
+    && out57b.includes("final report — asking the judge")
     && !flog57b.includes("CHAIN HALT")
     && !out57b.includes("hand-off slot not observed"),
     `rc=${r57b.status} report=${rep57b.includes("Final report (R57b)")} haltCtx=${flog57b.includes("CHAIN HALT")} polled=${out57b.includes("hand-off slot not observed")} tail=${out57b.trim().split("\n").slice(-3).join(" | ").slice(0, 200)}`);
@@ -1998,8 +2003,8 @@ if (p.includes("final report writer")) {
     && rep58.includes("R58-REPORT-MARKER")
     && !existsSync(path.join(sub58, "FINAL-REPORT.md")) && !existsSync(path.join(sub58, "FINAL-REPORT.monitor.md"))
     && handoffLines <= 2 && staleGuard
-    && /hand-back: run-1 → run1/.test(log58) && /CHAIN HALT/.test(log58),
-    `exit=${r58.status} report=${rep58.includes("R58-REPORT-MARKER")} subClean=${!existsSync(path.join(sub58, "FINAL-REPORT.md"))} handoffLines=${handoffLines} staleGuard=${staleGuard} handback=${/hand-back: run-1 → run1/.test(log58)} haltCtx=${/CHAIN HALT/.test(log58)}`);
+    && /reentry: run-1 → run1/.test(log58) && /CHAIN HALT/.test(log58),
+    `exit=${r58.status} report=${rep58.includes("R58-REPORT-MARKER")} subClean=${!existsSync(path.join(sub58, "FINAL-REPORT.md"))} handoffLines=${handoffLines} staleGuard=${staleGuard} handback=${/reentry: run-1 → run1/.test(log58)} haltCtx=${/CHAIN HALT/.test(log58)}`);
 }
 // ---- R59: v0.35.19 (run108/run110, 7.7) — the judge process dies (here:
 // hangs past --final-timeout-sec AFTER streaming the complete report) — the
@@ -2019,7 +2024,7 @@ setTimeout(() => {}, 30000);  // hang past --final-timeout-sec, like the real mo
   const rep59 = existsSync(path.join(d, "FINAL-REPORT.md")) ? readFileSync(path.join(d, "FINAL-REPORT.md"), "utf8") : "";
   const log59 = readLog(d);
   report("R59 report killed mid-hang → SALVAGED to disk (7.7)",
-    r59.status === 0 && rep59.includes("R59-SALVAGE-MARKER") && /SALVAGED/.test(log59) && /outcome=salvaged/.test(log59),
+    r59.status === 0 && rep59.includes("R59-SALVAGE-MARKER") && /salvaged/.test(log59) && /outcome=salvaged/.test(log59),
     `exit=${r59.status} salvaged=${rep59.includes("R59-SALVAGE-MARKER")} log=${/outcome=salvaged/.test(log59)}`);
 }
 // ---- R60: v0.35.19 (6.1/7.10) — --display-only (attach monitors): rides the

@@ -58,6 +58,7 @@ import {
   writeActive,
   isWindowName,
   windowNumber,
+  sleep,
 } from "./node.mjs";
 import { sizeDeadline } from "./deadline.mjs";
 
@@ -235,7 +236,7 @@ function briefContinuation({ nodePath, window, prevWindowDir, budget }) {
 // fits, so the re-entry window RESUMES it — the run continues with full
 // context; the bookkeeping (distill + next-step decision) happens in-place.
 // Fresh variant: a bookkeeping turn, not a work turn.
-function briefReentry({ nodePath, window, childPath, childState, childFinalDir, decision, budget, resume = false }) {
+function briefReentry({ nodePath, window, childPath, childState, childFinalDir, decision, budget, resume = false, judgeReport = null }) {
   const L = [];
   L.push(resume ? `# RE-ENTRY (resume) — ${nodePath} / ${window}` : `# RE-ENTRY — ${nodePath} / ${window}`);
   L.push("");
@@ -248,11 +249,23 @@ function briefReentry({ nodePath, window, childPath, childState, childFinalDir, 
   L.push(`## Budget`);
   L.push(`- ${budgetLine(budget)}`);
   L.push("");
-  L.push("## Child's final report");
+  // 6.1: the re-entry message IS the sub-run's final report (the judge
+  // writes it; the monitor sends it to the resumed session). The 60s wait in
+  // reentry() above covers the usual case; the pointer fallback is only for
+  // the report still being written when the window opens.
+  L.push("## The sub-run's final report");
   L.push("");
-  L.push("```");
-  L.push(windowFinalReport(childFinalDir).trim());
-  L.push("```");
+  if (judgeReport) {
+    L.push("```");
+    L.push(judgeReport.trim());
+    L.push("```");
+  } else {
+    L.push(`The judge's final report is at \`${path.join(childFinalDir, "FINAL-REPORT.md")}\` (still being written when this window opened) — read it once it is there. The mechanical run summary, if any:`);
+    L.push("");
+    L.push("```");
+    L.push(windowFinalReport(childFinalDir).trim());
+    L.push("```");
+  }
   L.push("");
   L.push("## The spawn decision that launched it");
   L.push("");
@@ -426,15 +439,22 @@ export async function step(projectDir, windowDir, cfg = {}) {
     clog(projectDir, windowDir, line);
     if (typeof cfg.log === "function") { try { cfg.log(terminal ?? line); } catch { /* sink must not kill the chain */ } }
   };
+  // 8.1.2: every run dir carries tree.json — a snapshot of the current tree
+  // (nodes, states, runs, deadline), refreshed after each transition.
+  const snapshot = (root) => { try { writeTreeSnapshots(root); } catch { /* best-effort */ } };
   // v0.27.0: the scheduler root no longer holds .pi-supervisor (the tree moved
   // away or was deleted) — the window has no parent tree to be decided by.
   // DEGRADE TO STANDALONE (plan §4): the window's own project decides it with
   // the same table as root, its own lock, one-time parent:null demotion. A
   // normal mode change, NOT an error — no chain-error.json.
   if (!fs.existsSync(supRoot(projectDir))) {
-    return stepStandalone(projectDir, windowDir, cfg, log);
+    const res = await stepStandalone(projectDir, windowDir, cfg, log);
+    snapshot(windowProjectOf(windowDir) || projectDir);
+    return res;
   }
-  return withLock(projectDir, () => stepCore(projectDir, windowDir, cfg, log, false));
+  const res = await withLock(projectDir, () => stepCore(projectDir, windowDir, cfg, log, false));
+  snapshot(projectDir);
+  return res;
 }
 
 // Standalone degradation (plan §4): step the window under ITS OWN project —
@@ -735,7 +755,7 @@ export async function reentry(parentPath, projectDir, childPath, childWindowDir,
   }
   // 1.3/3.2: the run may not re-activate if its deadline is spent — the SAME
   // rule launchWindow applies (single source of truth).
-  const finMin = Number(cfg.launch?.finalizeMin) || 10;
+  const finMin = cfg.launch?.finalizeMin != null ? Number(cfg.launch.finalizeMin) : 10;
   const sized = sizeDeadline({ ts: new Date(dlMs), finalizeMin: finMin, now: new Date() });
   if (!sized.ok) {
     // v0.35.17 (7.8, run90 streak check): this reason string is human-facing
@@ -759,6 +779,38 @@ export async function reentry(parentPath, projectDir, childPath, childWindowDir,
   // rejected the no-budget case); without it budgetLine() renders the
   // "no remaining budget" fallback in RE-ENTRY.md (run35, 2026-11-09).
   const budget = { ok: true, deadlineMs: dlMs, deadlineIso: dlIso, minutes: Math.max(0, Math.round((dlMs - Date.now()) / 60000)), remainingMs: Math.max(0, dlMs - Date.now()) };
+  // §4.6/§6.1 (run122 D1): the sub-run's Final Report is written by the JUDGE
+  // (the monitor's judgment model) — not harvested from the child's own last
+  // message. The monitor owns the write (it IS the run's monitor, §6.1); the
+  // chain only coordinates: it signals the pending re-entry, waits for the
+  // pointer the monitor drops when the report lands, and embeds the report in
+  // the RE-ENTRY message (2.4 — the parent's worker is informed in a message).
+  // §5.10: if the deadline is hit while waiting, no report is written and the
+  // run is not resumed — the same deadline, re-checked on every poll.
+  try {
+    writeJson(path.join(childFinalDir, "reentry-pending.json"), { at: new Date().toISOString(), reason: childState, deadline: dlIso });
+  } catch { /* best effort — the monitor's hook falls back to the sub's terminal status */ }
+  // v0.36: configurable via reportWaitMin for tests — production keeps the
+  // default: the judge's final-call budget (finalize window) + margin.
+  const reportWaitMin = cfg.launch?.reportWaitMin != null ? Number(cfg.launch.reportWaitMin) : finMin + 10;
+  const reportWaitMs = reportWaitMin * 60_000;
+  const reportWaitEnd = Date.now() + reportWaitMs;
+  let judgeReport = null;
+  while (Date.now() < reportWaitEnd) {
+    const ptr = readJson(path.join(childFinalDir, "final-report.json"));
+    if (ptr && ptr.file) {
+      try { judgeReport = fs.readFileSync(path.join(childFinalDir, ptr.file), "utf8"); } catch { judgeReport = null; }
+      break;
+    }
+    if (Date.now() >= dlMs) {
+      return haltBlocked(projectDir, parentPath, childWindowDir, log,
+        `child ${childPath} ended (${childState}); the run's deadline was reached while awaiting the sub-run's final report (5.10) — no re-entry, no final report; the sub-run's window is freed`, done);
+    }
+    await sleep(1000);
+  }
+  if (judgeReport === null) {
+    log(`final report not ready after ${Math.round(reportWaitMs / 1000)}s — re-entry proceeds without it; the report, if written, stays on disk at ${path.join(childFinalDir, "FINAL-REPORT.md")}`);
+  }
   // the decision that launched THIS child lives in the PARENT's window that
   // carried the request (newest-first: a re-spawned child takes its latest)
   const decision = findSpawnDecision(projectDir, parentPath, childPath);
@@ -769,7 +821,7 @@ export async function reentry(parentPath, projectDir, childPath, childWindowDir,
   const gate = sessionGate(winDir, cfg);
   const brief = (wname) => briefReentry({
     nodePath: parentPath, window: wname, childPath, childState,
-    childFinalDir, decision, budget, resume: gate.resume,
+    childFinalDir, decision, budget, resume: gate.resume, judgeReport,
   });
   // The prior step already recorded its outcome — clear the marker (and the
   // consumed spawn request, else the final step re-spawns the same child)

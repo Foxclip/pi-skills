@@ -96,6 +96,9 @@
 #   --task <path>                   = TASK_FILE   (task file, any path; default TASK.md)
 #   --cycle <duration>              parent's judgment period (45s/90m/2h/1h30m/2h30m;
 #                                  default 20m; env CYCLE_SEC = bare seconds)
+#   --timeout <min>                 hard wall clock for the whole run (the guard's
+#                                  --timeout; wins over the deadline-derived sizing,
+#                                  which normally sizes it so finalize lands on the deadline)
 # Both `--flag value` and `--flag=value` forms work.
 #
 # EVERY message this wrapper prints is timestamped `[YYYY-MM-DD HH:MM:SS.mmm]`
@@ -317,21 +320,26 @@ human_dl() { # $1 epoch|ISO|HH:MM → "YYYY-MM-DD HH:MM (in 11h 58m)"
   if [ $rel -ge 86400 ]; then span="$((rel / 86400))d $((rel % 86400 / 3600))h"
   elif [ $rel -ge 3600 ]; then span="$((rel / 3600))h $((rel % 3600 / 60))m"
   else span="$((rel / 60))m"; fi
-  echo "$(date -d "@$sec" +'%Y-%m-%d %H:%M')   ($sign $span)"; }
+  # 8.3.2: short date (month day, HH:MM), local time only.
+  echo "$(date -d "@$sec" +'%b %d %H:%M')   ($sign $span)"; }
 rule() { printf '─%.0s' $(seq 1 50); }
 banner() { # $1=mode: launch|attach — uses RUN_DIR, DEADLINE_EPOCH, PROJECT_DIR (all may be unset in attach)
   local runrel="$RUN_DIR" pd="${PROJECT_DIR:-}"
   case "$RUN_DIR" in "$pd"/*) [ -n "$pd" ] && runrel=".pi-supervisor/runs/$(basename "$RUN_DIR")" ;; esac
   {
-  local mon
-  mon="monitoring — cycle every $(human_secs "${CYCLE_SEC:-1200}") · Ctrl+C stops the whole run (monitor + guard + child)"
-  if [ "$1" = attach ]; then mon="monitoring attached run — cycle every $(human_secs "${CYCLE_SEC:-1200}") · Ctrl+C stops the whole run (monitor + guard + child)"; fi
+  # 8.2.1/8.1.1: the run-start box — project, run, deadline, worker model,
+  # judge model (the judge line carries the cycle). Box lines carry no
+  # timestamps (8.3.1); local time only (8.3.2).
+  local mon _ct=""
+  [ -n "${CHILD_THINKING:-}" ] && _ct=" (think: ${CHILD_THINKING})"
+  mon="Ctrl+C stops the whole run (monitor + worker)"
+  [ "$1" = attach ] && mon="monitoring an attached run · Ctrl+C stops the whole run (monitor + worker)"
   printf '%s┌ ralph%s %s\n' "$C_B" "$C_N" "$(rule)"
   printf '│ project   %s\n' "$( [ -n "$pd" ] && basename "$pd" || echo unknown )"
   printf '│ run       %s\n' "$runrel"
   printf '│ deadline  %s\n' "$(human_dl "${DEADLINE_EPOCH:-}")"
-  local _ct=""; [ -n "${CHILD_THINKING:-}" ] && _ct=" (think: ${CHILD_THINKING})"
-  printf '│ models    child=%s%s · parent=%s\n' "${CHILD_MODEL_VAL:-pi-default}" "$_ct" "${PARENT_MODEL_VAL:-pi-default}"
+  printf '│ worker    %s%s\n' "${CHILD_MODEL_VAL:-pi-default}" "$_ct"
+  printf '│ judge     %s (cycle every %s)\n' "${PARENT_MODEL_VAL:-pi-default}" "$(human_secs "${CYCLE_SEC:-1200}")"
   printf '│ %s\n' "$mon"
   printf '└%s\n' "$(rule)"
   } >&2; }
@@ -449,8 +457,7 @@ if (!s.ok) process.stdout.write(s.why);
   # status file is the same source the chain step reads). A WARN, not a
   # rejection: early-finish sub-runs are legal (run4's finished in 62 s). The
   # overshoot only changes supervision topology (the sub runs while its parent
-  # window is dead) and, pre-F1, would have ended the run at hand-back (3.2);
-  # post-F1 the re-entry gate sizes against the run's deadline, so this is
+  # window is dead) and means the deadline will be hit mid sub-run (5.10);
   # informational — printed so the judge can re-issue with a smaller runtime.
   SP_OVR=""
   if [ -n "$SP_RUNTIME_MIN$SP_DEADLINE" ] && [ -n "$PI_SUP_RUN_DIR" ] && [ -f "$PI_SUP_RUN_DIR/pi-child-status.json" ]; then
@@ -477,7 +484,7 @@ if (subMs === null) {
 if (subMs === null || subMs <= ms) process.exit(0);
 const remMin = Math.floor((ms - Date.now()) / 60000);
 const lead = (Number.isFinite(rt) && rt > 0) ? "sub runtime (" + rt + "m)" : "sub deadline (" + process.env.SP_DL + ")";
-process.stdout.write(lead + " exceeds the parent window" + String.fromCharCode(39) + "s remaining (" + remMin + "m); if the sub-run uses its full budget, the hand-back lands after the parent window" + String.fromCharCode(39) + "s hard stop (" + dl + ") and the run ends (3.2) — pass a smaller --runtime to keep re-entry inside the window");
+process.stdout.write(lead + " exceeds the parent window" + String.fromCharCode(39) + "s remaining (" + remMin + "m); if the sub-run uses its full budget, the hand-back lands after the parent window" + String.fromCharCode(39) + "s hard stop (" + dl + ") — the deadline lands mid sub-run: no re-entry, no sub-run report, the judge of the parent project writes the final report and the run ends. Pass a smaller --runtime to keep re-entry inside the window");
 ' 2>/dev/null || true)"
   fi
   [ -n "$SP_OVR" ] && saye "${C_Y}⚠${C_N} spawn receipt: WARN — ${SP_OVR}${C_N}"
@@ -495,6 +502,9 @@ const j = {
 process.stdout.write(JSON.stringify(j, null, 2) + "\n");')" \
     || { saye "${C_R}✗${C_N} spawn: failed to build the request JSON"; exit 1; }
   printf '%s\n' "$SP_REQ_JSON" > "$SP_REQ" || { saye "${C_R}✗${C_N} spawn: cannot write $SP_REQ"; exit 1; }
+  # 9.1: the run's tree is on disk — refresh the per-run tree snapshots
+  # (best effort; the registry is authoritative).
+  [ -n "${SP_PROJ:-}" ] && node "$HERE/lib/node.mjs" snapshots "$SP_PROJ" >/dev/null 2>&1 || true
   saye "${C_G}✓${C_N} spawn request written: $SP_REQ"
   saye "${C_D}·${C_N} node=${SP_NAME} task=${SP_TASK_ABS}${SP_DEADLINE:+ deadline=${SP_DEADLINE}}${SP_RUNTIME_MIN:+ runtime=${SP_RUNTIME_MIN}m} — the chain step launches it when this window ends; this node will be re-entered afterwards. END THE TURN now (do not launch anything yourself).${C_N}"
   exit 0
@@ -524,6 +534,8 @@ while [ $# -gt 0 ]; do
     --task=*)          TASK_FILE=${1#*=}; shift ;;
     --cycle)           [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --cycle needs a value"; exit 2; }; CYCLE_RAW=$2; shift 2 ;;
     --cycle=*)         CYCLE_RAW=${1#*=}; shift ;;
+    --timeout)         [ $# -ge 2 ] || { saye "${C_R}✗${C_N} --timeout needs a value"; exit 2; }; TIMEOUT_MIN=$2; shift 2 ;;
+    --timeout=*)       TIMEOUT_MIN=${1#*=}; shift ;;
     --sudo)            SUDO_ALLOWED=1; shift ;;
     -h|--help)
       cat <<'USAGE'
@@ -544,6 +556,8 @@ normal-mode flags (anywhere in the arg list): --deadline <ISO|HH:MM|epoch>
   --child-thinking <level>   the CHILD's thinking level (off|minimal|low|medium|high)
   --task <path>           task file to run (default TASK.md)
   --cycle <duration>      parent's judgment period: 45s/90m/2h/2h30m (default 20m)
+  --timeout <min>         hard wall clock for the whole run (the guard's --timeout;
+                          default: sized so the finalization window lands on the deadline)
   --sudo                 grant the child user root sudo (NOPASSWD) — voids kernel protection;
                          for tasks that genuinely need root. Off by default; per-user-global,
                          dropped on the next plain re-protect or unprotect.
@@ -968,6 +982,9 @@ try { ensureRootNode(process.argv[3], { deadline: dl, unblock: true }); } catch 
     if [ -n "$CHILD_MODEL_VAL" ];    then launch_args+=(--model "$CHILD_MODEL_VAL"); fi
     if [ -n "$CHILD_PROVIDER_VAL" ]; then launch_args+=(--provider "$CHILD_PROVIDER_VAL"); fi
     if [ -n "${CHILD_THINKING:-}" ]; then launch_args+=(--thinking "$CHILD_THINKING"); fi
+    # 2.2: the whole run's timeout — explicit wins over the deadline-derived
+    # sizing (launch.mjs honors a pre-set --timeout in the passthrough).
+    if [ -n "${TIMEOUT_MIN:-}" ]; then launch_args+=(--timeout "$TIMEOUT_MIN"); fi
 
     # kernel protection — the boundary must exist BEFORE the child starts
     # (the wrapper verifies the child actually runs as the protected user; a
@@ -987,7 +1004,14 @@ try { ensureRootNode(process.argv[3], { deadline: dl, unblock: true }); } catch 
     case "$launch_out" in
       *'"launched":true'*)
         guard_pid=$(status_field "$RUN_DIR/pi-child-status.json" guardPid)
-        saye "${C_D}·${C_N} child launched (guardPid=$guard_pid)" ;;
+        saye "${C_D}·${C_N} worker launched (pid $guard_pid)"
+        # 5.9: the pointer was reset from a subproject to this project —
+        # the worker was told; say so for the operator too.
+        if [ -f "$RUN_DIR/pointer-reset.json" ]; then
+          pr_node=$(sed -n 's/.*"node"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$RUN_DIR/pointer-reset.json" | head -n1)
+          saye "${C_D}·${C_N} the active pointer pointed into subproject ${pr_node:-?} — reset to this project at run start (the worker was told)"
+          rlog "5.9: pointer reset to this project (previous subproject: ${pr_node:-?})"
+        fi ;;
       *'"launched":"unknown"'*)
         saye "${C_Y}!${C_N} launch.mjs reported 'unknown' (alive but silent) — proceeding, the pre-checks will catch a dead child" ;;
       *)
@@ -995,13 +1019,6 @@ try { ensureRootNode(process.argv[3], { deadline: dl, unblock: true }); } catch 
         echo "$launch_out" | tail -20 >&2
         exit 1 ;;
     esac
-
-    # v0.26.0 (plan §5.5): the tree is the view — show it at launch too (the
-    # root node was just materialized by launch.mjs via --node; active.json
-    # names the window, so this is also the follow-the-slot entry point).
-    if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ]; then
-      node "$HERE/lib/node.mjs" tree "$PROJECT_DIR"
-    fi
 
     mkdir -p "$PROJECT_DIR/.pi-supervisor"
     echo "$RUN_DIR" > "$PTR"
@@ -1017,9 +1034,6 @@ try { ensureRootNode(process.argv[3], { deadline: dl, unblock: true }); } catch 
       [ -n "$iso" ] && DEADLINE_EPOCH="$iso"
     fi
     RALPH_MODE=attach
-    if [ -f "$PROJECT_DIR/.pi-supervisor/active.json" ] || [ -f "$PROJECT_DIR/.pi-supervisor/node.json" ]; then
-      SUBRUNS_ATTACH_TREE=1   # sub-runs project → the tree banner is the view
-    fi
     if [ -n "$PI_PROTECT_USER" ]; then
       ralph_flags+=(--pi "$HERE/lib/pi-as-child.sh")
       export PI_SUP_PI_ABS_FILE="$PROJECT_DIR/.pi-supervisor/pi-abs"
@@ -1069,9 +1083,16 @@ on_exit() {
     fi
     rlog "exit rc=$rc interrupted=$interrupted"
     harvest "$HARVEST_TARGET" "$interrupted" "$rc"
-    if [ "$rc" -eq 0 ]; then saye "${C_G}✓ done · exit 0${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"
-    else saye "${C_R}✗ done · exit $rc${C_N} · report: $HARVEST_TARGET/RUN-REPORT.md"; fi
-    rlog "final: $(if [ "$rc" -eq 0 ]; then printf '✓ done · exit 0'; else printf '✗ done · exit %s' "$rc"; fi) · report: $HARVEST_TARGET/RUN-REPORT.md"
+    # 8.3.5: a clean end (0) and the deadline (4) are messages; everything
+    # else is an error. (The monitor already printed the Final Report —
+    # 8.2.7 — so the old report box is gone: one print, from the monitor.)
+    # v0.36 (8.3.5/8.3.6): the closer is an EVENT line — dot glyph, `· done · exit N`.
+    # rc=0 is the happy end: GREEN. (rc=143/130 = the human stopped the run —
+    # the closer still reports the run's own clean end state.)
+    if [ "$rc" -eq 0 ]; then saye "${C_G}· done · exit 0${C_N} (clean end) · report: $HARVEST_TARGET/RUN-REPORT.md"
+    elif [ "$rc" -eq 4 ]; then saye "${C_D}· done · exit 4${C_N} (deadline) · report: $HARVEST_TARGET/RUN-REPORT.md"
+    else saye "${C_R}✗ done · exit $rc${C_N} (killed) · report: $HARVEST_TARGET/RUN-REPORT.md"; fi
+    rlog "final: rc=$rc · report: $HARVEST_TARGET/RUN-REPORT.md"
   fi
 }
 trap on_exit EXIT
@@ -1089,7 +1110,7 @@ stop_for_signal() { # $1 = exit code (130 INT / 143 TERM)
   if [ -n "${RUN_DIR:-}" ] && [ -f "$RUN_DIR/pi-child-status.json" ]; then
     local sig
     case "$1" in 130) sig=SIGINT ;; *) sig=SIGTERM ;; esac
-    saye "${C_Y}!${C_N} stopping the run — guard + child (graceful, escalating to SIGKILL)"
+    saye "${C_Y}!${C_N} stopping the run (graceful, escalating to force)"
     mark_user_stop "$RUN_DIR" "$sig"
     stop_and_report "$RUN_DIR" || true
   fi
@@ -1102,18 +1123,19 @@ trap 'stop_for_signal 143' TERM
 if [ "${RALPH_MODE:-launch}" = "attach" ]; then
   [ -n "$DEADLINE_EPOCH" ] || DEADLINE_EPOCH=$(status_field "$RUN_DIR/pi-child-status.json" deadlineIso 2>/dev/null)
   banner attach
-  if [ "${SUBRUNS_ATTACH_TREE:-0}" = "1" ]; then
-    echo
-    node "$HERE/lib/node.mjs" tree "$PROJECT_DIR"
-    echo
-  fi
 fi
 rc=0
+# 9.1: the run's tree is on disk — refresh the per-run tree snapshots at launch
+# and attach alike (best effort; the registry is authoritative).
+[ -n "${PROJECT_DIR:-}" ] && node "$HERE/lib/node.mjs" snapshots "$PROJECT_DIR" >/dev/null 2>&1 || true
 # the monitor runs in the background and ralph.sh waits on it: a trapped
 # Ctrl+C interrupts the wait (a trapped signal makes `wait` return 128+sig),
 # so stop_for_signal fires even if the monitor itself is busy — and the
 # handler can kill the monitor by PID. (A plain foreground `node` would defer
 # the trap until the monitor exited on its own.)
+# The monitor prints the Final Report itself when the run ends (8.2.7) —
+# ralph.sh no longer echoes it (the old double print, one box per report, is
+# gone with the v0.36 re-spec).
 node "$HERE/ralph-monitor.mjs" "${MONITOR_ARGS[@]}" &
 MON_PID=$!
 rlog "monitor launched (mon_pid=$MON_PID)"
@@ -1131,15 +1153,4 @@ rlog "monitor wait rc=$rc (mon_pid=$MON_PID, waited $(( $(date +%s) - wait_start
 # child-writable and the child's own report may hold FINAL-REPORT.md — the
 # monitor then writes its report to FINAL-REPORT.monitor.md; prefer it so the
 # box doesn't show the child's file under the parent's heading.
-FR="$RUN_DIR/FINAL-REPORT.md"
-[ -f "$RUN_DIR/FINAL-REPORT.monitor.md" ] && FR="$RUN_DIR/FINAL-REPORT.monitor.md"
-if [ -f "$FR" ]; then
-  printf '%s┌ final report (parent)%s %s\n' "$C_B" "$C_N" "$(rule)" >&2
-  # v0.35.20 (7.9): the report is AGENT text — displayed VERBATIM. (v0.35.14
-  # display-localized the UTC timestamps it quotes; the re-specified 7.8 local-
-  # time rule covers monitor messages only, and 7.9 forbids manipulating
-  # agent messages shown in the terminal.)
-  while IFS= read -r line; do printf '│ %s\n' "$line" >&2; done < "$FR"
-  printf '└%s\n' "$(rule)" >&2
-fi
 exit $rc

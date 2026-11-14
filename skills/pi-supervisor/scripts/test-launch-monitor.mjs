@@ -302,6 +302,68 @@ function killTree(pid) {
     `exit=${r.status} files=${JSON.stringify(files)}`);
 }
 
+// N1: 5.9 — the project's active pointer points into a subproject at run start:
+// pointer-reset.json lands in the run dir, the guard's task carries the note,
+// and the pointer resets to this project's window.
+{
+  const subRun = path.join(root, "auth", ".pi-supervisor", "runs", "run-1");
+  mkdirSync(subRun, { recursive: true });
+  mkdirSync(path.join(root, ".pi-supervisor"), { recursive: true });
+  writeFileSync(path.join(root, ".pi-supervisor", "active.json"), JSON.stringify({
+    run_dir: subRun, node: "auth", guard_pid: 12345, window: "run-1",
+    started_at: new Date().toISOString(), deadline: null,
+  }));
+  const N1_GUARD = path.join(root, "n1-guard.mjs");
+  writeFileSync(N1_GUARD, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+const argv = process.argv.slice(2);
+let outDir = process.cwd();
+for (let i = 0; i < argv.length; i++) if (argv[i] === "--out-dir") outDir = argv[++i];
+writeFileSync(join(outDir, "n1-argv.json"), JSON.stringify(argv));
+writeFileSync(join(outDir, "pi-child-status.json"), JSON.stringify({ v: 2, at: new Date().toISOString(), status: "running", guardPid: process.pid, childPid: null, attempt: 1, sessionId: "n1", toolCalls: 1 }));
+setTimeout(() => process.exit(0), 120000);
+`);
+  const d = path.join(root, "n1");
+  mkdirSync(d);
+  const r = spawnSync(node, [
+    path.join(HERE, "launch.mjs"), "--guard", N1_GUARD, "n1 task text",
+    "--out-dir", d, "--verify-sec", "6", "--project", root,
+  ], { encoding: "utf8", timeout: 30000 });
+  let j = null; try { j = JSON.parse(r.stdout.trim().split("\n").pop()); } catch {}
+  let pr = null;
+  try { pr = JSON.parse(readFileSync(path.join(d, "pointer-reset.json"), "utf8")); } catch {}
+  let act = null;
+  try { act = JSON.parse(readFileSync(path.join(root, ".pi-supervisor", "active.json"), "utf8")); } catch {}
+  let taskArg = null;
+  try { taskArg = JSON.parse(readFileSync(path.join(d, "n1-argv.json"), "utf8"))[0]; } catch {}
+  report("N1 5.9: subproject pointer → reset fact + worker notified + pointer reset",
+    j?.launched === true
+    && pr?.previous?.node === "auth" && pr?.previous?.run_dir === subRun
+    && act?.run_dir === d && act?.node === "(root)"
+    && typeof taskArg === "string" && taskArg.startsWith("NOTE (supervisor)")
+    && taskArg.includes(`\"auth\"`) && taskArg.includes("n1 task text"),
+    `launched=${j?.launched} pr=${JSON.stringify(pr)} actRun=${act?.run_dir} task=${JSON.stringify((taskArg || "").slice(0, 80))}`);
+  killTree(j?.guardPid || null);
+}
+
+// N2: 5.9 negative — the pointer points into the project's OWN runs dir →
+// no reset fact, no note.
+{
+  const d = path.join(root, "n2");
+  mkdirSync(d);
+  mkdirSync(path.join(root, ".pi-supervisor"), { recursive: true });
+  writeFileSync(path.join(root, ".pi-supervisor", "active.json"), JSON.stringify({
+    run_dir: path.join(root, ".pi-supervisor", "runs", "run-9"), node: "(root)",
+    guard_pid: 1, window: "run-9", started_at: new Date().toISOString(), deadline: null,
+  }));
+  const L = await runLaunch(d, ["--mode", "idle"]);
+  report("N2 5.9: own-project pointer → no reset",
+    L.json?.launched === true && !existsSync0(path.join(d, "pointer-reset.json")),
+    `launched=${L.json?.launched} resetFact=${existsSync0(path.join(d, "pointer-reset.json"))}`);
+  killTree(L.json?.guardPid || null);
+}
+
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);

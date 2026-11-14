@@ -70,7 +70,7 @@
 // The caller's shell call should not need a long timeout: this returns in
 // ~verify-sec.
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname, delimiter } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -229,17 +229,27 @@ if (deadlineRaw !== null) {
   if (!S.ok) {
     fail(`--deadline ${fmtLocal(P.ts)} ${S.why}`);
   }
-  setPassthroughTimeout(passthrough, S.timeoutMin);
+  // 2.2: an explicit --timeout (the whole run's hard wall clock) wins over
+  // the deadline-derived sizing.
+  const explicitTimeout = passthroughValue(passthrough, "--timeout", null);
+  let usedTimeout = S.timeoutMin;
+  if (explicitTimeout === null) {
+    setPassthroughTimeout(passthrough, S.timeoutMin);
+  } else {
+    usedTimeout = Number(explicitTimeout);
+  }
   deadlineInfo = {
     deadline: P.ts.toISOString(),
     deadlineLocal: P.label,
-    timeoutMin: S.timeoutMin,
+    timeoutMin: usedTimeout,
     finalizeMin: S.finalizeMin,
     hardStopAt: S.hardStopAt,
     hardStopAtLocal: S.hardStopAtLocal,
     finalizeAt: S.finalizeAt,
     finalizeAtLocal: S.finalizeAtLocal,
-    note: `--timeout ${S.timeoutMin} computed so the ${S.finalizeMin}min finalization window ends at the deadline (projected: hard stop ${S.hardStopAtLocal}, finalize ${S.finalizeAtLocal})`,
+    note: explicitTimeout === null
+      ? `--timeout ${S.timeoutMin} computed so the ${S.finalizeMin}min finalization window ends at the deadline (projected: hard stop ${S.hardStopAtLocal}, finalize ${S.finalizeAtLocal})`
+      : `--timeout ${usedTimeout} taken as given (an explicit --timeout wins; the run's deadline is still ${deadlineInfo?.deadlineLocal ?? P.label} — a shorter wall clock stops the run early)`,
   };
 }
 
@@ -249,6 +259,44 @@ if (deadlineRaw !== null) {
 // child pi with {...process.env, ...}, so PI_SUP_* reaches the child's shell
 // tools — ralph.sh reads PI_SUP_CHILD to refuse a child's direct launches, and
 // the guard keeps PI_SUP_RUN_DIR for the chain hook.
+// 5.9: a run started in a project whose active pointer points into a
+// subproject — the pointer resets to this project's window (the active.json
+// write below), and the Worker must be told which subproject was active.
+const ACT_PTR = activePath(projectDir);
+const ownRunsDir = join(projectDir, ".pi-supervisor", "runs");
+let prevPtr = null;
+try { prevPtr = JSON.parse(readFileSync(ACT_PTR, "utf8")); } catch { /* no previous pointer */ }
+const prevIsSubproject = !!(prevPtr && typeof prevPtr.run_dir === "string" &&
+  !prevPtr.run_dir.startsWith(ownRunsDir + "/"));
+if (prevIsSubproject) {
+  const note =
+    "NOTE (supervisor): when this run started, the project's active pointer pointed into the subproject " +
+    `"${prevPtr.node || "?"}" (run "${prevPtr.run_dir}"). The pointer has been reset to this project — ` +
+    "that subproject was the active project, and its run is not running now.";
+  try {
+    if (taskFromFlag) {
+      for (let i = 0; i < passthrough.length; i++) {
+        if (passthrough[i] === "--task-file") {
+          const orig = readFileSync(passthrough[i + 1], "utf8").replace(/^\uFEF/, "");
+          const p = join(outDir, "task-with-note.md");
+          writeFileSync(p, note + "\n\n" + orig);
+          passthrough[i + 1] = p;
+          break;
+        }
+      }
+    } else {
+      task = note + "\n\n" + task;
+    }
+    writeJson(join(outDir, "pointer-reset.json"), {
+      at: new Date().toISOString(),
+      previous: { node: prevPtr.node || null, run_dir: prevPtr.run_dir },
+      reset_to: outDir,
+    });
+    console.log(`[launch] 5.9: the active pointer pointed into subproject "${prevPtr.node || "?"}" (run ${prevPtr.run_dir}) — pointer resets to this project at run start; the worker was told`);
+  } catch (e) {
+    process.stderr.write(`[launch] 5.9 notification failed (ignored): ${e.message}\n`);
+  }
+}
 let guardArgs = taskFromFlag ? [guardPath, ...passthrough] : [guardPath, task, ...passthrough];
 const childUser = (process.env.PI_SUP_NO_PROTECT ? "" : process.env.PI_SUP_CHILD_USER) || "";
 if (childUser) {

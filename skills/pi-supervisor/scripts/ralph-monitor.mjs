@@ -55,7 +55,7 @@
 //   --dry-run pre-checks + state update only; no LLM call (prints the view).
 
 import { spawn, spawnSync } from "node:child_process";
-import { writeFileSync, readFileSync, existsSync, appendFileSync, mkdirSync, accessSync, constants } from "node:fs";
+import { writeFileSync, readFileSync, existsSync, appendFileSync, mkdirSync, accessSync, constants, statSync, openSync, readSync, closeSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseDeadline } from "./lib/deadline.mjs";
@@ -171,7 +171,9 @@ const glog = (glyph, color, line) => {
   tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(color)}${glyph} ${line}${C(0)}`);
 };
 const tick = (n, verdict, detail, reasoning) => {
-  const sym = verdict === "OK" ? `${C(32)}✓${C(0)}` : verdict === "NUDGE" ? `${C(33)}→${C(0)}` : `${C(31)}✗${C(0)}`;
+  // 8.3.5: a verdict is a message (dot). The arrow is reserved for handoff /
+  // reentry, the red cross for errors — an OK/NUDGE/STOP verdict is neither.
+  const sym = `${C(2)}·${C(0)}`;
   // v0.35.20 (7.9): the verdict detail/reasoning are AGENT text (the judge's
   // turn) — displayed VERBATIM, even when they quote UTC timestamps. The
   // re-specified 7.8 local-time rule covers monitor messages only; 7.9
@@ -240,7 +242,7 @@ const childToolLine = (s) => {
   const tc = Number(s.toolCalls) || 0;
   const tool = s.lastTool ? `: ${s.lastTool}` : "";
   const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
-  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${childPhase(s)} · tool call ${tc}${tool}${C(0)}${C(2)}${left}${C(0)}`);
+  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}worker ${childPhase(s)} · tool call ${tc}${tool}${C(0)}${C(2)}${left}${C(0)}`);
 };
 // v0.35.9 (run63, 7.4): the guard appends one `[tool]` line per COMPLETED
 // tool call to pi-child-progress.log (append-only; each attempt starts with
@@ -275,7 +277,7 @@ const emitToolChange = (s) => {
       const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
       for (let i = seen.progCount; i < p.count; i++) {
         const c = p.calls[i];
-        tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}child ${phase} · tool call ${i + 1}: ${c.tool}${c.err ? " ERR" : ""}${C(0)}${C(2)}${left}${C(0)}`);
+        tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(1)}worker ${phase} · tool call ${i + 1}: ${c.tool}${c.err ? " ERR" : ""}${C(0)}${C(2)}${left}${C(0)}`);
       }
       seen.progCount = p.count;
       return;
@@ -292,7 +294,12 @@ const childLiveLine = (s, { idleMs = null, bright = false, withLeft = true } = {
   const idle = idleMs !== null ? ` · no new tool call for ${humanLeft(idleMs)}` : "";
   const last = s.lastTool ? ` · last: ${s.lastTool}` : "";
   const left = withLeft && deadlineMs !== null ? ` · ${humanLeft(deadlineMs - Date.now())} left` : "";
-  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}·${C(0)} ${C(bright ? 1 : 2)}child ${childPhase(s)} · ${tc} tool call${tc === 1 ? "" : "s"}${idle}${last}${C(0)}${C(2)}${left}${C(0)}`);
+  // 8.3.5: the worker state lines (baseline / per-call / quiet / finalizing)
+  // carry the dot — they ARE messages. The ellipsis is reserved for the WAIT
+  // lines (judge deciding, handoff waiting, deadline grace), which the loop
+  // prints as separate lines.
+  const glyph = "·";
+  tlog(`${C(2)}[${tsLocalShort(new Date())}]${C(0)} ${C(2)}${glyph}${C(0)} ${C(bright ? 1 : 2)}worker ${childPhase(s)} · ${tc} tool call${tc === 1 ? "" : "s"}${idle}${last}${C(0)}${C(2)}${left}${C(0)}`);
 };
 // The first poll anchors the quiet timer to the child's own data when
 // available (attach: real idle, not 0) — and v0.25.7: PRINTS the launch
@@ -348,6 +355,52 @@ const beatMaybe = (s) => {
     seen.lastQuiet = now;
     childLiveLine(s, { idleMs: now - seen.lastToolAt });
   }
+};
+// 8.2.3: every Worker message is printed to the terminal — text verbatim
+// (8.3.3: agent message text is never manipulated), thinking never, and in
+// messages with tool calls the tool NAME is what shows (the per-call bright
+// lines above carry the names). Source: the guard's child transcript (the raw
+// session file, on disk — survives crashes, 9.1). Agent message lines have NO
+// timestamp (8.3.1) and the dim dot (8.3.5). Byte offsets are tracked per
+// transcript file, so a resume/distill (a NEW file) starts at 0 and an
+// attach never replays history.
+const workerMsgOff = new Map();
+const noteWorkerActivity = () => { if (seen) seen.lastQuiet = Date.now(); };
+const printWorkerMessages = () => {
+  const f = path.join(A.runDir, "child-transcript.jsonl");
+  let st;
+  try { st = statSync(f); } catch { return; }
+  const off = workerMsgOff.get(f) ?? 0;
+  if (st.size <= off) return;
+  try {
+    const fd = openSync(f, "r");
+    try {
+      const len = Math.min(st.size - off, 1 << 20);
+      const buf = Buffer.alloc(len);
+      const n = readSync(fd, buf, 0, len, off);
+      const s = buf.toString("utf8", 0, n);
+      const end = s.lastIndexOf("\n");
+      if (end < 0) return;   // partial line — wait for the rest
+      const full = s.slice(0, end);
+      workerMsgOff.set(f, off + Buffer.byteLength(full + "\n", "utf8"));
+      for (const line of full.split("\n")) {
+        if (!line) continue;
+        let j; try { j = JSON.parse(line); } catch { continue; }
+        const m = j && j.type === "message" ? j.message : null;
+        if (!m || m.role !== "assistant") continue;
+        const blocks = Array.isArray(m.content) ? m.content : [];
+        for (const b of blocks) {
+          if (!b || typeof b !== "object") continue;
+          if (b.type !== "text") continue;   // thinking: never; toolCall: the name lines above
+          for (const tl of String(b.text || "").split("\n")) {
+            if (tl.trim() === "") continue;
+            tlog(`${C(2)}· worker: ${tl}${C(0)}`);
+          }
+        }
+      }
+      if (full.trim()) noteWorkerActivity();
+    } finally { closeSync(fd); }
+  } catch { /* the view must never change the run */ }
 };
 process.on("SIGINT", () => { glog("!", 33, "sigint: stopping"); saveState(); process.exit(130); });
 
@@ -409,7 +462,7 @@ const markStaleIfMatch = () => {   // called at the end of every successful re-p
   if (!Number.isFinite(p)) return;
   if (prevInstance.get(A.runDir) === p) {
     staleMarker = { at: s.at, tc: s.toolCalls, p, until: Date.now() + STALE_MARKER_GRACE_MS, told: false };
-    glog("…", 33, `stale terminal on file (instance ${p} — the one last watched here) — the re-entry child will overwrite it; waiting (grace ${STALE_MARKER_GRACE_MS / 1000}s)`);
+    glog("…", 33, `stale terminal on file (instance ${p} — the one last watched here) — the re-entry worker will overwrite it; waiting (grace ${STALE_MARKER_GRACE_MS / 1000}s)`);
     flog(`stale-marker set: terminal of last-watched instance p=${p} at=${s.at} tc=${s.toolCalls} — polling until it changes or the grace expires`);
   }
 };
@@ -521,13 +574,13 @@ function preCheck(status) {
     const s0 = status && status.status;
     if (s0 === "completed") {
       const ok0 = /^completed/.test(status.exitReason || "");
-      return { stop: true, code: ok0 ? 0 : 5, reason: `deadline: child-terminal (${status.exitReason || "completed"})` };
+      return { stop: true, code: ok0 ? 0 : 5, reason: `deadline: worker-terminal (${status.exitReason || "completed"})` };
     }
     if (s0 === "stuck" || s0 === "failed" || s0 === "aborted")
-      return { stop: true, code: 4, reason: `deadline: child-terminal (${s0})` };
+      return { stop: true, code: 4, reason: `deadline: worker-terminal (${s0})` };
     if (s0 === "running" || s0 === "starting") {
       if (now >= effDl + A.finalizeGraceSec * 1000)
-        return { stop: true, code: 4, reason: `deadline (child still running after ${A.finalizeGraceSec}s grace)` };
+        return { stop: true, code: 4, reason: `deadline (worker still running after ${A.finalizeGraceSec}s grace)` };
       return { stop: false, waiting: "child-finalizing" };
     }
     return { stop: true, code: 4, reason: "deadline" };
@@ -538,7 +591,7 @@ function preCheck(status) {
     // absorbed by the finalization window — the usual outcome of --deadline
     // launches), so both are success here too
     const ok = /^completed/.test(status.exitReason || "");
-    return { stop: true, code: ok ? 0 : 5, reason: `child-terminal (${status.exitReason || "completed"})` };
+    return { stop: true, code: ok ? 0 : 5, reason: `worker-terminal (${status.exitReason || "completed"})` };
   }
   if (s === "running" || s === "starting") {
     const at = Date.parse(status.at || "");
@@ -546,9 +599,9 @@ function preCheck(status) {
     if (s === "running") {
       const gp = Number(status.guardPid);
       if (gp > 0 && !pidAlive(gp) && age > 60_000)
-        return { stop: true, code: 2, reason: `child-dead (guard pid ${gp} gone)` };
+        return { stop: true, code: 2, reason: `worker dead (pid ${gp} gone)` };
       if (age > A.staleSec * 1000)
-        return { stop: true, code: 2, reason: `child-stale (no status update for ${Math.round(age / 1000)}s)` };
+        return { stop: true, code: 2, reason: `worker stale (no status update for ${Math.round(age / 1000)}s)` };
       // progress tracking for stall detection
       const tc = Number(status.toolCalls);
       if (Number.isFinite(tc) && tc > state.lastToolCalls) {
@@ -567,7 +620,7 @@ function preCheck(status) {
   // a dead child) until the deadline: ping9's child died at 1 s, the monitor
   // sat out the whole 4-min window and stopped with a misleading "deadline".
   if (s === "error" || s === "stuck" || s === "failed" || s === "aborted")
-    return { stop: true, code: 5, reason: `child-terminal (${status.exitReason || s})` };
+    return { stop: true, code: 5, reason: `worker-terminal (${status.exitReason || s})` };
   return { stop: false };
 }
 
@@ -587,7 +640,7 @@ function buildLiveView() {
   const lines = [`LIVE (monitor-observed at ${new Date(now).toISOString()}): status=${s.status || "?"} toolCalls=${Number.isFinite(tc) ? tc : "?"}${last}${delta}`];
   const dl = [];
   const cdl = s.deadlineIso ? Date.parse(s.deadlineIso) : NaN;
-  if (Number.isFinite(cdl)) dl.push(`child deadline ${s.deadlineIso} ${now >= cdl ? "PASSED — child in finalize window" : `in ${humanLeft(cdl - now)}`}`);
+  if (Number.isFinite(cdl)) dl.push(`worker deadline ${s.deadlineIso} ${now >= cdl ? "PASSED — worker in finalize window" : `in ${humanLeft(cdl - now)}`}`);
   if (deadlineMs !== null) dl.push(`monitor deadline ${new Date(deadlineMs).toISOString()} ${now >= deadlineMs ? "PASSED" : `in ${humanLeft(deadlineMs - now)}`}`);
   if (dl.length) lines.push(dl.join(" | "));
   return lines.join("\n");
@@ -624,6 +677,10 @@ DECISION: OK
 DECISION: NUDGE: <one-line message, specific, actionable, referencing what you saw>
 DECISION: DISTILL: <one-line reason the context has rotted>
 DECISION: STOP: <one-line reason the run cannot succeed>
+
+Your reasoning is printed to the terminal verbatim — keep it short, and use
+the plain words worker / judge / run / deadline (never implementation words
+like child process, parent, guard or window).
 
 DISTILL is for CONTEXT ROT only: the child is confidently repeating a wrong
 premise, working from a refuted plan, or re-doing work it already did — the
@@ -689,16 +746,44 @@ to stdout and nothing else (no preamble, no DECISION line).
 ## Outcome
 ## Remaining
 Keep it under ~40 lines. Facts about the work only — no apologies, no
-meta-commentary about this report.`;
+meta-commentary about this report.
 
-async function writeFinalReport(reason) {
-  ask("final report — asking parent to summarize the run…", true);   // v0.25.7: bright — the run's end
+Use plain spec words — worker, judge, run, deadline, sub-run — and never
+implementation words (child process, parent, guard, window, session file):
+the report is printed to a human watching the run.`;
+
+async function writeFinalReport(reason, opts = {}) {
+  const runDir = opts.runDir || A.runDir;
+  const projectDir = opts.projectDir || A.projectDir;
+  if (A.displayOnly) {
+    // 8.2.7: an attach terminal never judges — but the run's Final Report
+    // (written by the owning terminal's judge) is still printed at the end
+    // of the run, no ask, straight from the file.
+    for (const name of ["FINAL-REPORT.monitor.md", "FINAL-REPORT.md"]) {
+      const f = path.join(runDir, name);
+      if (existsSync(f)) {
+        glog("·", 2, `report — the run's Final Report`);
+        // v0.36 (8.2.6/7.9): boxed, and VERBATIM — the agent's text is never
+        // manipulated (the box lines are the file lines as written).
+        try {
+          const lines = readFileSync(f, "utf8").trimEnd().split("\n");
+          tlog(`${C(2)}┌ final report (judge)${C(0)}`);
+          for (const line of lines) tlog(`${C(2)}│${C(0)} ${line}`);
+          tlog(`${C(2)}└─${C(0)}`);
+        } catch { /* best effort */ }
+        return f;
+      }
+    }
+    flog(`final report skipped (display-only attach, 6.1) — none on disk`);
+    return null;
+  }
+  ask(opts.askMsg || "final report — asking the judge to write it…", true);   // v0.25.7: bright — the run's end
   const frStarted = Date.now();   // v0.25.15: duration on the end line
   flog(`final-report-start model=${A.model || "pi-default"} provider=${A.provider || "pi-default"} reason=${JSON.stringify(reason)}`);
-  const projectLine = A.projectDir
-    ? `Project directory: ${A.projectDir}`
+  const projectLine = projectDir
+    ? `Project directory: ${projectDir}`
     : "Project directory: unknown (check pi-child-status.json / git in the run dir)";
-  const prompt = SUMMARY_PROMPT.replaceAll("<run-dir>", A.runDir)
+  const prompt = SUMMARY_PROMPT.replaceAll("<run-dir>", runDir)
     .replaceAll("<project-dir-line>", projectLine)
     .replaceAll("<end-reason>", reason);
   const args = ["--print", "--no-session"];   // fresh writer, never the judgment session
@@ -708,7 +793,7 @@ async function writeFinalReport(reason) {
   let r;
   const frDur = () => `${Math.round((Date.now() - frStarted) / 1000)}s`;
   try {
-    const stopHb = heartbeat("final report — parent summarizing");   // v0.24.3
+    const stopHb = heartbeat("final report — the judge is writing it");   // v0.24.3
     // v0.35.19 (run108/run110, 7.7): the final report gets its OWN budget
     // (--final-timeout-sec, default 900 = the finalize window). A slow local
     // judge model needs >600s (observed 626–696s); the shared --timeout-sec
@@ -739,19 +824,85 @@ async function writeFinalReport(reason) {
   // overwrite hit EACCES). If the existing file is not overwritable by this
   // process, write FINAL-REPORT.monitor.md and leave the child's file intact
   // — ralph.sh prefers this file when printing the parent box.
-  let p = path.join(A.runDir, "FINAL-REPORT.md");
+  let p = path.join(runDir, "FINAL-REPORT.md");
   try { accessSync(p, constants.W_OK); }
-  catch (e) { if (e.code !== "ENOENT") p = path.join(A.runDir, "FINAL-REPORT.monitor.md"); }
+  catch (e) { if (e.code !== "ENOENT") p = path.join(runDir, "FINAL-REPORT.monitor.md"); }
   try {
     writeFileSync(p, text + "\n");
-    glog("✓", 32, `final-report: ${okExit ? "written" : "SALVAGED"} (${text.length} chars) → ${p}`);
+    glog("·", 2, `final-report: ${okExit ? "written" : "salvaged"} (${text.length} chars) → ${p}`);
     flog(`final-report-end dur=${frDur()} outcome=${okExit ? "written" : "salvaged"} chars=${text.length} file=${path.basename(p)}`);
+    // v0.36 (8.2.6/7.9): the owning terminal prints the report it just
+    // wrote, boxed and verbatim.
+    tlog(`${C(2)}┌ final report (judge)${C(0)}`);
+    for (const line of text.split("\n")) tlog(`${C(2)}│${C(0)} ${line}`);
+    tlog(`${C(2)}└─${C(0)}`);
     return p;
   } catch (e) {
     glog("✗", 31, `final-report: write failed (${e.message})`);
     flog(`final-report-end dur=${frDur()} outcome=write-failed (${e.message})`);
     return null;
   }
+}
+// §6.1 (re-entry): the sub-run's Final Report. When the sub-run's worker ends
+// and the chain re-activates the original run, the sub-run's judge (one fresh
+// judgment-model turn — the same writer as the run's report) summarizes the
+// sub-run. The monitor OWNS this write: the chain's re-entry step signals
+// reentry-pending.json and then WAITS for the final-report.json pointer we
+// drop here (the report is ready before the pointer resets, §6.1). The report
+// is printed to the terminal (8.2.6). No marker after the grace → the chain
+// HALTED (deadline spent, 5.10) — no sub-run report; the run's own report
+// covers it. Idempotent: an existing pointer means the report already landed.
+async function writeSubRunReport(leaveDir) {
+  if (A.displayOnly) { flog(`sub-run report skipped (display-only attach, 6.1)`); return null; }
+  const win = path.basename(leaveDir);
+  const markerPath = path.join(leaveDir, "reentry-pending.json");
+  // a durable halt (the chain step's markers) means no re-entry will come —
+  // skip the report immediately instead of sitting out the full grace
+  // (5.10: the deadline spent → the run ends at the launch window).
+  const haltedOnDisk = () => {
+    if (existsSync(path.join(leaveDir, "chain-halt.json"))) return true;
+    try {
+      const d = JSON.parse(readFileSync(path.join(leaveDir, "chain-done.json"), "utf8"));
+      return d && d.outcome && d.outcome.next === "halted";
+    } catch { return false; }
+  };
+  if (!existsSync(markerPath)) {
+    // the chain step decides right after the terminal status is durable —
+    // give it a bounded grace before concluding a halt (a durable halt
+    // marker on disk ends the wait early).
+    const t0 = Date.now();
+    while (!existsSync(markerPath) && !haltedOnDisk() && Date.now() - t0 < 60_000) await sleep(500);
+  }
+  if (!existsSync(markerPath)) {
+    flog(`no reentry-pending in ${win} — the chain halted (${haltedOnDisk() ? "halt marker on disk" : "grace expired"}); no sub-run report (the run's report covers it)`);
+    return null;
+  }
+  let mj = null;
+  try { mj = JSON.parse(readFileSync(markerPath, "utf8")); } catch { /* marker content optional */ }
+  if (mj && mj.deadline && Date.now() >= Date.parse(mj.deadline)) {
+    flog(`reentry-pending deadline (${mj.deadline}) already reached — 5.10: no sub-run report; the run ends at the launch window`);
+    return null;
+  }
+  if (existsSync(path.join(leaveDir, "final-report.json"))) {
+    flog(`final-report pointer already on disk in ${win} — not rewriting`);
+    return null;
+  }
+  // the sub-run's project = three levels up (the window is <proj>/.pi-supervisor/runs/<win>)
+  const projectDir = path.resolve(path.join(leaveDir, "..", "..", ".."));
+  const p = await writeFinalReport(
+    `sub-run ${win} ended (${mj && mj.reason ? mj.reason : "terminal"}) — re-entry to the original run is pending`,
+    { runDir: leaveDir, projectDir, askMsg: `final report — asking the judge to summarize the sub-run (${win})…` },
+  );
+  if (!p) return null;
+  // the pointer the chain's re-entry step waits for: {file} RELATIVE to the
+  // window dir — the chain joins it onto the dir it is already waiting in.
+  try {
+    writeFileSync(path.join(leaveDir, "final-report.json"), JSON.stringify({ file: path.basename(p) }, null, 2) + "\n");
+  } catch (e) { flog(`final-report.json pointer write failed in ${win}: ${e.message}`); }
+  // 8.2.6: the Final Report, printed to the terminal when the run ends.
+  glog("·", 2, `report — sub-run ${win} (the re-entry carries it to the original run)`);
+  try { for (const line of readFileSync(p, "utf8").split("\n")) tlog(line); } catch { /* the file was just written */ }
+  return p;
 }
 
 async function deliverNudge(msg) {
@@ -798,6 +949,7 @@ const heartbeat = (label) => {
     // is checked on every fast tick.
     const labelDue = el - lastLabelEl >= HEARTBEAT_SEC;
     if (labelDue) lastLabelEl = el;
+    printWorkerMessages();   // 8.2.3: the worker's messages keep flowing during the wait
     const s = readStatus();
     const left = deadlineMs !== null ? ` · ${humanLeft(deadlineMs - now)} left` : "";
     // v0.25.3: the parent's wait and the child's state are SEPARATE messages —
@@ -918,10 +1070,10 @@ async function stopLoop(pc, trigger = null) {
   // fresh read landed AFTER the re-entry guard's first write (1 ms later)
   // and cleared the marker, so the stop proceeded on the stale terminal
   // (the monitor exited 14 s before the re-entry child's true terminal).
-  if (/child-terminal/.test(pc.reason)) {
+  if (/worker-terminal/.test(pc.reason)) {
     const raw = trigger ?? rawStatus();
     if (markerHolds(raw)) {
-      if (!staleMarker.told) { staleMarker.told = true; glog("…", 2, `terminal deferred: stale instance-${staleMarker.p} terminal unchanged on file — waiting for the re-entry child to write`); }
+      if (!staleMarker.told) { staleMarker.told = true; glog("…", 2, `terminal deferred: stale instance-${staleMarker.p} terminal unchanged on file — waiting for the re-entry worker to write`); }
       flog(`terminal deferred: stale child status (instance ${staleMarker.p}, at=${raw ? raw.at : "?"} unchanged) — polling`);
       // v0.35.12: pace the deferred polls — the pre-fix branch returned with
       // no sleep and tight-looped (run81-2nd: ~33 000 flog lines in 1.85 s).
@@ -940,7 +1092,7 @@ async function stopLoop(pc, trigger = null) {
   // announce the child's state FIRST (same shape as the child beat line):
   // cause before reaction. (run11: the terminal state was first visible in
   // the STOP line, then re-printed by the heartbeat 60s later.)
-  if (/child-terminal/.test(pc.reason)) {
+  if (/worker-terminal/.test(pc.reason)) {
     const s = readStatus();
     if (s) {
       const tc = Number.isFinite(Number(s.toolCalls)) ? ` · ${s.toolCalls} tool call${Number(s.toolCalls) === 1 ? "" : "s"}` : "";
@@ -953,8 +1105,16 @@ async function stopLoop(pc, trigger = null) {
       childLiveLine(s, { bright: true, withLeft: false });
     }
   }
-  glog(pc.code === 0 ? "✓" : "✗", pc.code === 0 ? 32 : 31,
-    `pre-check STOP: ${pc.reason} (cycle=${state.cycles} interventions=${state.interventions})`);
+  // 8.3.5: a clean end (0) or the deadline (4) is a message (dot); a dead,
+  // stale or failed worker (2/5) is an error (red cross).
+  // v0.36 (R22/R26/R29/R40/R41): the machine line keeps the guard's own
+  // wording (child-terminal + exitReason — what the guard actually wrote),
+  // for the log; the DISPLAY line uses the worker's status word (a
+  // completed-finalized worker is read back as "completed").
+  flog(`pre-check STOP: ${pc.reason.replace("worker-terminal", "child-terminal")}`);
+  const dispReason = pc.reason.replace(/\(completed-finalized\)/g, "(completed)");
+  glog(pc.code === 0 || pc.code === 4 ? "·" : "✗", pc.code === 0 || pc.code === 4 ? 2 : 31,
+    `stop: ${dispReason} (cycles=${state.cycles} interventions=${state.interventions})`);
   saveState();
   // v0.32.0 (5.1/7.7): the pause-vs-end decision is the child's spawn
   // request. WITH a pending spawn-request.json the run PAUSES (the chain
@@ -1013,15 +1173,20 @@ async function stopLoop(pc, trigger = null) {
     // report in a subproject" (4.9) deviation (run110: a 1600-char run110
     // report in subrun84/run-1/FINAL-REPORT.md, an extra 451s judge call).
     // The write-below stays as the fallback when no re-point is possible.
-    if (followedSub && (followSlot() || handBackToLaunch())) return;
-    if (A.displayOnly) {
-      // v0.35.19 (6.1/7.11): attach monitors are display — the owning
-      // terminal's monitor writes the report; 6.2 tears the run down with its
-      // owner, so an attach never becomes the de-facto supervisor.
-      flog(`final-report skipped (display-only attach, 6.1): reason=${JSON.stringify(pc.reason)}`);
-    } else {
-      await writeFinalReport(hc ? `${pc.reason} — CHAIN HALT (the run is over): ${hc.reason}` : pc.reason);
+    if (followedSub) {
+      // v0.36 (v0.35.10, R52/run73): a FOLLOWED sub window's plain terminal
+      // is never where the RUN's report is written — re-point IMMEDIATELY,
+      // no blocking sub report in this path (the pre-fix await sat ~60 s on
+      // the reentry-pending grace and swallowed the re-entry's per-call
+      // lines). The sub-run's report is fired fire-and-forget from the
+      // re-point itself (handBackToLaunch / the main loop's follow hook) —
+      // a no-op unless the chain's re-entry step is waiting on the pointer
+      // (reentry-pending.json on disk).
+      if (followSlot() || handBackToLaunch()) return;
     }
+    // 8.2.7: display-only is handled inside writeFinalReport (it prints
+    // the run's report from disk without judging).
+    await writeFinalReport(hc ? `${pc.reason} — CHAIN HALT (the run is over): ${hc.reason}` : pc.reason);
   }
   // run4 fix (F4, 6.2/7.6): on the pause path (child-terminal + pending
   // spawn request) the handoff slot is written by the EXITING window's guard
@@ -1041,7 +1206,7 @@ async function stopLoop(pc, trigger = null) {
       const hc = readHaltContext();
       await writeFinalReport(hc ? `${pc.reason} — CHAIN HALT (the run is over): ${hc.reason}` : pc.reason);
     } else {
-      glog("…", 33, "hand-off slot not observed after 10 s — chain may still be spawning; a later-attaching terminal follows the tree");
+      glog("…", 33, "hand-off slot not observed after 10 s — the launch may still be in flight; a later-attaching terminal follows the tree");
     }
   }
   // the slot can also land while the final report was being written (the
@@ -1124,11 +1289,33 @@ function followSlot() {
   // belongs to a previous child instance of this window (see statusIsStale).
   const stAt = p.started_at ? Date.parse(p.started_at) : NaN;
   slotStartedAtMs = Number.isFinite(stAt) ? stAt : null;
-  glog("→", 36, `handoff: ${from} → ${to} (node ${p.node || "?"} · ${p.window || "?"})`);
-  try {
-    for (const line of renderTree(A.projectDir).split("\n")) glog("", 2, line);
-  } catch { /* the tree is decoration — the re-point is the substance */ }
-  flog(`handoff: ${from} → ${to} (node ${p.node || "?"} · ${p.window || "?"})`);
+  const isReentry = path.resolve(rd) === path.resolve(A.origRunDir);
+  if (isReentry) {
+    // 8.2.5: on reentry, only a message line (the run's report, not a
+    // banner, is the event).
+    glog("→", 36, `reentry: ${from} → ${to}`);
+  } else {
+    // 8.2.1: the handoff banner — the run being launched. Banner lines carry
+    // no timestamps (8.3.1) and no symbols (8.3.5); local time only (8.3.2).
+    const subProj = path.basename(path.join(rd, "..", "..", ".."));
+    const dl = p.deadline ? tsLocalShort(new Date(p.deadline)) : "—";
+    const cycle = A.cycleSec % 60 === 0 ? `${A.cycleSec / 60}m` : `${A.cycleSec}s`;
+    glog("→", 36, `handoff: ${from} → ${to} (node ${p.node || "?"} · ${p.window || "?"})`);
+    for (const line of [
+      `┌ ralph — handoff (sub-run)`,
+      `│ project   ${subProj}`,
+      `│ run       .pi-supervisor/runs/${to}`,
+      `│ deadline  ${dl}`,
+      `│ worker    ${p.model || "pi-default"}`,
+      `│ judge     ${A.model || "pi-default"} (cycle every ${cycle})`,
+      `└─`,
+    ]) tlog(`${C(2)}${line}${C(0)}`);
+    // plan §5.5: the whole sub-runs layout, dim, on every handoff.
+    if (A.projectDir) {
+      try { for (const line of renderTree(A.projectDir).split("\n")) tlog(`${C(2)}${line}${C(0)}`); }
+      catch { /* the tree banner is best-effort — never break the follow */ }
+    }
+  }
   resetSeen();   // v0.35.7 (run61, 7.4): new window = new child
   markStaleIfMatch();   // v0.35.11: stale-instance marker for the re-pointed window
   return true;
@@ -1155,6 +1342,11 @@ function handBackToLaunch() {
       consumedSlotSig = `${p.run_dir}|${p.started_at || ""}|${p.guard_pid ?? ""}`;
     }
   } catch { /* no slot — nothing to consume */ }
+  // v0.36 (v0.35.10, §6.1): the sub-run we are leaving owes its Final
+  // Report — fire it WITHOUT blocking the loop (the re-entry child is
+  // starting now; a blocking judge call would swallow its per-call lines,
+  // run73). No-op unless the chain's re-entry step waits on the pointer.
+  void writeSubRunReport(A.runDir);
   const from = path.basename(A.runDir);
   const to = path.basename(target);
   A.runDir = target;
@@ -1168,11 +1360,9 @@ function handBackToLaunch() {
   };
   deadlineMs = launchDeadlineMs;   // the launch window's own deadline (1.3)
   slotStartedAtMs = null;          // no slot here — only the child-pgid check applies
-  glog("→", 36, `hand-back: ${from} → ${to} (slot consumed — re-point to the launch window)`);
-  try {
-    for (const line of renderTree(A.projectDir).split("\n")) glog("", 2, line);
-  } catch { /* the tree is decoration — the re-point is the substance */ }
-  flog(`hand-back: ${from} → ${to} (slot consumed — re-point to the launch window)`);
+  // 8.2.5: reentry is a message line only — no banner, no tree.
+  glog("→", 36, `reentry: ${from} → ${to} (pointer reset to the launch window)`);
+  flog(`reentry: ${from} → ${to} (pointer reset to the launch window)`);
   resetSeen();   // v0.35.7 (run61, 7.4): new window = new child instance
   markStaleIfMatch();   // v0.35.11: the launch window's spawn terminal may be stale
   return true;
@@ -1180,7 +1370,15 @@ function handBackToLaunch() {
 
 (async () => {
 for (;;) {
-  followSlot();   // v0.26.0: re-point if the chain handed off to another window
+  const prevDir = A.runDir;
+  const followed = followSlot();   // v0.26.0: re-point if the chain handed off to another window
+  if (followed && path.resolve(prevDir) !== path.resolve(A.origRunDir)) {
+    // §6.1: we are leaving a followed sub-window — its Final Report is
+    // written before the pointer moves on. Fire-and-forget (v0.36): the
+    // re-entry child is starting NOW — a blocking judge call would swallow
+    // its per-call lines (run73). Idempotent inside.
+    void writeSubRunReport(prevDir);
+  }
   const status = readStatus();
   noteRunning(status);   // v0.35.11: remember the instance we are watching
   const pc = preCheck(status);
@@ -1201,8 +1399,9 @@ for (;;) {
   // 60s child beats keep the wait visible until it ends.
   if (pc.waiting === "child-finalizing" && !finalWaitAnnounced) {
     finalWaitAnnounced = true;
-    glog("…", 36, `deadline reached — waiting for the child to finalize (grace ${A.finalizeGraceSec}s)`);
+    glog("…", 36, `deadline reached — waiting for the worker to finalize (grace ${A.finalizeGraceSec}s)`);
   }
+  if (status) printWorkerMessages();   // 8.2.3: every Worker message, verbatim
   if (status && status.status === "running") beatMaybe(status);
   // v0.25.1: no LLM judgment inside the finalize window — the parent has no
   // meaningful action there: NUDGE can't reach a mid-finalize turn, STOP
@@ -1238,7 +1437,7 @@ for (;;) {
     saveState();
     if (A.once) process.exit(0);
   } else {
-    ask(`cycle ${state.cycles} — asking parent for judgment…`);
+    ask(`cycle ${state.cycles} — asking the judge…`);
     // v0.25.1: toolCalls baseline at judgment start — the stale-STOP veto
     // and the log audit compare against it when the verdict returns.
     const sJs = readStatus();
@@ -1249,7 +1448,7 @@ for (;;) {
     // what the child was doing. (run1: the 600s kill was a call queued behind
     // the child's own probe suite; that had to be inferred, not read.)
     flog(`cycle=${state.cycles} judgment-start model=${A.model || "pi-default"} provider=${A.provider || "pi-default"} timeout-sec=${A.timeoutSec} child status=${sJs ? sJs.status : "?"} toolCalls=${Number.isFinite(toolsAtJudgeStart) ? toolsAtJudgeStart : "?"}${sJs && sJs.lastTool ? ` last=${sJs.lastTool}` : ""}`);
-    const stopHb = heartbeat(`cycle ${state.cycles} — parent judging`);   // v0.24.3
+    const stopHb = heartbeat(`cycle ${state.cycles} — the judge is deciding`);   // v0.24.3
     // v0.23.0: race the judgment against the deadline — see runCmdTracked.
     // v0.25.2: AND against the CHILD's own deadline (status.deadlineIso, written
     // by the guard at launch). Once it has passed the loop has no useful
@@ -1276,7 +1475,7 @@ for (;;) {
     if (raced === "deadline" || raced === "child-deadline") {
       flog(`cycle=${state.cycles} judgment-end dur=${jdur}s outcome=killed-by-${raced} io=llm/cycle-${state.cycles}-judgment.{out,err}`);
       if (judgmentProc) { try { judgmentProc.kill("SIGKILL"); } catch { /* best effort */ } }
-      glog("!", 33, `cycle=${state.cycles} ${raced === "child-deadline" ? "child deadline" : "deadline"} passed while asking parent — judgment killed, handing off to the pre-checks`);
+      glog("!", 33, `cycle=${state.cycles} ${raced === "child-deadline" ? "worker deadline" : "deadline"} passed while the judge was deciding — the judgment was killed; the pre-checks take over`);
       saveState();
       continue;
     }
@@ -1287,11 +1486,11 @@ for (;;) {
       // RETRY next cycle — the loop never dies on one bad LLM call
       // (the anti-BlockGame6 behavior)
       state.llmFailStreak += 1;
-      glog("!", 33, `cycle=${state.cycles} llm-failed (exit=${d.exitStatus} streak=${state.llmFailStreak}): ${(d.tail[d.tail.length - 1] || "").slice(0, 200)}`);
+      glog("!", 33, `cycle=${state.cycles} judge failed (exit=${d.exitStatus} streak=${state.llmFailStreak}): ${(d.tail[d.tail.length - 1] || "").slice(0, 200)}`);
       saveState();
       if (A.once) process.exit(4);
       if (state.llmFailStreak >= A.llmFailMax) {
-        glog("✗", 31, `llm-down: ${state.llmFailStreak} consecutive failed cycles — giving up`);
+        glog("✗", 31, `judge down: ${state.llmFailStreak} consecutive failed cycles — giving up`);
         process.exit(4);
       }
     } else if (d.raw === "") {
@@ -1301,7 +1500,7 @@ for (;;) {
       saveState();
       if (A.once) process.exit(4);
       if (state.llmFailStreak >= A.llmFailMax) {
-        glog("✗", 31, `llm-down: ${state.llmFailStreak} consecutive empty cycles — giving up`);
+        glog("✗", 31, `judge down: ${state.llmFailStreak} consecutive empty cycles — giving up`);
         process.exit(4);
       }
     } else {
@@ -1322,7 +1521,7 @@ for (;;) {
         const vetoKind = d.decision;
         stopVetoed = { from: toolsAtJudgeStart, to: tcNow };
         d.decision = "OK";
-        glog("!", 33, `cycle=${state.cycles} ${vetoKind} vetoed — child progressed while judging (toolCalls ${toolsAtJudgeStart}→${tcNow}) — stale verdict, treated as OK`);
+        glog("!", 33, `cycle=${state.cycles} ${vetoKind} vetoed — the worker progressed while judging (toolCalls ${toolsAtJudgeStart}→${tcNow}) — stale verdict, treated as OK`);
         flog(`cycle=${state.cycles} decision=${vetoKind}-VETOED reason=${JSON.stringify(d.detail)}`);
       }
       // v0.21.0: the FULL reasoning goes to ralph-monitor.log (the permanent
@@ -1341,6 +1540,7 @@ for (;;) {
         state.interventions += 1;
         const nr = await deliverNudge(d.detail || "please continue and update STATUS.md");
         flog(`cycle=${state.cycles} decision=NUDGE interventions=${state.interventions} delivered=${nr.ok}${nr.why ? " why=" + nr.why : ""} msg=${JSON.stringify(d.detail)}`);
+        if (!nr.ok) flog(`cycle=${state.cycles} intervention could not be delivered (${nr.why || "unknown"})`);
         tick(state.cycles, "NUDGE", d.detail, reasoning);
         // nudge delivery status (dead guard, etc.) — the pre-checks will catch a
         // truly dead child next cycle; the budget slot is burned either way

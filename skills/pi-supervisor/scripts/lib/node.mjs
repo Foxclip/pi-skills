@@ -647,15 +647,55 @@ export function renderTree(projectDir, { now = new Date() } = {}) {
   return [top, ...body, `╰${"─".repeat(w)}╯`].join("\n");
 }
 
+// ---------- 8.1.2: tree.json snapshots ---------------------------------------
+// tree.json — a snapshot of the current tree (nodes, states, runs, deadlines)
+// written into EVERY run directory (root + each sub-project's windows). The
+// run dir's own on-disk fact, refreshed by the chain step after every
+// transition and by ralph.sh at launch. Best-effort: a failed snapshot never
+// breaks the step.
+export function writeTreeSnapshots(rootProject, { now = new Date() } = {}) {
+  let tree;
+  try { tree = deriveTree(rootProject); } catch { return 0; }
+  const flat = [];
+  const walk = (n) => { flat.push(n); for (const c of n.children) walk(c); };
+  walk(tree);
+  const nodes = flat.map((x) => ({
+    path: x.path,
+    name: x.name,
+    state: x.state,
+    deadline: x.deadline || null,
+    windows: x.windows,
+    live: x.live ? x.live.window : null,
+  }));
+  const snap = { v: 1, at: now.toISOString(), deadline: tree.deadline || null, nodes };
+  let count = 0;
+  for (const n of flat) {
+    let runsDir = null;
+    try { runsDir = nodeRunsDir(rootProject, n.path); } catch { runsDir = null; }
+    if (!runsDir) continue;
+    let ents = [];
+    try { ents = fs.readdirSync(runsDir, { withFileTypes: true }); } catch { continue; }
+    for (const e of ents) {
+      if (!e.isDirectory() || !isWindowName(e.name)) continue;
+      try { writeJson(path.join(runsDir, e.name, "tree.json"), snap); count++; } catch { /* best-effort */ }
+    }
+  }
+  return count;
+}
+
 // ---------- CLI ----------
 // node node.mjs tree <project-dir> — the sub-runs tree banner (ralph.sh / the
 // monitor print it on attach + every handoff; plan §5.5).
+// node node.mjs snapshots <project-dir> — refresh every run dir's tree.json
+// (8.1.2); ralph.sh calls it at launch/attach (best-effort).
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const [cmd, projectDir] = process.argv.slice(2);
   if (cmd === "tree" && projectDir && fs.existsSync(projectDir)) {
     process.stdout.write(renderTree(projectDir) + "\n");
+  } else if (cmd === "snapshots" && projectDir && fs.existsSync(projectDir)) {
+    process.stdout.write(`tree.json snapshots: ${writeTreeSnapshots(projectDir)} run dirs\n`);
   } else {
-    console.error("usage: node node.mjs tree <project-dir>");
-    process.exit(cmd === "tree" ? 1 : 2);
+    console.error("usage: node node.mjs tree|snapshots <project-dir>");
+    process.exit(cmd === "tree" || cmd === "snapshots" ? 1 : 2);
   }
 }
