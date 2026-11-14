@@ -18,6 +18,7 @@
 - In case of unexpected crashes, observe bpftrace output.
 - If there are problems, make changes to pi-supervisor to try to fix that problem.
 - Use polling loop that can early return to wait for runs. Don't use `goal_wait` to wait for runs.
+- Also use polling loop with early return when waiting for tests.
 - After significant changes to pi-supervisor, verify your session transcript for hallucinated user messages and commit changes.
 
 # Phases
