@@ -2133,6 +2133,60 @@ setTimeout(() => {}, 300000); // hang like a queued model call
     }
   }
 }
+// ---- R62: v0.36.2 (spec 6.1/7.4) — the re-entry hand-back outranks a stale
+// terminal. run130: the monitor's 60 s grace expired while the chain's re-entry
+// step was still waiting on the sub-run report (a minutes-long local judge
+// turn), so the monitor "trusted the terminal" and exited rc=0 — killing the
+// in-flight report judge. The chain then waited its full 1200 s budget, the
+// re-activation launch was refused (no work time left) and the tree HALTED
+// with no re-entry and no sub-run report. The grace must RENEW while the
+// re-entry step is in flight, and the run must end normally once it completes.
+// Choreography mirrors the real shape: the monitor watches the launch window
+// running (prevInstance), the hand-off slot lands with the spawn terminal,
+// the sub window's terminal hands back (markStaleIfMatch sets the marker on
+// the launch window), and the chain's re-entry step sits on the report wait.
+{
+  const proj = runDir("p-r62"); mkdirSync(path.join(proj, ".pi-supervisor"), { recursive: true });
+  const slot = path.join(proj, ".pi-supervisor", "active.json");
+  const d = runDir("r62-l");     // the launch window (the monitor's home)
+  const d2 = runDir("r62-s");    // the sub-run window
+  writeFileSync(path.join(d2, "reentry-pending.json"), JSON.stringify({ at: new Date().toISOString() }));
+  mkStatus(d, { status: "running", childPgid: 424242 });
+  writeFileSync(path.join(d, "spawn-request.json"), JSON.stringify({ at: new Date().toISOString(), task: "sub-run" }));
+  writeFileSync(path.join(d, "spawn-decision.json"), JSON.stringify({ ok: true, run_dir: d2, at: new Date().toISOString() }));
+  const c = spawn(NODE, [path.join(HERE, "ralph-monitor.mjs"), "--run-dir", d, "--project-dir", proj, "--pi", STUB_OK, "--cycle-sec", "2", "--timeout-sec", "9999"], { stdio: ["ignore", "ignore", "ignore"] });
+  spawnSync("sleep", ["4"]);   // the monitor is on d, watching the spawn instance RUNNING
+  // the spawn terminal + the hand-off slot land together (slot first — the
+  // monitor's loop always followSlot()s before reading the status)
+  writeFileSync(slot, JSON.stringify({ run_dir: d2, started_at: new Date().toISOString(), guard_pid: 424243, deadline: new Date(Date.now() + 3600e3).toISOString() }));
+  writeFileSync(path.join(d, "pi-child-status.json"), JSON.stringify({ v: 2, at: "2026-11-15T18:20:54.543Z", status: "completed", exitReason: "completed", guardPid: 424242, childPid: 424242, childPgid: 424242, attempt: 1, rewinds: 0, toolCalls: 7, lastTool: "bash", elapsedMs: 8000, sessionId: "r62-spawn", deadlineIso: new Date(Date.now() + 3600e3).toISOString() }));
+  // the sub window's child starts AFTER the slot (real shape: the new guard
+  // overwrites the status — a pre-slot terminal there reads as "starting"
+  // via the slot-time staleness check, which is not what we want to test)
+  spawnSync("sleep", ["2"]);   // the monitor has followed the slot to d2
+  mkStatus(d2, { status: "running", childPgid: 424243 });
+  spawnSync("sleep", ["2"]);   // sub child works a beat
+  mkStatus(d2, { status: "completed", exitReason: "completed", childPgid: 424243, toolCalls: 9 });
+  spawnSync("sleep", ["4"]);   // sub terminal → hand-back → marker set on d
+  const log0 = readLog(d);
+  // Phase A: past the 60 s grace with the re-entry step IN FLIGHT — the grace
+  // must have been renewed, not trusted (run130 died exactly here).
+  spawnSync("sleep", ["75"]);
+  const logA = readLog(d);
+  const aliveA = c.exitCode === null;
+  const renewals = (logA.match(/stale-marker grace renewed/g) || []).length;
+  // Phase B: the re-entry step completes (chain-done with an outcome) → the
+  // grace is allowed to expire → normal stop → exit 0.
+  writeFileSync(path.join(d2, "chain-done.json"), JSON.stringify({ at: new Date().toISOString(), outcome: { next: "reentry" } }));
+  let waited = 0;
+  while (!existsSync(path.join(d, "monitor-exit.json")) && waited < 80) { spawnSync("sleep", ["1"]); waited++; }
+  try { if (c.exitCode === null) c.kill("SIGKILL"); } catch { /* gone */ }
+  const log = readLog(d);
+  report("R62 stale terminal + in-flight re-entry → grace renewed, no premature exit; ends when the step completes (6.1/7.4)",
+    aliveA && /stale terminal on file/.test(log0 + logA) && renewals >= 1 && !/trusting the terminal/.test(logA)
+    && exitFile(d, 0) && /trusting the terminal/.test(log),
+    `markerSet=${/stale terminal on file/.test(log0 + logA)} alive@75s=${aliveA} renewals=${renewals} prematureTrust=${/trusting the terminal/.test(logA)} exit0=${exitFile(d, 0)} normalTrust=${/trusting the terminal/.test(log)}`);
+}
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);

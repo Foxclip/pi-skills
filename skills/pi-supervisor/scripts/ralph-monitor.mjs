@@ -473,6 +473,31 @@ const markStaleIfMatch = () => {   // called at the end of every successful re-p
     flog(`stale-marker set: terminal of last-watched instance p=${p} at=${s.at} tc=${s.toolCalls} — polling until it changes or the grace expires`);
   }
 };
+// v0.36.2 (run130, 6.1/7.4): the re-entry hand-back is legitimately slow —
+// the chain's re-entry step WAITS for the sub-run report pointer (up to its
+// own 1200s budget) before re-activating the launch window, and that report
+// is written by THIS monitor's fire-and-forget judge call (handBackToLaunch /
+// the follow hook). While the re-entry step has not completed, the pre-spawn
+// terminal on file is by definition not the run's end — the re-entry child
+// will still overwrite it. run130: the 60s grace expired mid-hand-back, the
+// monitor "trusted the terminal" and exited (rc=0), killing the in-flight
+// report judge; the chain then sat out its full 1200s wait, the re-activation
+// launch was refused (no work time left) and the tree HALTED with no re-entry
+// and no sub-run report.
+function reentryStepInFlight() {
+  try {
+    const d = JSON.parse(readFileSync(path.join(A.runDir, "spawn-decision.json"), "utf8"));
+    if (!d || d.ok !== true || !d.run_dir) return false;
+    const rd = path.resolve(d.run_dir);
+    if (!existsSync(path.join(rd, "reentry-pending.json"))) return false;
+    if (existsSync(path.join(rd, "chain-halt.json"))) return false;
+    try {
+      const c = JSON.parse(readFileSync(path.join(rd, "chain-done.json"), "utf8"));
+      if (c && c.outcome) return false;   // the re-entry step completed (re-activation launched or halted)
+    } catch { /* no chain-done yet — still in flight */ }
+    return true;
+  } catch { return false; }
+}
 const markerHolds = (raw) => {   // true → a child-terminal stop must be deferred (poll)
   if (!staleMarker) return false;
   if (!raw || raw.at !== staleMarker.at || Number(raw.toolCalls) !== Number(staleMarker.tc) || Number(raw.childPgid) !== staleMarker.p) {
@@ -481,6 +506,20 @@ const markerHolds = (raw) => {   // true → a child-terminal stop must be defer
     return false;
   }
   if (Date.now() >= staleMarker.until) {
+    // v0.36.2 (run130): grace renewal while the hand-back is in flight — the
+    // re-entry child cannot have written yet because the chain's re-entry
+    // step is still waiting on the report pointer. The chain's own 1200s
+    // report wait bounds the renewal; the window deadline bounds everything
+    // else (ralph.sh tears the monitor down at the deadline regardless).
+    if (reentryStepInFlight()) {
+      staleMarker.until = Date.now() + STALE_MARKER_GRACE_MS;
+      if (!staleMarker.extTold || Date.now() - staleMarker.extTold >= 60_000) {
+        staleMarker.extTold = Date.now();
+        glog("…", 33, "hand-back in flight — the sub-run's final report is being written; the re-entry worker starts when it lands");
+      }
+      flog(`stale-marker grace renewed: re-entry step in flight (chain waiting on the sub-run report pointer)`);
+      return true;
+    }
     flog(`stale-marker expired (grace ${STALE_MARKER_GRACE_MS / 1000}s, file unchanged — the re-entry child never wrote); trusting the terminal`);
     staleMarker = null;
     return false;
@@ -1286,6 +1325,17 @@ async function stopLoop(pc, trigger = null) {
   // with the run's final report). No ping-pong: after the re-point
   // A.runDir === origRunDir, so a later stopLoop falls through to exit.
   if (handBackToLaunch()) return;
+  // v0.36.2 (run130, 6.1/7.4): never exit while the re-entry hand-back is in
+  // flight — the run is PAUSED (the chain re-activates this window once the
+  // sub-run report lands), not ended. This exit is what killed run130's
+  // in-flight report judge mid-call (rc=0 at 75 s into a minutes-long local
+  // judge turn); the marker-renewal above covers the marked case, this guard
+  // covers the marker-less one (attach mid-hand-back, marker never set).
+  if (reentryStepInFlight()) {
+    flog(`stop deferred: re-entry step in flight (the run is paused, not ended) — polling`);
+    await sleep(1000);
+    return;
+  }
   process.exit(pc.code);
 }
 // ---- follow-the-slot (v0.26.0, plan §5.5) ----------------------------------
