@@ -42,7 +42,8 @@
 //   2 child dead: guard pid gone or status stale while running
 //   4 loop gave up: deadline / stall / budget / llm-down / LLM said STOP
 //   5 child terminal with a failure exitReason
-//   1 usage error, 130 SIGINT
+//   1 usage error, 130 SIGINT, 143 SIGTERM (v0.36.1: tracked LLM trees are
+//   swept on every exit path — spec 7.3/7.5)
 //
 // Usage:
 //   node ralph-monitor.mjs --run-dir <dir> --pi <path>
@@ -60,6 +61,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseDeadline } from "./lib/deadline.mjs";
 import { renderTree } from "./lib/node.mjs";
+import { killChildGroup } from "./lib/kill-child.mjs";   // v0.36.1: two-sided LLM group kills
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NODE = process.execPath;
@@ -154,6 +156,7 @@ const flog = (line) => appendFileSync(logPath, `[${new Date().toISOString()}] ${
 process.on("exit", (code) => {
   try {
     if (!A.runDir || !existsSync(A.runDir)) return;
+    try { killLlmGroups(`exit(code=${code ?? 0})`); } catch { /* sweep is best-effort */ }
     writeFileSync(path.join(A.runDir, "monitor-exit.json"), `${JSON.stringify({ at: new Date().toISOString(), code })}\n`);
     flog(`monitor-exit: code=${code}`);
   } catch { /* best-effort — never mask the real exit code */ }
@@ -403,6 +406,10 @@ const printWorkerMessages = () => {
   } catch { /* the view must never change the run */ }
 };
 process.on("SIGINT", () => { glog("!", 33, "sigint: stopping"); saveState(); process.exit(130); });
+// v0.36.1 (spec 7.3/7.5): SIGTERM (ralph.sh stop paths, stop.mjs) — same
+// contract as SIGINT with the SIGTERM code; the tracked LLM process groups are
+// swept by the exit handler below, BEFORE the monitor-exit record is written.
+process.on("SIGTERM", () => { glog("!", 33, "sigterm: stopping"); saveState(); process.exit(143); });
 
 // ---- helpers
 const pidAlive = (pid) => {
@@ -497,6 +504,7 @@ const readStatus = () => {
   let s;
   try { s = JSON.parse(readFileSync(path.join(A.runDir, "pi-child-status.json"), "utf8")); }
   catch { return null; }
+  if (s && s.childUser) lastChildUser = s.childUser;   // v0.36.1: remember for the two-sided group kills
   if (statusIsStale(s)) {
     // the window's current child is a (re-)starting instance — the on-disk
     // terminal is the previous instance's. Freshen the fields the pre-checks
@@ -525,15 +533,66 @@ const dumpIO = (tag, stdout, stderr) => {
     writeFileSync(path.join(dir, `${tag}.err`), stderr || "");
   } catch { /* diagnostics must never change the exit code */ }
 };
+// v0.36.1 (spec 7.3/7.5): every LLM process tree this monitor spawns (cycle
+// judgment, final report — the pi-as-child wrapper + the child-user pi behind
+// it in protected runs) is DETACHED and group-tracked. The monitor is a
+// terminal child: on ANY exit path (budget/deadline/STOP = 4, SIGINT = 130,
+// SIGTERM = 143, crash, process.exit(0)) the tracked groups are killed
+// two-sided (owner + sudo child-user — the pichild pi is EPERM from the owner
+// side, same as the worker; the kill-child.mjs pattern), so a judgment never
+// outlives the monitor as an orphan (run128: the stop paths left the in-flight
+// judge running until its own --print finished). The groups are persisted to
+// <run-dir>/llm-groups.json so ralph.sh's EXIT trap can sweep what this
+// process's own handlers cannot reach (monitor OOM-killed / SIGKILLed).
+let lastChildUser = null;
+const llmGroupsFile = path.join(A.runDir, "llm-groups.json");
+const llmGroups = new Map(); // pgid (== leader pid, setsid) -> true
+const saveLlmGroups = () => {
+  try { writeFileSync(llmGroupsFile, JSON.stringify({ v: 1, at: new Date().toISOString(), groups: [...llmGroups.keys()] }) + "\n"); }
+  catch { /* best effort — the file is a sweep index, not state */ }
+};
+const trackLlm = (p) => {
+  if (!p.pid) return;
+  llmGroups.set(p.pid, true);
+  saveLlmGroups();
+  p.once("close", () => { if (llmGroups.delete(p.pid)) saveLlmGroups(); }); // we are its parent — reap
+};
+const groupGone = (g) => {
+  try { process.kill(-g, 0); return false; }                    // we can signal it — alive
+  catch (e) { return /no such process|ESRCH/i.test(e.message); } // EPERM = foreign members still alive
+};
+// Kill one tracked group two-sided: TERM → 2s grace → KILL. Synchronous (safe
+// inside the process "exit" handler). ESRCH-tolerant.
+const killLlmGroup = (ref, tag) => {
+  const g = typeof ref === "number" ? ref : (ref && ref.pid);
+  if (!g) return;
+  const sig = (name) => killChildGroup({ childPgid: g, childUser: lastChildUser }, name).errors
+    .forEach((e) => glog("·", 37, `v0.36.1 ${tag}: group ${g} ${name}: ${e}`));
+  const wait = (ms) => { const t0 = Date.now(); while (Date.now() - t0 < ms) { if (groupGone(g)) return true; Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50); } return groupGone(g); };
+  sig("SIGTERM");
+  if (!wait(2000)) { sig("SIGKILL"); wait(2000); }
+};
+const killLlmGroups = (tag) => {
+  const groups = [...llmGroups.keys()];
+  if (!groups.length) return;
+  glog("·", 37, `v0.36.1 ${tag}: sweeping ${groups.length} tracked LLM group(s) ${groups.join(",")}`);
+  for (const g of groups) killLlmGroup(g, tag);
+  llmGroups.clear();
+  saveLlmGroups();
+};
 function runCmd(cmd, args, timeoutMs, tag) {
   return new Promise((resolve) => {
     let stdout = "", stderr = "", done = false;
     const finish = (extra) => { if (!done) { done = true; dumpIO(tag, stdout, stderr); resolve({ ...extra }); } };
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs, killSignal: "SIGKILL" });
-    p.stdout.on("data", (d) => { stdout += d; if (stdout.length > 16 * 1024 * 1024) p.kill("SIGKILL"); });
-    p.stderr.on("data", (d) => { stderr += d; if (stderr.length > 16 * 1024 * 1024) p.kill("SIGKILL"); });
-    p.on("error", (e) => finish({ status: null, signal: null, stdout, stderr, error: String(e) }));
-    p.on("close", (status, signal) => finish({ status, signal, stdout, stderr }));
+    // v0.36.1: detached → own process group, tracked for the exit sweep; the
+    // timeout is manual so the expiry kills the WHOLE tree, not the leader.
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], detached: true });
+    trackLlm(p);
+    const to = setTimeout(() => killLlmGroup(p, `timeout(${tag})`), timeoutMs);
+    p.stdout.on("data", (d) => { stdout += d; if (stdout.length > 16 * 1024 * 1024) killLlmGroup(p, `stdout-overflow(${tag})`); });
+    p.stderr.on("data", (d) => { stderr += d; if (stderr.length > 16 * 1024 * 1024) killLlmGroup(p, `stderr-overflow(${tag})`); });
+    p.on("error", (e) => { clearTimeout(to); finish({ status: null, signal: null, stdout, stderr, error: String(e) }); });
+    p.on("close", (status, signal) => { clearTimeout(to); finish({ status, signal, stdout, stderr }); });
   });
 }
 // v0.23.0: judgment invocations are tracked so the deadline watcher can KILL a
@@ -544,11 +603,15 @@ let judgmentProc = null;
 async function runCmdTracked(cmd, args, timeoutMs, tag) {
   return new Promise((resolve) => {
     let stdout = "", stderr = "", done = false;
-    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs, killSignal: "SIGKILL" });
+    // v0.36.1: detached + group-tracked (see runCmd) — the timeout and the
+    // deadline-watcher kill kill the whole tree, owner side and child-user side.
+    const p = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], detached: true });
     judgmentProc = p;
-    const finish = (extra) => { if (!done) { done = true; if (judgmentProc === p) judgmentProc = null; dumpIO(tag, stdout, stderr); resolve({ ...extra }); } };
-    p.stdout.on("data", (d) => { stdout += d; if (stdout.length > 16 * 1024 * 1024) p.kill("SIGKILL"); });
-    p.stderr.on("data", (d) => { stderr += d; if (stderr.length > 16 * 1024 * 1024) p.kill("SIGKILL"); });
+    trackLlm(p);
+    const to = setTimeout(() => killLlmGroup(p, `timeout(${tag})`), timeoutMs);
+    const finish = (extra) => { if (!done) { done = true; clearTimeout(to); if (judgmentProc === p) judgmentProc = null; dumpIO(tag, stdout, stderr); resolve({ ...extra }); } };
+    p.stdout.on("data", (d) => { stdout += d; if (stdout.length > 16 * 1024 * 1024) killLlmGroup(p, `stdout-overflow(${tag})`); });
+    p.stderr.on("data", (d) => { stderr += d; if (stderr.length > 16 * 1024 * 1024) killLlmGroup(p, `stderr-overflow(${tag})`); });
     p.on("error", (e) => finish({ status: null, signal: null, stdout, stderr, error: String(e) }));
     p.on("close", (status, signal) => finish({ status, signal, stdout, stderr }));
   });
@@ -1474,7 +1537,7 @@ for (;;) {
     const jdur = Math.round((Date.now() - nowMs) / 1000);
     if (raced === "deadline" || raced === "child-deadline") {
       flog(`cycle=${state.cycles} judgment-end dur=${jdur}s outcome=killed-by-${raced} io=llm/cycle-${state.cycles}-judgment.{out,err}`);
-      if (judgmentProc) { try { judgmentProc.kill("SIGKILL"); } catch { /* best effort */ } }
+      if (judgmentProc) { try { killLlmGroup(judgmentProc, "deadline-watcher"); } catch { /* best effort */ } }
       glog("!", 33, `cycle=${state.cycles} ${raced === "child-deadline" ? "worker deadline" : "deadline"} passed while the judge was deciding — the judgment was killed; the pre-checks take over`);
       saveState();
       continue;

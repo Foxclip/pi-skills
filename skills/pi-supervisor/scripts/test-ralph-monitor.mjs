@@ -2054,6 +2054,85 @@ console.log("DECISION: OK");`);
     `skips=${(log60.match(/display-only: judgment skipped/g) || []).length} judged=${existsSync(marker60)} state=${st60 ? st60.cycles : "none"}`);
   void so60;
 }
+// ---- R61: v0.36.1 (spec 7.3/7.5) — no orphaned judgment on a monitor stop.
+// (a) SIGTERM mid-judgment → rc 143, monitor-exit.json code 143, and the
+// judgment's WHOLE process group is dead (not just the leader).
+// (b) --timeout-sec expiry kills the group too, not the leader.
+// (c) protected variant: the judge runs as the child user (pi-as-child shape —
+// wrapper → sudo -u pichild → pi); the pichild member must die via the sudo
+// side of the two-sided kill (owner-side is EPERM, exactly the run128 orphan).
+{
+  const groupAlive = (pgid) => {
+    if (!Number.isFinite(pgid) || !pgid) return false;
+    try { process.kill(-pgid, 0); return true; } catch { return false; }
+  };
+  const judgePidFrom = (mark) => { try { return Number(readFileSync(mark, "utf8").trim().split(/\s+/)[1]); } catch { return NaN; } };
+  const mkHangStub = (name, mark) => mkStub(name, `
+import { appendFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(mark)}, "JUDGE-START " + process.pid + "\\n");
+setTimeout(() => {}, 300000); // hang like a queued model call
+`);
+  // The monitor's synchronous exit sweep (up to ~4s with a live judge) plus
+  // this suite's spawnSync wait-loop makes the spawn "exit" event unreliable to
+  // assert on — the authoritative record is the monitor's own exit file
+  // (process.exit ran, handler completed → the process is dead or a zombie,
+  // i.e. no longer executing), plus the judge group's actual liveness.
+  const waitForExitFile = (d) => { let t = 0; while (!existsSync(path.join(d, "monitor-exit.json")) && t < 150) { spawnSync("sleep", ["0.2"]); t++; } };
+  const procGone = (pid) => { try { process.kill(pid, 0); return false; } catch { return true; } };
+  // (a) SIGTERM mid-judgment (owner-owned judge)
+  {
+    const d = runDir("r61a");
+    mkStatus(d); // running, live guard
+    const mark = path.join(root, "r61a-judge.log");
+    const stub = mkHangStub("pi-r61a.mjs", mark);
+    const c = spawn(NODE, [path.join(HERE, "ralph-monitor.mjs"), "--run-dir", d, "--pi", stub, "--cycle-sec", "1", "--timeout-sec", "9999"], { stdio: ["ignore", "ignore", "ignore"] });
+    spawnSync("sleep", ["4"]); // first pre-checks + judgment in flight
+    try { c.kill("SIGTERM"); } catch { /* already gone */ }
+    waitForExitFile(d);
+    const jp = judgePidFrom(mark);
+    const log = readLog(d);
+    report("R61a SIGTERM mid-judgment → rc 143 + judgment group dead (7.3/7.5)",
+      exitFile(d, 143) && Number.isFinite(jp) && !groupAlive(jp) && /v0\.36\.1 exit\(code=143\): sweeping 1 tracked LLM group/.test(log),
+      `exitFile=${exitFile(d, 143)} monGone=${procGone(c.pid)} judge=${jp || "?"} groupAlive=${groupAlive(jp)} sweep=${/sweeping/.test(log)}`);
+  }
+  // (b) --timeout-sec expiry: the whole group, not just the leader
+  {
+    const d = runDir("r61b");
+    mkStatus(d);
+    const mark = path.join(root, "r61b-judge.log");
+    const stub = mkHangStub("pi-r61b.mjs", mark);
+    const r = runRm(d, stub, ["--once", "--cycle-sec", "1", "--timeout-sec", "2"]);
+    const jp = judgePidFrom(mark);
+    const log = readLog(d);
+    report("R61b --timeout-sec expiry kills the judgment group (7.3)",
+      r.status === 4 && Number.isFinite(jp) && !groupAlive(jp) && /cycle=1 judgment-end/.test(log) && /cycle=1 judge failed/.test(log),
+      `status=${r.status} judge=${jp || "?"} groupAlive=${groupAlive(jp)} judgeend=${/cycle=1 judgment-end/.test(log)} failed-line=${/cycle=1 judge failed/.test(log)}`);
+  }
+  // (c) protected child-user variant (pi-as-child shape: wrapper → sudo → pi)
+  {
+    const okUser = spawnSync("sudo", ["-n", "-u", "pichild", "true"]).status === 0;
+    if (!okUser) {
+      report("R61c protected child-user judge dies via the sudo side (7.3/7.5)", true, "skipped: pichild unavailable");
+    } else {
+      const d = runDir("r61c");
+      mkStatus(d);
+      const mark = path.join(root, "r61c-wrap.log");
+      const wrap = path.join(root, "pi-r61c.sh");
+      writeFileSync(wrap, `#!/bin/sh\necho WRAPPER-START >> ${JSON.stringify(mark)}\nexec sudo -n -u pichild /bin/sh -c 'exec sleep 3000'\n`);
+      chmodSync(wrap, 0o755);
+      const c = spawn(NODE, [path.join(HERE, "ralph-monitor.mjs"), "--run-dir", d, "--pi", wrap, "--cycle-sec", "1", "--timeout-sec", "9999"], { stdio: ["ignore", "ignore", "ignore"] });
+      spawnSync("sleep", ["4"]);
+      try { c.kill("SIGTERM"); } catch { /* already gone */ }
+      waitForExitFile(d);
+      const pr = spawnSync("pgrep", ["-u", "pichild", "-f", "sleep 3000"]);
+      const leftover = (pr.stdout || Buffer.alloc(0)).toString().trim();
+      const log = readLog(d);
+      report("R61c protected child-user judge dies via the sudo side (7.3/7.5)",
+        exitFile(d, 143) && leftover === "" && /sweeping 1 tracked LLM group/.test(log),
+        `exitFile=${exitFile(d, 143)} monGone=${procGone(c.pid)} pichild-leftover=${leftover || "none"} sweep=${/sweeping/.test(log)}`);
+    }
+  }
+}
 if (KEEP) console.log(`(kept artifacts in ${root})`);
 else rmSync(root, { recursive: true, force: true });
 console.log(failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`);

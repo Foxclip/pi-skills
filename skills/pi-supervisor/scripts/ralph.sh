@@ -1067,10 +1067,44 @@ resolve_monitor_rc() {
   case "$mon_rc" in ''|*[!0-9-]*) : ;; *) rc=$mon_rc ;; esac
   rlog "rc resolution: wait reported 127 (status lost) — monitor-exit.json code=${mon_rc:-?} → rc=$rc"
 }
+# ── v0.36.1 (spec 7.3/7.5): sweep the LLM process trees the monitor tracked ──
+# ralph-monitor records every LLM process group it spawns (cycle judgment,
+# final report — the pi-as-child wrapper + the child-user pi behind it) in
+# <run>/llm-groups.json and kills them on its OWN exit paths. This sweep covers
+# the paths the monitor's own handlers cannot: a monitor OOM-killed or
+# SIGKILLed. Owner-side group signal + sudo as the protected child user
+# (the pichild pi is EPERM from the owner side); ESRCH-tolerant; idempotent.
+kill_llm_groups() {
+  local lf groups g
+  lf="$RUN_DIR/llm-groups.json"
+  [ -f "$lf" ] || return 0
+  groups=$(sed -n 's/.*"groups":\[\([^]]*\)\].*/\1/p' "$lf" 2>/dev/null)
+  groups=${groups//[^0-9,]/}
+  if [ -z "$groups" ]; then rm -f "$lf"; return 0; fi
+  IFS=',' read -ra _LLM_GS <<< "$groups"
+  for g in "${_LLM_GS[@]}"; do
+    [ -n "$g" ] || continue
+    kill -TERM -"$g" 2>/dev/null || true
+    if [ -n "${PI_PROTECT_USER:-}" ] && command -v sudo >/dev/null 2>&1; then
+      sudo -n -u "$PI_PROTECT_USER" kill -s SIGTERM -"$g" 2>/dev/null || true
+    fi
+  done
+  sleep 1
+  for g in "${_LLM_GS[@]}"; do
+    [ -n "$g" ] || continue
+    kill -KILL -"$g" 2>/dev/null || true
+    if [ -n "${PI_PROTECT_USER:-}" ] && command -v sudo >/dev/null 2>&1; then
+      sudo -n -u "$PI_PROTECT_USER" kill -s SIGKILL -"$g" 2>/dev/null || true
+    fi
+  done
+  rm -f "$lf"
+  return 0
+}
 on_exit() {
   local rc=$?
   local interrupted=0
   if [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then interrupted=1; fi
+  kill_llm_groups   # v0.36.1 (7.3/7.5): sweep what the monitor's own sweep couldn't
   resolve_monitor_rc
   if [ -n "$HARVEST_TARGET" ] && [ -d "$HARVEST_TARGET" ]; then
     # v0.25.15: was the script edited on disk mid-run? (2026-11-02 run: the

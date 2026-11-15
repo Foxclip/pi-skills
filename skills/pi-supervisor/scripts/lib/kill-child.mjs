@@ -13,6 +13,7 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 
+const SIGNUM = { TERM: 15, KILL: 9, INT: 2, HUP: 1, QUIT: 3, USR1: 10, USR2: 12 };
 export function killChildGroup(status, signal = "SIGTERM") {
   const errors = [];
   const sigName = String(signal || "SIGTERM").replace(/^SIG/i, "").toUpperCase();
@@ -22,7 +23,9 @@ export function killChildGroup(status, signal = "SIGTERM") {
   // Owner side: kills the leader (sudo) + wrapper; EPERM on the child node
   // process is expected and handled below via sudo.
   try {
-    process.kill(-g, sigName);
+    // node's process.kill only accepts "SIGX" or a number — a bare name
+    // ("TERM") throws ERR_UNKNOWN_SIGNAL; the shell kill below accepts both.
+    process.kill(-g, SIGNUM[sigName] || "SIG" + sigName);
   } catch (e) {
     errors.push(`owner group-kill: ${e.message}`);
   }
